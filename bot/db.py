@@ -1,0 +1,804 @@
+import json
+import psycopg2
+from collections import defaultdict
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from telegram import InlineKeyboardButton
+
+from pgconn import get_conn
+from service_details import load_service_details
+from disk_health import format_disk_health, load_disk_health
+from backup_files import disk_of_path
+from backup_verify import path_str
+from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
+
+ALMATY = ZoneInfo("Asia/Almaty")
+STALE_MINUTES = 15
+CPU_WARN = 80
+CPU_CRIT = 90
+RAM_WARN = 80
+RAM_CRIT = 90
+DISK_WARN_FREE = 20
+DISK_CRIT_FREE = 10
+BACKUP_WARN_HOURS = 24
+BACKUP_STALE_MINUTES = 30
+ONEC_LOG_WARN_GB = 5
+ONEC_LOG_CRIT_GB = 10
+ONEC_LOG_STALE_MINUTES = 30
+SERVER_BUTTONS_PER_PAGE = 8
+SERVERS_FILE = "/app/config/servers.json"
+
+
+def _make_bar(used_pct: float, width: int = 10) -> str:
+    filled = round(used_pct / 100 * width)
+    empty = width - filled
+    return f"[{'█' * filled}{'░' * empty}] {used_pct}%"
+
+
+def _format_duration(seconds) -> str:
+    if seconds is None:
+        return "нет данных"
+    seconds = int(seconds)
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    if days:
+        return f"{days} д {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+
+def _format_local_time(dt) -> str:
+    return dt.replace(tzinfo=timezone.utc).astimezone(ALMATY).strftime("%d.%m %H:%M")
+
+
+def _fetch_optional(cur, query: str, params: tuple = ()) -> list:
+    try:
+        cur.execute(query, params)
+        return cur.fetchall()
+    except psycopg2.Error as e:
+        cur.connection.rollback()
+        print(f"[bot] Optional problem query skipped: {e}", flush=True)
+        return []
+
+
+def _load_backup_targets() -> tuple[dict[str, set[tuple[str, str]]], set[str]]:
+    targets: dict[str, set[tuple[str, str]]] = {}
+    config_server_names: set[str] = set()
+    try:
+        with open(SERVERS_FILE) as f:
+            servers = json.load(f)
+        for server in servers:
+            name = server.get("name")
+            if not name:
+                continue
+            config_server_names.add(name)
+            entries: set[tuple[str, str]] = set()
+            backups = server.get("backups", {})
+            if isinstance(backups, dict):
+                for backup_type, paths in backups.items():
+                    if not isinstance(paths, list):
+                        paths = [paths]
+                    for raw_path in paths:
+                        # Путь бывает объектом {path, alert_hours, schedule_*} —
+                        # без path_str() в набор попадала строка вида "{'path': …}",
+                        # она не совпадала с БД, и такие пути молча выпадали
+                        # из сводки проблем целиком.
+                        backup_path = path_str(raw_path)
+                        if backup_path:
+                            entries.add((str(backup_type), str(backup_path)))
+            targets[name] = entries
+    except Exception as e:
+        print(f"[bot] Не удалось прочитать {SERVERS_FILE}: {e}", flush=True)
+    return targets, config_server_names
+
+
+def _paginate_buttons(buttons: list, page: int, per_page: int, callback_prefix: str,
+                      back_callback: str = None, columns: int = 2) -> list:
+    total_pages = max(1, (len(buttons) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_buttons = buttons[start:end]
+
+    keyboard = [page_buttons[i:i+columns] for i in range(0, len(page_buttons), columns)]
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️", callback_data=f"{callback_prefix}:{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("▶️", callback_data=f"{callback_prefix}:{page + 1}"))
+    keyboard.append(nav_row)
+
+    if back_callback:
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=back_callback)])
+
+    return keyboard
+
+
+# ─── Состояние серверов со списком кнопок ────────────────────
+
+def get_servers_status(page: int = 0) -> tuple:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (server_name)
+                   server_name, status, checked_at
+            FROM server_status
+            ORDER BY server_name, checked_at DESC
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        return "⚠️ Нет данных — мониторинг ещё не запускался", []
+
+    now_utc = datetime.now(timezone.utc)
+    online = 0
+    offline = 0
+    buttons = []
+
+    msg = "🖥 СОСТОЯНИЕ СЕРВЕРОВ\n\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for server_name, status, checked_at in sorted(rows):
+        checked_utc = checked_at.replace(tzinfo=timezone.utc)
+        age_min = (now_utc - checked_utc).total_seconds() / 60
+        stale = " ⚠️" if age_min > STALE_MINUTES else ""
+        time_str = checked_utc.astimezone(ALMATY).strftime("%H:%M")
+
+        if status == "online":
+            icon = "🟢"
+            msg += f"🟢 {server_name}{stale} ({time_str})\n"
+            online += 1
+        else:
+            icon = "🔴"
+            msg += f"🔴 {server_name} — {status}{stale} ({time_str})\n"
+            offline += 1
+
+        buttons.append(
+            InlineKeyboardButton(f"{icon} {server_name}", callback_data=f"server:{server_name}")
+        )
+
+    keyboard = _paginate_buttons(
+        buttons,
+        page=page,
+        per_page=SERVER_BUTTONS_PER_PAGE,
+        callback_prefix="servers_list",
+        columns=2
+    )
+
+    total = online + offline
+    availability = round((online / total) * 100, 1) if total > 0 else 0
+
+    msg += "\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += (
+        f"📊 ИТОГО\n\n"
+        f"🟢 Онлайн: {online}\n"
+        f"🔴 Оффлайн: {offline}\n"
+        f"📈 Доступность: {availability}%\n\n"
+        f"🕒 Обновляется каждые 5 минут"
+    )
+
+    return msg, keyboard
+
+
+# ─── Детали конкретного сервера ──────────────────────────────
+
+def get_disk_usage(server_name: str, disk_name: str):
+    """(free_gb, used_gb) последнего замера диска или None.
+    Имя диска сопоставляется без учёта «:», «\\» и регистра ('E' == 'E:')."""
+    norm = str(disk_name or "").rstrip(":\\/").upper()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (disk_name) disk_name, free_gb, used_gb
+            FROM disk_metrics
+            WHERE server_name = %s
+            ORDER BY disk_name, created_at DESC
+        """, (server_name,))
+        for dn, free, used in cur.fetchall():
+            if str(dn).rstrip(":\\/").upper() == norm:
+                return float(free), float(used)
+    return None
+
+
+def get_server_disks(server_name: str) -> list:
+    """[(disk_name, free_gb, used_gb), ...] по последнему замеру каждого диска.
+    Нужен для меню «какой диск разобрать» под карточкой сервера."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (disk_name) disk_name, free_gb, used_gb
+            FROM disk_metrics
+            WHERE server_name = %s
+            ORDER BY disk_name, created_at DESC
+        """, (server_name,))
+        return [(dn, float(free or 0), float(used or 0)) for dn, free, used in cur.fetchall()]
+
+
+def get_server_detail(server_name: str) -> str:
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT DISTINCT ON (server_name)
+                   status, error, checked_at, cpu_load, ram_total, ram_free, uptime_seconds
+            FROM server_status
+            WHERE server_name = %s
+            ORDER BY server_name, checked_at DESC
+        """, (server_name,))
+        status_row = cur.fetchone()
+
+        cur.execute("""
+            SELECT DISTINCT ON (disk_name)
+                   disk_name, free_gb, used_gb
+            FROM disk_metrics
+            WHERE server_name = %s
+            ORDER BY disk_name, created_at DESC
+        """, (server_name,))
+        disk_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT DISTINCT ON (service_name)
+                   service_name, display_name, status, checked_at
+            FROM service_status
+            WHERE server_name = %s
+              AND checked_at >= NOW() - INTERVAL '15 minutes'
+            ORDER BY service_name, checked_at DESC
+        """, (server_name,))
+        service_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT process_name, process_id, cpu_percent, cpu_seconds, memory_mb
+            FROM process_metrics
+            WHERE server_name = %s
+              AND metric_type = 'cpu'
+              AND created_at = (
+                  SELECT MAX(created_at)
+                  FROM process_metrics
+                  WHERE server_name = %s
+                    AND metric_type = 'cpu'
+              )
+            ORDER BY cpu_percent DESC NULLS LAST
+            LIMIT 5
+        """, (server_name, server_name))
+        top_cpu_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT process_name, process_id, cpu_percent, cpu_seconds, memory_mb
+            FROM process_metrics
+            WHERE server_name = %s
+              AND metric_type = 'memory'
+              AND created_at = (
+                  SELECT MAX(created_at)
+                  FROM process_metrics
+                  WHERE server_name = %s
+                    AND metric_type = 'memory'
+              )
+            ORDER BY memory_mb DESC NULLS LAST
+            LIMIT 5
+        """, (server_name, server_name))
+        top_memory_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT
+                MIN(cpu_load),
+                ROUND(AVG(cpu_load)::numeric, 1),
+                MAX(cpu_load),
+                MIN(ROUND(((ram_total - ram_free) / NULLIF(ram_total, 0) * 100)::numeric, 1)),
+                ROUND(AVG((ram_total - ram_free) / NULLIF(ram_total, 0) * 100)::numeric, 1),
+                MAX(ROUND(((ram_total - ram_free) / NULLIF(ram_total, 0) * 100)::numeric, 1))
+            FROM server_status
+            WHERE server_name = %s
+              AND checked_at >= NOW() - INTERVAL '24 hours'
+              AND status = 'online'
+        """, (server_name,))
+        resource_history = cur.fetchone()
+
+        cur.execute("""
+            SELECT
+                disk_name,
+                MIN(ROUND((free_gb / NULLIF(free_gb + used_gb, 0) * 100)::numeric, 1)),
+                ROUND(AVG(free_gb / NULLIF(free_gb + used_gb, 0) * 100)::numeric, 1),
+                MAX(ROUND((free_gb / NULLIF(free_gb + used_gb, 0) * 100)::numeric, 1))
+            FROM disk_metrics
+            WHERE server_name = %s
+              AND created_at >= NOW() - INTERVAL '24 hours'
+            GROUP BY disk_name
+            ORDER BY disk_name
+        """, (server_name,))
+        disk_history = cur.fetchall()
+
+        # Где лежат бэкапы этого сервера: путь, диск и размер каталога
+        try:
+            cur.execute("""
+                SELECT DISTINCT ON (backup_type, backup_path)
+                       backup_type, backup_path, file_count,
+                       total_size_gb, newest_file
+                FROM backup_metrics
+                WHERE server_name = %s
+                ORDER BY backup_type, backup_path, created_at DESC
+            """, (server_name,))
+            backup_rows = cur.fetchall()
+        except Exception:
+            conn.rollback()
+            backup_rows = []
+
+    # Путь, убранный из конфига, остаётся в БД навсегда — monitor его больше
+    # не опрашивает, но и не удаляет. Особенно опасны родительские каталоги
+    # (был "G:\Backups", стали "G:\Backups\elev22" и "G:\Backups\sh"):
+    # родитель суммирует дочерние, поэтому мёртвая копия в одном подкаталоге
+    # маскируется свежими файлами соседнего. Показываем только то, что есть
+    # в конфиге — как это уже делают дайджест и Backup Health.
+    # Сервер не из конфига (остался в БД) не фильтруем: иначе он опустеет.
+    backup_targets, config_server_names = _load_backup_targets()
+    if server_name in config_server_names:
+        allowed = backup_targets.get(server_name, set())
+        backup_rows = [
+            row for row in backup_rows if (str(row[0]), str(row[1])) in allowed
+        ]
+
+    if not status_row:
+        return f"❓ Нет данных по серверу {server_name}"
+
+    status, error, checked_at, cpu_load, ram_total, ram_free, uptime_seconds = status_row
+    checked_local = checked_at.replace(tzinfo=timezone.utc).astimezone(ALMATY)
+    time_str = checked_local.strftime("%d.%m.%Y %H:%M")
+    status_line = "🟢 Онлайн" if status == "online" else f"🔴 {status}"
+
+    msg = f"🖥 {server_name}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += f"Статус:   {status_line}\n"
+    msg += f"Проверен: {time_str}\n"
+    msg += f"Uptime:   {_format_duration(uptime_seconds)}\n"
+
+    if error and status != "online":
+        first_line = error.splitlines()[0][:100]
+        msg += f"Ошибка:   {first_line}\n"
+
+    # CPU
+    if cpu_load is not None:
+        cpu_load = float(cpu_load)
+        cpu_icon = "🔴" if cpu_load >= 90 else "🟠" if cpu_load >= 70 else "🟢"
+        msg += f"\n{cpu_icon} CPU\n"
+        msg += f"   {_make_bar(cpu_load)}\n"
+        msg += f"   Загрузка: {cpu_load}%\n"
+
+    # RAM
+    if ram_total is not None and ram_free is not None and float(ram_total) > 0:
+        ram_total = float(ram_total)
+        ram_free = float(ram_free)
+        ram_used = ram_total - ram_free
+        ram_used_pct = round((ram_used / ram_total) * 100, 1)
+        ram_icon = "🔴" if ram_used_pct >= 90 else "🟠" if ram_used_pct >= 70 else "🟢"
+        msg += f"\n{ram_icon} RAM\n"
+        msg += f"   {_make_bar(ram_used_pct)}\n"
+        msg += f"   Занято:  {round(ram_used, 1)} ГБ\n"
+        msg += f"   Свободно: {round(ram_free, 1)} ГБ\n"
+        msg += f"   Всего:   {round(ram_total, 1)} ГБ\n"
+
+    # Диски
+    if disk_rows:
+        msg += "\n💽 ДИСКИ\n"
+        for disk_name, free, used in disk_rows:
+            free = float(free)
+            used = float(used)
+            total = free + used
+            pct_used = round((used / total) * 100, 1) if total > 0 else 0
+            pct_free = round(100 - pct_used, 1)
+            disk_icon = "🔴" if pct_free < 10 else "🟠" if pct_free < 20 else "🟢"
+            msg += f"\n{disk_icon} {disk_name}:\n"
+            msg += f"   {_make_bar(pct_used)}\n"
+            msg += f"   Свободно: {free} ГБ ({pct_free}%)\n"
+            msg += f"   Занято:   {used} ГБ\n"
+            msg += f"   Всего:    {round(total, 1)} ГБ\n"
+    else:
+        msg += "\n💽 Нет данных по дискам\n"
+
+    # RAID, температура дисков, причина недоступности SMART (Linux/NAS).
+    # Алерты приходят только при поломке — текущее состояние надо видеть всегда.
+    msg += format_disk_health(load_disk_health(server_name))
+
+    # Бэкапы: на каком диске и в каком каталоге лежат, сколько занимают
+    if backup_rows:
+        msg += "\n💾 БЭКАПЫ\n"
+        for backup_type, backup_path, file_count, total_size_gb, newest_file in backup_rows:
+            size_gb = float(total_size_gb or 0)
+            msg += f"\n   📁 {disk_of_path(backup_path)} · {str(backup_type).upper()}\n"
+            msg += f"      {backup_path}\n"
+            msg += f"      Размер: {round(size_gb, 2)} ГБ · файлов: {file_count or 0}\n"
+            if newest_file:
+                fresh = newest_file.strftime("%d.%m.%Y %H:%M")
+                msg += f"      Свежий: {fresh}\n"
+
+    # Сервисы (Windows-службы или systemd-юниты)
+    if service_rows:
+        details = load_service_details(server_name)
+        msg += "\n⚙️ СЕРВИСЫ\n"
+        for service_name, display_name, service_status, service_checked_at in service_rows:
+            icon = "🟢" if str(service_status).lower() == "running" else "🔴"
+            label = display_name if display_name and display_name != service_name else service_name
+            msg += f"   {icon} {label}: {service_status}\n"
+            # Расширенная информация: контейнеры Docker, сайты веб-серверов
+            for line in details.get(service_name, [])[:12]:
+                msg += f"      {str(line)[:90]}\n"
+
+    if top_cpu_rows or top_memory_rows:
+        msg += "\n🔥 ТОП ПРОЦЕССОВ\n"
+        if top_cpu_rows:
+            msg += "   CPU:\n"
+            for process_name, process_id, cpu_percent, cpu_seconds, memory_mb in top_cpu_rows:
+                cpu_percent = cpu_percent if cpu_percent is not None else 0
+                msg += f"      {process_name} ({process_id}): {cpu_percent}% CPU, {memory_mb} MB\n"
+        if top_memory_rows:
+            msg += "   RAM:\n"
+            for process_name, process_id, cpu_percent, cpu_seconds, memory_mb in top_memory_rows:
+                cpu_percent = cpu_percent if cpu_percent is not None else 0
+                msg += f"      {process_name} ({process_id}): {memory_mb} MB, {cpu_percent}% CPU\n"
+
+    # История за 24 часа
+    msg += "\n📈 ИСТОРИЯ 24 ЧАСА\n"
+    if resource_history and resource_history[0] is not None:
+        cpu_min, cpu_avg, cpu_max, ram_min, ram_avg, ram_max = resource_history
+        msg += f"   CPU: min {cpu_min}% / avg {cpu_avg}% / max {cpu_max}%\n"
+        if ram_min is not None:
+            msg += f"   RAM: min {ram_min}% / avg {ram_avg}% / max {ram_max}%\n"
+    else:
+        msg += "   CPU/RAM: нет данных\n"
+
+    if disk_history:
+        for disk_name, free_min, free_avg, free_max in disk_history:
+            msg += (
+                f"   {disk_name}: свободно min {free_min}% / "
+                f"avg {free_avg}% / max {free_max}%\n"
+            )
+    else:
+        msg += "   Диски: нет данных\n"
+
+    return msg
+
+
+# ─── Проблемы ────────────────────────────────────────────────
+
+def get_problems() -> str:
+    backup_targets, config_server_names = _load_backup_targets()
+    schedule_map = load_schedule_map(SERVERS_FILE)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (server_name)
+                   server_name, status, error, checked_at,
+                   cpu_load, ram_total, ram_free
+            FROM server_status
+            ORDER BY server_name, checked_at DESC
+        """)
+        status_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT DISTINCT ON (server_name, disk_name)
+                   server_name, disk_name, free_gb, used_gb, created_at
+            FROM disk_metrics
+            ORDER BY server_name, disk_name, created_at DESC
+        """)
+        disk_rows = cur.fetchall()
+
+        service_rows = _fetch_optional(cur, """
+            SELECT service_name, display_name, status, server_name, checked_at
+            FROM (
+                SELECT DISTINCT ON (server_name, service_name)
+                       service_name, display_name, status, server_name, checked_at
+                FROM service_status
+                ORDER BY server_name, service_name, checked_at DESC
+            ) latest
+            WHERE LOWER(status) != 'running'
+              AND checked_at >= NOW() - INTERVAL '30 minutes'
+            ORDER BY server_name, service_name
+        """)
+
+        backup_rows = _fetch_optional(cur, """
+            SELECT server_name, backup_type, backup_path, file_count,
+                   newest_file, disk_total_gb, disk_free_gb, created_at
+            FROM (
+                SELECT DISTINCT ON (server_name, backup_type, backup_path)
+                       server_name, backup_type, backup_path, file_count,
+                       newest_file, disk_total_gb, disk_free_gb, created_at
+                FROM backup_metrics
+                ORDER BY server_name, backup_type, backup_path, created_at DESC
+            ) latest
+            ORDER BY server_name, backup_type, backup_path
+        """)
+
+        onec_log_rows = _fetch_optional(cur, """
+            SELECT server_name, log_name, log_path, total_size_gb,
+                   file_count, status, error, created_at
+            FROM (
+                SELECT DISTINCT ON (server_name, log_path)
+                       server_name, log_name, log_path, total_size_gb,
+                       file_count, status, error, created_at
+                FROM onec_log_metrics
+                ORDER BY server_name, log_path, created_at DESC
+            ) latest
+            ORDER BY server_name, log_name, log_path
+        """)
+
+        verify_rows = _fetch_optional(cur, """
+            SELECT server_name, backup_path, file_path, status, error, created_at
+            FROM (
+                SELECT DISTINCT ON (server_name, backup_path)
+                       server_name, backup_path, file_path, status, error, created_at
+                FROM backup_verifications
+                WHERE created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY server_name, backup_path, created_at DESC
+            ) latest
+            WHERE status != 'ok'
+            ORDER BY server_name, backup_path
+        """)
+
+    now_utc = datetime.now(timezone.utc)
+    critical = []
+    warning = []
+    disk_critical = []
+    disk_warning = []
+
+    icons = {
+        "auth_failed":      "🔑",
+        "access_denied":    "⛔",
+        "timeout":          "⏱",
+        "dns_error":        "🌐",
+        "winrm_refused":    "⚠️",
+        "host_unreachable": "🚨",
+        "ping_down":        "🚨",
+    }
+
+    for server_name, status, error, checked_at, cpu_load, ram_total, ram_free in status_rows:
+        checked_utc = checked_at.replace(tzinfo=timezone.utc)
+        age_min = (now_utc - checked_utc).total_seconds() / 60
+        time_str = _format_local_time(checked_at)
+
+        if status != "online":
+            icon = icons.get(status, "❓")
+            line = f"{icon} {server_name}: {status} ({time_str})"
+            if error:
+                line += f"\n   {error.splitlines()[0][:90]}"
+            critical.append(line)
+            continue
+
+        if age_min > STALE_MINUTES:
+            warning.append(f"⚠️ {server_name}: данные старше {round(age_min)} мин ({time_str})")
+
+    for server_name, disk_name, free_gb, used_gb, created_at in disk_rows:
+        free = float(free_gb)
+        used = float(used_gb)
+        total = free + used
+        if total <= 0:
+            continue
+        free_pct = round(free / total * 100, 1)
+        detail = f"{server_name} {disk_name}: свободно {free_pct}% ({free} ГБ)"
+        if free_pct < DISK_CRIT_FREE:
+            disk_critical.append(f"🔴 {detail}")
+        elif free_pct < DISK_WARN_FREE:
+            disk_warning.append(f"🟠 {detail}")
+
+    # RAID: развал массива не виден ни по свободному месту, ни по SMART
+    # отдельного диска — в сводке проблем ему самое место
+    for config_name in sorted(config_server_names):
+        for array in load_disk_health(config_name).get("raid") or []:
+            if not array.get("degraded"):
+                continue
+            counts = ""
+            if array.get("total") is not None:
+                counts = f" ({array.get('active')}/{array['total']})"
+            if array.get("progress"):
+                percent = array["progress"].get("percent")
+                critical.append(
+                    f"🔄 {config_name}: RAID {array.get('name')} "
+                    f"восстанавливается{counts} — {percent}%"
+                )
+            else:
+                critical.append(
+                    f"🚨 {config_name}: RAID {array.get('name')} деградирован{counts}"
+                )
+
+    for service_name, display_name, service_status, server_name, checked_at in service_rows:
+        label = display_name if display_name and display_name != service_name else service_name
+        critical.append(f"🚨 {server_name}: сервис {label} = {service_status}")
+
+    for (
+        server_name, backup_type, backup_path, file_count,
+        newest_file, disk_total_gb, disk_free_gb, created_at
+    ) in backup_rows:
+        if server_name in config_server_names:
+            server_targets = backup_targets.get(server_name, set())
+            if not server_targets or (backup_type, backup_path) not in server_targets:
+                continue
+
+        created_utc = created_at.replace(tzinfo=timezone.utc)
+        age_min = (now_utc - created_utc).total_seconds() / 60
+        label = f"{server_name} {backup_type.upper()} {backup_path}"
+
+        if age_min > BACKUP_STALE_MINUTES:
+            warning.append(f"⚠️ {label}: метрики backup старше {round(age_min)} мин")
+
+        if not file_count:
+            critical.append(f"🚨 {label}: нет файлов backup")
+            continue
+
+        schedule = schedule_for(schedule_map, server_name, backup_type, backup_path)
+        if newest_file:
+            newest = newest_file
+            if getattr(newest, "tzinfo", None) is None:
+                newest = newest.replace(tzinfo=timezone.utc)
+            if schedule:
+                # Недельная копия: между плановыми днями возраст растёт законно,
+                # проблема — только пропущенный дедлайн (см. shared/backup_schedule.py)
+                if weekly_backup_missed(newest, schedule[0], schedule[1]):
+                    critical.append(
+                        f"🚨 {label}: пропущена недельная копия "
+                        f"(последняя {round((now_utc - newest).total_seconds() / 86400, 1)} дн назад)"
+                    )
+            else:
+                age_hours = (now_utc - newest).total_seconds() / 3600
+                if age_hours > BACKUP_WARN_HOURS:
+                    warning.append(f"🟠 {label}: последний backup {round(age_hours / 24, 1)} дн назад")
+        elif schedule:
+            critical.append(f"🚨 {label}: пропущена недельная копия (нет даты последнего backup)")
+        else:
+            warning.append(f"🟠 {label}: нет даты последнего backup")
+
+        total = float(disk_total_gb or 0)
+        free = float(disk_free_gb or 0)
+        if total > 0:
+            free_pct = round(free / total * 100, 1)
+            if free_pct < DISK_CRIT_FREE:
+                disk_critical.append(f"🔴 {label}: диск backup свободно {free_pct}% ({free} ГБ)")
+            elif free_pct < DISK_WARN_FREE:
+                disk_warning.append(f"🟠 {label}: диск backup свободно {free_pct}% ({free} ГБ)")
+
+    for (
+        server_name, log_name, log_path, total_size_gb,
+        file_count, status, error, created_at
+    ) in onec_log_rows:
+        created_utc = created_at.replace(tzinfo=timezone.utc)
+        age_min = (now_utc - created_utc).total_seconds() / 60
+        label = f"{server_name} 1C log {log_name}: {log_path}"
+
+        if age_min > ONEC_LOG_STALE_MINUTES:
+            warning.append(f"⚠️ {label}: метрики старше {round(age_min)} мин")
+
+        if status != "ok":
+            detail = error.splitlines()[0][:90] if error else status
+            critical.append(f"🚨 {label}: {detail}")
+            continue
+
+        size_gb = float(total_size_gb or 0)
+        if size_gb >= ONEC_LOG_CRIT_GB:
+            critical.append(f"🚨 {label}: размер {size_gb} ГБ")
+        elif size_gb >= ONEC_LOG_WARN_GB:
+            warning.append(f"🟠 {label}: размер {size_gb} ГБ")
+
+    for server_name, backup_path, file_path, status, error, created_at in verify_rows:
+        detail = (error or status or "").splitlines()[0][:90]
+        critical.append(
+            f"🚨 {server_name}: backup не прошёл RESTORE VERIFYONLY\n"
+            f"   {backup_path}: {detail}"
+        )
+
+    if not critical and not warning and not disk_critical and not disk_warning:
+        return "✅ Проблем не обнаружено"
+
+    msg = "🚨 ТРЕБУЕТ ВНИМАНИЯ\n\n"
+    msg += f"💽 Диски критично: {len(disk_critical)}\n"
+    msg += f"💽 Диски предупреждение: {len(disk_warning)}\n"
+    msg += f"🔴 Прочее критично: {len(critical)}\n"
+    msg += f"🟠 Прочее предупреждения: {len(warning)}\n\n"
+
+    if disk_critical or disk_warning:
+        msg += "💽 ДИСКИ\n"
+        if disk_critical:
+            msg += "\n".join(disk_critical) + "\n"
+        if disk_warning:
+            msg += ("\n" if disk_critical else "") + "\n".join(disk_warning)
+        msg += "\n\n"
+
+    if critical:
+        msg += "🔴 КРИТИЧНО\n"
+        msg += "\n".join(critical)
+        msg += "\n\n"
+
+    if warning:
+        msg += "🟠 ПРЕДУПРЕЖДЕНИЯ\n"
+        msg += "\n".join(warning)
+
+    return msg
+
+
+# ─── Отчёт ───────────────────────────────────────────────────
+
+def build_report(title: str = "📊 ОТЧЁТ ПО ИНФРАСТРУКТУРЕ") -> str:
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT MAX(created_at) FROM disk_metrics")
+        last_update = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT DISTINCT ON (server_name, disk_name)
+                   server_name, disk_name, free_gb, used_gb
+            FROM disk_metrics
+            ORDER BY server_name, disk_name, created_at DESC
+        """)
+        disk_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT DISTINCT ON (server_name)
+                   server_name, status, cpu_load, ram_total, ram_free, uptime_seconds
+            FROM server_status
+            ORDER BY server_name, checked_at DESC
+        """)
+        status_rows = cur.fetchall()
+
+    server_statuses = {row[0]: row[1:] for row in status_rows}
+    disks_by_server = defaultdict(list)
+    for server, disk, free, used in disk_rows:
+        disks_by_server[server].append((disk, float(free), float(used)))
+
+    all_servers = sorted(set(disks_by_server.keys()) | set(server_statuses.keys()))
+
+    critical = []
+    warning = []
+    msg = f"{title}\n\n"
+
+    for server in all_servers:
+        status_row = server_statuses.get(server)
+        status = status_row[0] if status_row else "unknown"
+        if status != "online":
+            msg += f"🔴 {server} ({status})\n\n"
+            continue
+
+        msg += f"🖥 {server}\n"
+        cpu_load, ram_total, ram_free, uptime_seconds = status_row[1:]
+        if cpu_load is not None:
+            cpu_load = float(cpu_load)
+            cpu_icon = "🔴" if cpu_load >= 90 else "🟠" if cpu_load >= 70 else "🟢"
+            msg += f"   {cpu_icon} CPU: {cpu_load}%\n"
+        if ram_total is not None and ram_free is not None and float(ram_total) > 0:
+            ram_total = float(ram_total)
+            ram_free = float(ram_free)
+            ram_used_pct = round((ram_total - ram_free) / ram_total * 100, 1)
+            ram_icon = "🔴" if ram_used_pct >= 90 else "🟠" if ram_used_pct >= 70 else "🟢"
+            msg += f"   {ram_icon} RAM: {ram_used_pct}% занято ({ram_free} ГБ свободно)\n"
+        if uptime_seconds is not None:
+            msg += f"   ⏱ Uptime: {_format_duration(uptime_seconds)}\n"
+
+        for disk, free, used in disks_by_server.get(server, []):
+            total = free + used
+            pct = round((free / total) * 100, 1) if total > 0 else 0
+            if pct < 10:
+                icon = "🔴"
+                critical.append(f"🔴 {server} → {disk} ({pct}%)")
+            elif pct < 20:
+                icon = "🟠"
+                warning.append(f"🟠 {server} → {disk} ({pct}%)")
+            else:
+                icon = "🟢"
+            msg += f"   {icon} {disk}: {pct}% свободно ({free} ГБ)\n"
+        msg += "\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+
+    if critical:
+        msg += "\n🚨 КРИТИЧЕСКИЕ ДИСКИ\n\n"
+        for item in critical:
+            msg += item + "\n"
+
+    if warning:
+        msg += "\n🟠 ПРЕДУПРЕЖДЕНИЕ\n\n"
+        for item in warning:
+            msg += item + "\n"
+
+    if last_update:
+        t = last_update.replace(tzinfo=timezone.utc).astimezone(ALMATY)
+        msg += f"\n\n📅 Данные актуальны на: {t.strftime('%d.%m.%Y %H:%M')}"
+
+    return msg

@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]==21.5
+psycopg2-binary==2.9.9
+pywinrm==0.4.3
+paramiko==3.5.0
+matplotlib==3.9.2

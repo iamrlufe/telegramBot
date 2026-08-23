@@ -1,0 +1,49 @@
+# Секреты и рабочий конфиг.
+# .env содержит TELEGRAM_TOKEN и пароль PostgreSQL, servers.json — реальные
+# хосты и учётки серверов. В репозиторий идёт только config/example.servers.json.
+.env
+.env.*
+!.env.example
+config/servers.json
+config/servers.json.bak
+config/ssh_key
+config/ssh_key.pub
+*.pem
+*.key
+id_rsa*
+
+# Мусор ОС и облачных дисков (Google Drive кладёт desktop.ini в каждую папку)
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Данные рантайма: том monitor_data (состояния алертов, heartbeat, дефер),
+# графики matplotlib и дампы — генерируются на сервере, версионировать нечего
+data/
+*.log
+*.sqlite
+*.sqlite3
+*.png
+*.bak
+
+# Артефакты graphify: ~24 МБ сгенерированного графа, кэша и суточных бэкапов.
+# Восстанавливается локально командой `graphify update .`
+graphify-out/
+
+# Локальные настройки инструментов
+.claude/settings.local.json
+.idea/
+.vscode/

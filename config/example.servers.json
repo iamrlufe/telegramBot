@@ -1,0 +1,93 @@
+[
+  {
+    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host.",
+    "name": "sql-01.example.local",
+    "host": "192.0.2.10",
+    "services": [
+      "MSSQLSERVER",
+      "SQLSERVERAGENT"
+    ],
+    "dbsize": true,
+    "backups": {
+      "sql": [
+        "E:\\Backups\\daily"
+      ]
+    },
+    "verify_backup": true
+  },
+  {
+    "_comment": "Все поддерживаемые поля Windows-сервера сразу, для справки.",
+    "name": "app-01.example.local",
+    "host": "192.0.2.11",
+    "services": [
+      "MSSQLSERVER",
+      "W3SVC",
+      "WAS",
+      "TermService"
+    ],
+    "dbsize": true,
+    "backups": {
+      "sql": [
+        "E:\\Backups\\base_one",
+        {
+          "_comment": "Копия раз в неделю: проверяется только по расписанию (пн, 09:00), а не по возрасту файла.",
+          "path": "E:\\Backups\\base_one\\FULL",
+          "schedule_weekday": "mon",
+          "schedule_by_hour": 9
+        },
+        {
+          "_comment": "Свой порог устаревания и проверка размера для конкретного пути.",
+          "path": "E:\\Backups\\base_two\\DIFF",
+          "alert_hours": 40,
+          "size_check": true
+        },
+        {
+          "_comment": "ignore_logs: рядом с полными копиями лежат журналы, их не учитывать.",
+          "path": "E:\\Backups\\base_three",
+          "ignore_logs": true
+        }
+      ],
+      "1c": [
+        "D:\\1CBase\\Backup1C"
+      ],
+      "veeam": [
+        "F:\\Veeam"
+      ]
+    },
+    "onec_logs": [
+      {
+        "name": "ЛогиСервера1С",
+        "path": "C:\\Program Files\\1cv8\\srvinfo\\reg_1541",
+        "warn_gb": 100,
+        "crit_gb": 150
+      }
+    ],
+    "retention_days": 30,
+    "backup_alert_hours": 30,
+    "backup_size_check": true,
+    "verify_backup": true,
+    "reg_file": "C:\\Scripts\\before_reboot.reg"
+  },
+  {
+    "_comment": "Linux по SSH: пароль ЛИБО ssh_key, пустой пароль означает вход по ключу. Бэкапы/1С/реестр к Linux неприменимы.",
+    "name": "web-01.example.local",
+    "host": "192.0.2.20",
+    "type": "linux",
+    "username": "monitor",
+    "password": "",
+    "ssh_port": 22,
+    "ssh_key": "/app/config/ssh_key",
+    "services": [
+      "apache2",
+      "ssh",
+      "cron",
+      "docker"
+    ]
+  },
+  {
+    "_comment": "Хост только для пинга: без сервисов и бэкапов.",
+    "name": "gw-01.example.local",
+    "host": "192.0.2.30",
+    "services": []
+  }
+]

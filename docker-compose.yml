@@ -1,0 +1,64 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  monitor:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config:ro
+      - monitor_data:/app/data
+    healthcheck:
+      # heartbeat обновляется каждый цикл (5 мин); если файл старше 20 минут —
+      # цикл завис и контейнер считается нездоровым
+      test: ["CMD-SHELL", "find /app/data/heartbeat -mmin -20 | grep -q ."]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # rw: бот редактирует servers.json через раздел ⚙️ Настройка
+      - ./config:/app/config
+      - monitor_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import psycopg2, os; psycopg2.connect(host=os.getenv('POSTGRES_HOST'), dbname=os.getenv('POSTGRES_DB'), user=os.getenv('POSTGRES_USER'), password=os.getenv('POSTGRES_PASSWORD')).close()\""]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  monitor_data:

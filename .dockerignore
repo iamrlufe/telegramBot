@@ -1,0 +1,30 @@
+# Что не должно попадать в контекст сборки и в образы.
+# Dockerfile копирует monitor/ (или bot/) и shared/ в один плоский /app,
+# поэтому любой посторонний файл из этих каталогов оказывается в образе.
+
+# Мусор ОС и облачных дисков (Google Drive кладёт desktop.ini в каждую папку)
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# Кэш Python: .pyc собран другой версией интерпретатора и в образе бесполезен
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# В образ не нужны
+tests/
+graphify-out/
+.claude/
+.git/
+.gitignore
+*.md
+
+# Секреты и рабочий конфиг: .env подключается через env_file,
+# config/ монтируется томом — внутрь образа они попадать не должны
+.env
+config/servers.json
+config/servers.json.bak
+config/ssh_key
