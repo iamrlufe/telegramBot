@@ -10,6 +10,7 @@
 # вида servers.json.bak и servers.json.<имя_сервера> — они содержат те же
 # реальные хосты и учётки, но под точечное правило не подпадали.
 config/*.json
+config/servers.json*
 !config/example.servers.json
 config/ssh_key
 config/ssh_key.pub
