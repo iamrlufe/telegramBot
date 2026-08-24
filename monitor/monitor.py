@@ -13,9 +13,9 @@ from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
 from backup_maintenance import run_backup_maintenance
 from db import (
-    save_disk_metric,
+    save_disk_metrics,
     save_server_status,
-    save_service_status,
+    save_service_statuses,
     save_process_metrics,
     get_disk_free_history,
     cleanup_removed_servers,
@@ -42,6 +42,7 @@ from alerts import (
     purge_server_state,
     send_or_defer,
     load_json,
+    save_json,
     DEFERRED_FILE,
     ALMATY,
 )
@@ -232,11 +233,18 @@ def process_server(server: dict):
 
         info = try_check_server(server)
 
+        # Замеры пишем одной вставкой до проверок, а не по диску внутри цикла:
+        # прогноз заполнения читает историю из БД и должен видеть текущий замер,
+        # поэтому запись обязана идти раньше check_disk_forecast_alert.
+        save_disk_metrics(name, [
+            (disk["Name"], float(disk["FreeGB"]), float(disk["UsedGB"]))
+            for disk in info["disks"]
+        ])
+
         for disk in info["disks"]:
             free = float(disk["FreeGB"])
             used = float(disk["UsedGB"])
             print(f"  💽 {name} {disk['Name']}: free={free}GB used={used}GB", flush=True)
-            save_disk_metric(name, disk["Name"], free, used)
             check_disk_alert(name, disk)
 
             # Прогноз заполнения — по истории из БД, уже с учётом только что
@@ -309,15 +317,24 @@ def process_server(server: dict):
         if info.get("docker_containers") is not None:
             check_docker_alerts(name, info["docker_containers"])
 
+        service_rows = []
         for service in info.get("services", []):
             service_name = service.get("Name")
-            display_name = service.get("Label") or service.get("DisplayName") or service_name
-            service_status = service.get("Status", "unknown")
+            if not service_name:
+                continue
+            service_rows.append((
+                service_name,
+                service.get("Label") or service.get("DisplayName") or service_name,
+                service.get("Status", "unknown"),
+            ))
+        save_service_statuses(name, service_rows)
+
+        for service in info.get("services", []):
+            service_name = service.get("Name")
             if not service_name:
                 continue
 
-            print(f"  ⚙️ {name} {service_name}: {service_status}", flush=True)
-            save_service_status(name, service_name, display_name, service_status)
+            print(f"  ⚙️ {name} {service_name}: {service.get('Status', 'unknown')}", flush=True)
             check_service_alert(name, service)
 
         return "online"
@@ -383,9 +400,10 @@ def maybe_send_self_report(now: datetime = None):
 
 
 def save_json_safe(path: str, data: dict):
+    """Та же атомарная запись, что и в alerts.save_json, но сбой записи только
+    логируется: отметка о самоотчёте не стоит падения цикла мониторинга."""
     try:
-        with open(path, "w") as f:
-            json.dump(data, f)
+        save_json(path, data)
     except OSError as e:
         print(f"[monitor] Не удалось записать {path}: {e}", flush=True)
 

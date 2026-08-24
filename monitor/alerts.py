@@ -1,5 +1,6 @@
 import os
 import json
+import tempfile
 import threading
 import time as time_module
 from datetime import datetime, timezone, timedelta
@@ -42,6 +43,19 @@ def _get_notify_id() -> str:
 # алерт офлайна вкладывает полный текст исключения WinRM/paramiko, который
 # легко переваливает за лимит — и такой алерт молча терялся целиком.
 TELEGRAM_TEXT_LIMIT = 4000
+
+
+def _hide_token(message: str, token: str) -> str:
+    """Убирает токен бота из текста ошибки перед выводом в лог.
+
+    requests вкладывает в исключение полный URL запроса, а токен — часть пути
+    (/bot<TOKEN>/sendMessage). Без этой замены любой сетевой сбой печатал
+    рабочий токен в stdout контейнера, откуда он уходит в docker logs и дальше
+    в любой сборщик логов.
+    """
+    if token and token in message:
+        message = message.replace(token, "<TOKEN>")
+    return message
 
 
 def _post_message(token: str, chat_id, text: str, reply_markup: dict = None):
@@ -114,7 +128,7 @@ def send_telegram(text: str, reply_markup: dict = None):
                 else:
                     print(f"[alerts] Алерт доставлен в личку {owner_id} (фолбэк)", flush=True)
     except Exception as e:
-        print(f"[alerts] Ошибка отправки в Telegram: {e}", flush=True)
+        print(f"[alerts] Ошибка отправки в Telegram: {_hide_token(str(e), token)}", flush=True)
 
 
 def server_alert_kb(server_name: str) -> dict:
@@ -316,8 +330,29 @@ def load_json(path: str) -> dict:
 
 
 def save_json(path: str, data: dict):
-    with open(path, "w") as f:
-        json.dump(data, f)
+    """Атомарная запись: сначала во временный файл рядом, потом os.replace.
+
+    Прямая запись в открытый на "w" файл сначала обрезает его до нуля.
+    Обрыв в этот момент (перезапуск контейнера, конец места на диске)
+    оставлял битый JSON, а load_json молча возвращает {} на любой ошибке —
+    то есть разом и незаметно терялись все заглушённые серверы и состояния
+    алертов. os.replace внутри одной файловой системы атомарен: читатель
+    видит либо прежний файл целиком, либо новый целиком.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ─── Алерты по дискам ────────────────────────────────────────

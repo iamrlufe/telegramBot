@@ -27,7 +27,7 @@ class _StubModule(types.ModuleType):
 
 _STUB_MODULES = [
     "winrm", "requests", "paramiko",
-    "psycopg2", "psycopg2.errors",
+    "psycopg2", "psycopg2.errors", "psycopg2.extras", "psycopg2.pool",
     "telegram", "telegram.ext", "telegram.error", "telegram.constants",
     "matplotlib", "matplotlib.pyplot", "matplotlib.dates", "matplotlib.ticker",
     "matplotlib.patches", "matplotlib.transforms",
@@ -45,3 +45,11 @@ class BadRequest(Exception):
 
 
 sys.modules["telegram.error"].BadRequest = BadRequest
+
+
+# psycopg2.Error тоже ловится в except (pgconn, pg_admin) — нужен настоящий класс.
+class PsycopgError(Exception):
+    pass
+
+
+sys.modules["psycopg2"].Error = PsycopgError
