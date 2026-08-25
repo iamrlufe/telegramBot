@@ -190,7 +190,8 @@ def validate_config(servers) -> None:
             if bah < 1 or bah > 720:
                 raise ValueError(f"Сервер «{name}»: backup_alert_hours должно быть от 1 до 720")
 
-        for flag in ("dbsize", "verify_backup", "backup_size_check", "verify_ssl"):
+        for flag in ("dbsize", "verify_backup", "backup_size_check",
+                     "verify_ssl", "legacy_tls"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
 
@@ -391,6 +392,16 @@ FIELD_DEFS = {
                   "Пропусти — проверять (безопасное значение по умолчанию).",
         "kind": "bool_on",
     },
+    "legacy_tls": {
+        "label": "Старый TLS",
+        "prompt": "Разрешить устаревшие настройки TLS? (да/нет)\n"
+                  "Нужно для vSphere 6.0/6.5: они не договариваются с "
+                  "современным клиентом, и подключение обрывается с ошибкой "
+                  "SSL: UNEXPECTED_EOF_WHILE_READING.\n"
+                  "Пропусти — не разрешать (для vSphere 7 и новее менять "
+                  "ничего не нужно).",
+        "kind": "bool",
+    },
     "snapshot_alert_days": {
         "label": "Снапшот: возраст (дней)",
         "prompt": "Алерт, если снапшот старше N дней. Например: 7\n"
@@ -420,7 +431,7 @@ WIZARD_ORDER = [
     "backups_sql", "backups_1c", "backups_veeam", "onec_logs",
     "dbsize", "retention_days", "backup_alert_hours", "backup_size_check",
     "verify_backup", "reg_file",
-    "verify_ssl", "snapshot_alert_days", "snapshot_alert_gb",
+    "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
 ]
 REQUIRED_FIELDS = {"name", "host"}
 
@@ -439,7 +450,7 @@ WINDOWS_ONLY_FIELDS = {
 # Поля только для vmware: TLS до vCenter и пороги по снапшотам.
 # На остальных типах их показывать незачем.
 VMWARE_ONLY_FIELDS = {
-    "verify_ssl", "snapshot_alert_days", "snapshot_alert_gb",
+    "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
 }
 
 # Чего у VMware нет: бэкапы, MSSQL, журналы 1С и реестр Windows.
@@ -985,6 +996,10 @@ def edit_fields_kb(server: dict):
                 f"Проверять сертификат: "
                 f"{'❌' if server.get('verify_ssl') is False else '✅'}",
                 callback_data="cfg_toggle:verify_ssl"
+            ),
+            InlineKeyboardButton(
+                f"Старый TLS: {'✅' if server.get('legacy_tls') else '❌'}",
+                callback_data="cfg_toggle:legacy_tls"
             ),
         ])
     keyboard.append([
@@ -1662,6 +1677,10 @@ HELP_VMWARE = """🖥 VMWARE (vCenter / ESXi)
 
 Сертификат у vSphere почти всегда самоподписанный — тогда в мастере
 на вопрос «Проверять сертификат» отвечай «нет».
+
+Если подключение падает с SSL: UNEXPECTED_EOF_WHILE_READING — это
+старый vCenter 6.0/6.5. Проверка сертификата тут ни при чём: включи
+«Старый TLS» в карточке сервера.
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 ЧТО СОБИРАЕТСЯ

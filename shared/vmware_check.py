@@ -488,13 +488,38 @@ def build_status(raw: dict, server: dict) -> dict:
 
 # ─── Обращение к vSphere ─────────────────────────────────────
 
-def _ssl_context(verify: bool):
-    if verify:
+def _ssl_context(verify: bool, legacy: bool = False):
+    if verify and not legacy:
         return None          # pyVmomi возьмёт системные доверенные корни
+
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    if not verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    if legacy:
+        # Старые vSphere (6.0/6.5) не договариваются с современным клиентом
+        # по двум причинам сразу: они предлагают только наборы шифров с
+        # обменом ключами на чистом RSA, которые нынешняя политика OpenSSL
+        # отсекает, и спотыкаются о ClientHello с расширениями TLS 1.3.
+        # Соединение при этом закрывается молча — в логе виден лишь
+        # UNEXPECTED_EOF_WHILE_READING, без причины.
+        #
+        # Оба ограничения снимаются только для той записи, где флаг задан
+        # явно: понижать планку для всех vCenter из-за одного старого нельзя.
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers("DEFAULT@SECLEVEL=1")
+
     return context
+
+
+def _legacy_tls(server: dict) -> bool:
+    value = server.get("legacy_tls")
+    if value is None:
+        value = os.getenv("VMWARE_LEGACY_TLS", "").strip().lower() in (
+            "1", "true", "yes", "да"
+        )
+    return bool(value)
 
 
 def _verify_ssl(server: dict) -> bool:
@@ -584,13 +609,24 @@ def _collect_raw(server: dict) -> dict:
     from pyVim.connect import SmartConnect, Disconnect
     from pyVmomi import vim, vmodl
 
-    connection = SmartConnect(
-        host=server["host"],
-        user=server.get("username") or os.getenv("VMWARE_USERNAME"),
-        pwd=server.get("password") or os.getenv("VMWARE_PASSWORD"),
-        port=int(server.get("port") or 443),
-        sslContext=_ssl_context(_verify_ssl(server)),
-    )
+    try:
+        connection = SmartConnect(
+            host=server["host"],
+            user=server.get("username") or os.getenv("VMWARE_USERNAME"),
+            pwd=server.get("password") or os.getenv("VMWARE_PASSWORD"),
+            port=int(server.get("port") or 443),
+            sslContext=_ssl_context(_verify_ssl(server), _legacy_tls(server)),
+        )
+    except ssl.SSLError as e:
+        # Сам по себе текст ошибки TLS ничего не подсказывает — дополняем
+        # его тем, что в этом случае нужно сделать
+        if not _legacy_tls(server):
+            raise RuntimeError(
+                f"TLS-соединение не установлено ({e}). Для vSphere 6.x "
+                f"включите «Старый TLS» в настройках сервера "
+                f"(legacy_tls: true в конфиге)."
+            ) from e
+        raise
     try:
         content = connection.RetrieveContent()
 

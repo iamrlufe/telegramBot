@@ -659,3 +659,64 @@ def test_top_line_survives_missing_values():
     line = _top_line(("app", None, None, None, None), by="cpu")
 
     assert line == "🟢 app — 0% CPU · 0 MB"
+
+
+# ─── Устаревший TLS (vSphere 6.x) ────────────────────────────
+
+def test_legacy_context_caps_tls12_and_lowers_cipher_policy():
+    """vSphere 6.0 предлагает только шифры с обменом ключами на чистом RSA
+    и спотыкается о ClientHello с расширениями TLS 1.3."""
+    import ssl
+
+    context = vc._ssl_context(verify=False, legacy=True)
+
+    assert context.maximum_version == ssl.TLSVersion.TLSv1_2
+    assert context.verify_mode == ssl.CERT_NONE
+
+
+def test_normal_context_keeps_modern_policy():
+    import ssl
+
+    context = vc._ssl_context(verify=False, legacy=False)
+
+    # Потолок не опускаем: на современных vCenter TLS 1.3 работает
+    assert context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
+    assert context.verify_mode == ssl.CERT_NONE
+
+
+def test_verifying_context_is_default_unless_legacy():
+    # None означает «настройки по умолчанию с системными корнями»
+    assert vc._ssl_context(verify=True, legacy=False) is None
+    assert vc._ssl_context(verify=True, legacy=True) is not None
+
+
+def test_legacy_context_still_verifies_when_asked():
+    import ssl
+
+    context = vc._ssl_context(verify=True, legacy=True)
+
+    # Старый TLS и отключение проверки сертификата — разные вещи
+    assert context.verify_mode != ssl.CERT_NONE
+    assert context.maximum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_legacy_flag_read_from_config(monkeypatch):
+    monkeypatch.delenv("VMWARE_LEGACY_TLS", raising=False)
+
+    assert vc._legacy_tls({"legacy_tls": True}) is True
+    assert vc._legacy_tls({}) is False
+
+
+def test_legacy_flag_from_env(monkeypatch):
+    monkeypatch.setenv("VMWARE_LEGACY_TLS", "true")
+
+    assert vc._legacy_tls({}) is True
+    # Значение в конфиге сильнее переменной окружения
+    assert vc._legacy_tls({"legacy_tls": False}) is False
+
+
+def test_wizard_asks_about_legacy_tls():
+    from config_editor import build_wizard_order
+
+    assert "legacy_tls" in build_wizard_order("vmware")
+    assert "legacy_tls" not in build_wizard_order("windows")

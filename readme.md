@@ -138,6 +138,7 @@ WINRM_PASSWORD=change_me
 # VMWARE_USERNAME=monitor@vsphere.local
 # VMWARE_PASSWORD=change_me
 # VMWARE_VERIFY_SSL=true            # false — не проверять самоподписанный сертификат
+# VMWARE_LEGACY_TLS=false           # true — разрешить устаревший TLS (vSphere 6.x)
 
 # BACKUP_ALERT_HOURS=25             # алерт "БЭКАП УСТАРЕЛ", если не задано у сервера/пути
 # BACKUP_SIZE_CHECK_MIN_RATIO=0.97  # порог "подозрительно маленький" (backup_size_check)
@@ -369,6 +370,34 @@ ESXi-хостов **вне** vCenter доменные учётки не рабо
 curl -sk https://<адрес-vcenter>/sdk/vimServiceVersions.xml
 ```
 
+### vSphere 6.x: ошибка UNEXPECTED_EOF_WHILE_READING
+
+Подключение к старым vCenter (6.0/6.5) обрывается на TLS-рукопожатии:
+
+```
+[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol
+```
+
+`verify_ssl: false` здесь не помогает — до проверки сертификата дело не
+доходит. Причины две сразу: такие серверы предлагают только наборы шифров
+с обменом ключами на чистом RSA, которые современная политика OpenSSL
+отсекает, и спотыкаются о ClientHello с расширениями TLS 1.3. Соединение
+закрывается молча, без внятной причины в логе.
+
+Лечится флагом `"legacy_tls": true` для конкретной записи (в боте —
+переключатель «Старый TLS» в карточке сервера). Он опускает потолок
+протокола до TLS 1.2 и понижает уровень строгости шифров **только для
+этого сервера**: ослаблять TLS для всех vCenter из-за одного старого
+нельзя. Проверка сертификата при этом остаётся независимой настройкой.
+
+Отличить этот случай от сетевой проблемы:
+
+```bash
+curl -sk https://<адрес>/sdk/vimServiceVersions.xml
+```
+
+Вернулся XML с версией `6.0` или `6.5` — это он.
+
 ### Что собирается
 
 - **Датасторы** → те же поля, что диски Windows/Linux, поэтому им сразу
@@ -447,6 +476,7 @@ Windows-специфично и для `vmware` не собирается. Кн�
 | `onec_logs` | нет | `[{"name", "path", "warn_gb", "crit_gb"}]` — контроль размера журнала регистрации 1С. |
 | `reg_file` | нет | Путь к `.reg` на сервере — импортируется перед перезагрузкой (только Windows). |
 | `verify_ssl` | нет | Только для `type: vmware`: проверять TLS-сертификат vCenter/ESXi. По умолчанию `true`. |
+| `legacy_tls` | нет | Только для `type: vmware`: разрешить устаревшие настройки TLS. Нужно для vSphere 6.0/6.5. |
 | `snapshot_alert_days` | нет | Только для `type: vmware`: алерт о снапшоте старше N дней. |
 | `snapshot_alert_gb` | нет | Только для `type: vmware`: алерт о снапшоте больше N ГБ. |
 
