@@ -286,7 +286,11 @@ def process_server(server: dict):
         save_process_metrics(name, "memory", info.get("top_memory", []))
 
         # Детали сервисов (контейнеры Docker, сайты веб-серверов) — для бота
-        save_service_details(name, info.get("service_details") or {})
+        save_service_details(
+            name,
+            info.get("service_details") or {},
+            info.get("platform_details") or {},
+        )
 
         check_smart_alert(name, info.get("unhealthy_disks") or [])
         check_disk_temp_alert(name, info.get("disk_temps") or [])

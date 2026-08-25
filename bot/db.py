@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton
 
 from pgconn import get_conn
-from service_details import load_service_details
+from service_details import load_service_details, load_platform_details
 from disk_health import format_disk_health, load_disk_health
 from backup_files import disk_of_path
 from backup_verify import path_str
@@ -411,6 +411,18 @@ def get_server_detail(server_name: str) -> str:
             if newest_file:
                 fresh = newest_file.strftime("%d.%m.%Y %H:%M")
                 msg += f"      Свежий: {fresh}\n"
+
+    # Разбивка платформы по хостам (vCenter): агрегат выше показывает,
+    # хватает ли ресурсов в целом, а здесь видно перекос между хостами
+    platform = load_platform_details(server_name)
+    host_lines = platform.get("hosts") or []
+    if host_lines:
+        msg += "\n🖥 ХОСТЫ\n"
+        for line in host_lines[:15]:
+            msg += f"   {str(line)[:90]}\n"
+        summary_lines = platform.get("summary") or []
+        for line in summary_lines:
+            msg += f"\n   🧩 Виртуальные машины: {str(line)[:90]}\n"
 
     # Сервисы (Windows-службы или systemd-юниты)
     if service_rows:

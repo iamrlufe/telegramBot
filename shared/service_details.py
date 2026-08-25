@@ -9,9 +9,14 @@ shared/service_details.py
 {
   "ServerName": {
     "updated": "2026-07-17T12:00:00+00:00",
-    "services": { "docker": ["строка", ...], "nginx": [...] }
+    "services": { "docker": ["строка", ...], "nginx": [...] },
+    "platform": { "hosts": ["строка", ...], "summary": [...] }
   }
 }
+
+Секция platform — про сам объект мониторинга, а не про его службы:
+разбивка vCenter по ESXi-хостам. Агрегат в карточке отвечает на вопрос
+«хватает ли ресурсов платформе», но не показывает перекос между хостами.
 """
 import json
 import os
@@ -39,14 +44,22 @@ def load_service_details(server_name: str) -> dict:
     return services if isinstance(services, dict) else {}
 
 
-def save_service_details(server_name: str, details: dict):
-    """Сохраняет детали сервисов сервера; пустой dict удаляет запись."""
+def load_platform_details(server_name: str) -> dict:
+    """{раздел: [строки]} про саму платформу (хосты ESXi); пусто, если нет."""
+    entry = load_all().get(server_name) or {}
+    platform = entry.get("platform")
+    return platform if isinstance(platform, dict) else {}
+
+
+def save_service_details(server_name: str, details: dict, platform: dict = None):
+    """Сохраняет детали сервера; пустые details и platform удаляют запись."""
     with _lock:
         data = load_all()
-        if details:
+        if details or platform:
             data[server_name] = {
                 "updated": datetime.now(timezone.utc).isoformat(),
-                "services": details,
+                "services": details or {},
+                "platform": platform or {},
             }
         elif server_name in data:
             del data[server_name]

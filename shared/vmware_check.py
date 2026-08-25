@@ -233,12 +233,28 @@ def top_vms(vms: list, by: str, limit: int = TOP_VM_LIMIT) -> list:
         {
             "Name": vm.get("name"),
             "Id": 0,
-            "CpuPercent": round(_num(vm.get("cpu_mhz_used")), 1),
+            # Именно процент загрузки выделенных ВМ ядер: vSphere отдаёт
+            # потребление в мегагерцах, и без пересчёта карточка сервера
+            # показывала бы «1967% CPU» — колонка называется cpu_percent.
+            "CpuPercent": round(_num(vm.get("cpu_percent")), 1),
             "CpuSeconds": None,
             "MemoryMB": round(_num(vm.get("memory_mb_used")), 1),
         }
         for vm in ranked[:limit]
     ]
+
+
+def vm_cpu_percent(cpu_mhz_used, num_cpu, host_mhz) -> float:
+    """Загрузка ВМ в процентах от выделенных ей ядер.
+
+    Ёмкость ВМ = число её vCPU × частота ядра хоста, на котором она
+    работает. Данных не хватает (ВМ выключена, хост неизвестен) — отдаём 0,
+    а не выдумываем число.
+    """
+    capacity = _num(num_cpu) * _num(host_mhz)
+    if capacity <= 0:
+        return 0.0
+    return round(_num(cpu_mhz_used) / capacity * 100, 1)
 
 
 def vm_detail_lines(vms: list, limit: int = 20) -> list:
@@ -258,6 +274,52 @@ def vm_detail_lines(vms: list, limit: int = 20) -> list:
         if len(lines) >= limit:
             break
     return lines
+
+
+def host_detail_lines(hosts: list) -> list:
+    """Строки по каждому ESXi-хосту для карточки сервера.
+
+    Агрегат по vCenter отвечает на вопрос «хватает ли ресурсов платформе»,
+    но не показывает перекос: один хост под завязку, другой пустой. Здесь
+    видно каждый.
+    """
+    lines = []
+    for host in sorted(hosts, key=lambda h: str(h.get("name") or "").lower()):
+        name = host.get("name") or "?"
+        state = host.get("connection_state")
+        if state not in (None, "connected"):
+            lines.append(f"🔴 {name} — {state}")
+            continue
+
+        cpu_total = _num(host.get("cpu_mhz_total"))
+        cpu_used = _num(host.get("cpu_mhz_used"))
+        cpu_pct = round(cpu_used / cpu_total * 100, 1) if cpu_total > 0 else 0.0
+        ram_total = _num(host.get("memory_bytes_total"))
+        ram_used = _num(host.get("memory_bytes_used"))
+        ram_pct = round(ram_used / ram_total * 100, 1) if ram_total > 0 else 0.0
+
+        mark = "🟠" if ram_pct >= 80 or cpu_pct >= 80 else "🟢"
+        if host.get("in_maintenance"):
+            mark = "🔧"
+        line = (f"{mark} {name} — CPU {cpu_pct}% · "
+                f"RAM {_gb(ram_used)}/{_gb(ram_total)} ГБ ({ram_pct}%)")
+        uptime = int(_num(host.get("uptime_seconds")))
+        if uptime:
+            line += f" · uptime {uptime // 86400} д"
+        if host.get("in_maintenance"):
+            line += " · обслуживание"
+        lines.append(line)
+    return lines
+
+
+def vm_summary_line(vms: list) -> str:
+    """Одна строка про парк ВМ: сколько включено, выключено, со снапшотами."""
+    on = sum(1 for vm in vms if str(vm.get("power_state")) == "poweredOn")
+    with_snapshots = sum(1 for vm in vms if vm.get("snapshots"))
+    parts = [f"всего {len(vms)}", f"включено {on}", f"выключено {len(vms) - on}"]
+    if with_snapshots:
+        parts.append(f"со снапшотами {with_snapshots}")
+    return " · ".join(parts)
 
 
 # ─── Снапшоты ────────────────────────────────────────────────
@@ -393,6 +455,10 @@ def build_status(raw: dict, server: dict) -> dict:
         "snapshots": snapshots,
         "vm_count": len(vms),
         "host_count": len(hosts),
+        "platform_details": {
+            "hosts": host_detail_lines(hosts),
+            "summary": [vm_summary_line(vms)] if vms else [],
+        },
     }
 
 
@@ -442,7 +508,11 @@ def _retrieve(content, vim, vmodl, obj_type, path_set) -> list:
         )
         rows = []
         for result in content.propertyCollector.RetrieveContents([filter_spec]):
-            rows.append({prop.name: prop.val for prop in result.propSet})
+            row = {prop.name: prop.val for prop in result.propSet}
+            # Ссылка на сам объект: по ней ВМ связывается со своим хостом,
+            # без этого не посчитать процент загрузки CPU
+            row["_ref"] = result.obj
+            rows.append(row)
         return rows
     finally:
         view.Destroy()
@@ -528,6 +598,8 @@ def _collect_raw(server: dict) -> dict:
                 "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo"
             ) or []
             hosts.append({
+                "_ref": row.get("_ref"),
+                "cpu_mhz_per_core": getattr(hardware, "cpuMhz", 0) or 0,
                 "name": row.get("name"),
                 "cpu_mhz_total": cpu_total,
                 "cpu_mhz_used": getattr(quick, "overallCpuUsage", 0) or 0,
@@ -543,9 +615,14 @@ def _collect_raw(server: dict) -> dict:
             })
 
         vms = []
+        # Частота ядра по каждому хосту: нужна, чтобы перевести потребление
+        # ВМ из мегагерц в проценты от выделенных ей ядер
+        mhz_by_host = {host["_ref"]: host["cpu_mhz_per_core"] for host in hosts}
+
         vm_rows = _retrieve(content, vim, vmodl, vim.VirtualMachine, [
-            "name", "runtime.powerState", "guest.toolsStatus",
+            "name", "runtime.powerState", "runtime.host", "guest.toolsStatus",
             "summary.quickStats", "snapshot", "layoutEx", "config.template",
+            "config.hardware.numCPU",
         ])
         for row in vm_rows:
             if row.get("config.template"):
@@ -556,11 +633,17 @@ def _collect_raw(server: dict) -> dict:
                 getattr(snapshot_info, "rootSnapshotList", None) if snapshot_info else None
             )
             sizes = snapshot_sizes(_layout_ex_to_dict(row.get("layoutEx")))
+            cpu_mhz_used = getattr(quick, "overallCpuUsage", 0) or 0
             vms.append({
                 "name": row.get("name"),
                 "power_state": str(row.get("runtime.powerState") or ""),
                 "tools_status": str(row.get("guest.toolsStatus") or "") or None,
-                "cpu_mhz_used": getattr(quick, "overallCpuUsage", 0) or 0,
+                "cpu_mhz_used": cpu_mhz_used,
+                "cpu_percent": vm_cpu_percent(
+                    cpu_mhz_used,
+                    row.get("config.hardware.numCPU"),
+                    mhz_by_host.get(row.get("runtime.host")),
+                ),
                 "memory_mb_used": getattr(quick, "guestMemoryUsage", 0) or 0,
                 "snapshots": [
                     {**node, "size_bytes": sizes.get(node["id"], 0)}

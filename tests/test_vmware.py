@@ -465,3 +465,77 @@ def test_env_can_switch_verification_off(monkeypatch):
     assert vc._verify_ssl({}) is False
     # Значение в конфиге сильнее переменной окружения
     assert vc._verify_ssl({"verify_ssl": True}) is True
+
+
+# ─── Разбивка по хостам и проценты CPU ───────────────────────
+
+def test_vm_cpu_reported_in_percent_not_megahertz():
+    """vSphere отдаёт потребление в МГц. Без пересчёта карточка сервера
+    показывала «1967% CPU» — колонка называется cpu_percent."""
+    # 4 vCPU на ядрах по 2000 МГц = ёмкость 8000 МГц, занято 2000 → 25%
+    assert vc.vm_cpu_percent(2000, 4, 2000) == 25.0
+
+
+@pytest.mark.parametrize("mhz,cpus,host_mhz", [
+    (2000, 0, 2000),      # число vCPU неизвестно
+    (2000, 4, 0),         # частота хоста неизвестна
+    (2000, None, None),   # ВМ выключена, данных нет
+])
+def test_cpu_percent_is_zero_when_capacity_unknown(mhz, cpus, host_mhz):
+    # Лучше 0, чем выдуманное число
+    assert vc.vm_cpu_percent(mhz, cpus, host_mhz) == 0.0
+
+
+def test_top_vms_report_percent_field():
+    vms = [dict(vm("busy", cpu=6000), cpu_percent=75.0)]
+
+    assert vc.top_vms(vms, "cpu")[0]["CpuPercent"] == 75.0
+
+
+def test_host_lines_show_each_host_separately():
+    """Ради чего всё: в vCenter несколько хостов, и агрегат их прячет."""
+    lines = vc.host_detail_lines([
+        host("esxi8", cores=10, mhz=2000, used_mhz=2000, ram_gb=100, used_ram_mb=90 * 1024),
+        host("esxi9", cores=10, mhz=2000, used_mhz=1000, ram_gb=100, used_ram_mb=10 * 1024),
+    ])
+
+    assert len(lines) == 2
+    assert lines[0].startswith("🟠 esxi8")      # RAM 90% — предупреждение
+    assert "CPU 10.0%" in lines[0]
+    assert "RAM 90.0/100.0 ГБ (90.0%)" in lines[0]
+    assert lines[1].startswith("🟢 esxi9")
+    assert "uptime 1 д" in lines[1]
+
+
+def test_host_line_marks_maintenance_and_offline():
+    lines = vc.host_detail_lines([
+        host("esxi-maint", maintenance=True),
+        host("esxi-down", state="notResponding"),
+    ])
+
+    # Хосты сортируются по имени, поэтому esxi-down идёт первым
+    by_name = {line.split()[1]: line for line in lines}
+    assert by_name["esxi-maint"].startswith("🔧 esxi-maint")
+    assert "обслуживание" in by_name["esxi-maint"]
+    assert by_name["esxi-down"] == "🔴 esxi-down — notResponding"
+
+
+def test_vm_summary_counts_states():
+    line = vc.vm_summary_line([
+        vm("a"), vm("b", power="poweredOff"),
+        vm("c", snapshots=[{"id": 1, "name": "s", "created_at": None}]),
+    ])
+
+    assert "всего 3" in line and "включено 2" in line
+    assert "выключено 1" in line and "со снапшотами 1" in line
+
+
+def test_build_status_exposes_platform_details():
+    status = vc.build_status(
+        {"datastores": [], "hosts": [host("esxi8"), host("esxi9")],
+         "vms": [vm("dc-01")], "server_time_utc": None},
+        {"name": "vcenter", "host": "h", "services": []},
+    )
+
+    assert len(status["platform_details"]["hosts"]) == 2
+    assert status["platform_details"]["summary"] == ["всего 1 · включено 1 · выключено 0"]
