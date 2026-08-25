@@ -217,6 +217,26 @@ def get_server_disks(server_name: str) -> list:
         return [(dn, float(free or 0), float(used or 0)) for dn, free, used in cur.fetchall()]
 
 
+def _top_line(row, by: str) -> str:
+    """Строка топа процессов/ВМ: иконка по нагрузке, без пустого PID.
+
+    У виртуальных машин идентификатора процесса нет, и в колонке лежит 0 —
+    выводить «(0)» бессмысленно. Иконка та же, что в разделе ВМ: 🔥 от 80%.
+    """
+    process_name, process_id, cpu_percent, _cpu_seconds, memory_mb = row
+    cpu_percent = cpu_percent if cpu_percent is not None else 0
+    memory_mb = memory_mb if memory_mb is not None else 0
+
+    icon = "🔥" if float(cpu_percent) >= 80 else "🟢"
+    name = str(process_name)
+    if process_id:
+        name += f" ({process_id})"
+
+    if by == "cpu":
+        return f"{icon} {name} — {cpu_percent}% CPU · {memory_mb} MB"
+    return f"{icon} {name} — {memory_mb} MB · {cpu_percent}% CPU"
+
+
 def get_server_detail(server_name: str) -> str:
     with get_conn() as conn:
         cur = conn.cursor()
@@ -443,17 +463,18 @@ def get_server_detail(server_name: str) -> str:
                 msg += f"      {str(line)[:90]}\n"
 
     if top_cpu_rows or top_memory_rows:
-        msg += "\n🔥 ТОП ПРОЦЕССОВ\n"
+        # Заголовок зависит от того, что в строках: у VMware это не процессы,
+        # а виртуальные машины, и «топ процессов» там читается как ошибка
+        header = "🖥 ТОП ВМ" if platform.get("vms") else "🔥 ТОП ПРОЦЕССОВ"
+        msg += f"\n{header}\n"
         if top_cpu_rows:
             msg += "   CPU:\n"
-            for process_name, process_id, cpu_percent, cpu_seconds, memory_mb in top_cpu_rows:
-                cpu_percent = cpu_percent if cpu_percent is not None else 0
-                msg += f"      {process_name} ({process_id}): {cpu_percent}% CPU, {memory_mb} MB\n"
+            for row in top_cpu_rows:
+                msg += f"      {_top_line(row, by='cpu')}\n"
         if top_memory_rows:
             msg += "   RAM:\n"
-            for process_name, process_id, cpu_percent, cpu_seconds, memory_mb in top_memory_rows:
-                cpu_percent = cpu_percent if cpu_percent is not None else 0
-                msg += f"      {process_name} ({process_id}): {memory_mb} MB, {cpu_percent}% CPU\n"
+            for row in top_memory_rows:
+                msg += f"      {_top_line(row, by='memory')}\n"
 
     # История за 24 часа
     msg += "\n📈 ИСТОРИЯ 24 ЧАСА\n"

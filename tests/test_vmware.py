@@ -603,3 +603,59 @@ def test_old_tools_not_flagged():
     lines = vc.vm_overview_lines([dict(vm("app", tools="toolsOld"), cpu_percent=1.0)])
 
     assert "Tools" not in lines[0]
+
+
+# ─── Отрисовка топа в карточке ───────────────────────────────
+
+# bot/db.py и monitor/db.py называются одинаково, и обычный import db
+# попадает в monitor — грузим модуль бота по явному пути.
+def _bot_db():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "bot" / "db.py"
+    spec = importlib.util.spec_from_file_location("bot_db", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_top_line_hides_empty_process_id():
+    """У виртуальной машины идентификатора процесса нет — в колонке 0,
+    и «(0)» в карточке выглядит как ошибка."""
+    _top_line = _bot_db()._top_line
+
+    line = _top_line(("agrotnk.kz", 0, 10.7, None, 819), by="cpu")
+
+    assert "(0)" not in line
+    assert line == "🟢 agrotnk.kz — 10.7% CPU · 819 MB"
+
+
+def test_top_line_keeps_real_process_id():
+    _top_line = _bot_db()._top_line
+
+    line = _top_line(("sqlservr", 4312, 40.0, None, 2048), by="cpu")
+
+    assert "(4312)" in line
+
+
+def test_top_line_marks_heavy_load():
+    _top_line = _bot_db()._top_line
+
+    assert _top_line(("busy", 0, 91.0, None, 100), by="cpu").startswith("🔥")
+
+
+def test_top_line_memory_order():
+    _top_line = _bot_db()._top_line
+
+    line = _top_line(("app", 0, 4.5, None, 2621), by="memory")
+
+    assert line == "🟢 app — 2621 MB · 4.5% CPU"
+
+
+def test_top_line_survives_missing_values():
+    _top_line = _bot_db()._top_line
+
+    line = _top_line(("app", None, None, None, None), by="cpu")
+
+    assert line == "🟢 app — 0% CPU · 0 MB"
