@@ -91,7 +91,7 @@
     "services": []
   },
   {
-    "_comment": "VMware: vCenter или отдельный ESXi. Опрос по HTTPS/443, роль Read-only с Propagate to children. services — имена ВМ, за которыми следим.",
+    "_comment": "VMware: vCenter или отдельный ESXi. Опрос по HTTPS/443, роль Read-only с Propagate to children. services — имена ВМ, за которыми следим. legacy_tls нужен только для vSphere 6.0/6.5, которые не договариваются с современным TLS.",
     "name": "vcenter.example.local",
     "host": "192.0.2.50",
     "type": "vmware",
@@ -103,6 +103,7 @@
       "app-01"
     ],
     "snapshot_alert_days": 7,
-    "snapshot_alert_gb": 50
+    "snapshot_alert_gb": 50,
+    "legacy_tls": false
   }
 ]
