@@ -420,9 +420,15 @@ def get_server_detail(server_name: str) -> str:
         msg += "\n🖥 ХОСТЫ\n"
         for line in host_lines[:15]:
             msg += f"   {str(line)[:90]}\n"
-        summary_lines = platform.get("summary") or []
-        for line in summary_lines:
-            msg += f"\n   🧩 Виртуальные машины: {str(line)[:90]}\n"
+
+    vm_lines = platform.get("vms") or []
+    if vm_lines:
+        summary = (platform.get("summary") or [""])[0]
+        msg += "\n🧩 ВИРТУАЛЬНЫЕ МАШИНЫ\n"
+        if summary:
+            msg += f"   {summary}\n\n"
+        for line in vm_lines:
+            msg += f"   {str(line)[:110]}\n"
 
     # Сервисы (Windows-службы или systemd-юниты)
     if service_rows:

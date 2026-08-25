@@ -201,17 +201,17 @@ def test_top_vms_by_memory():
     assert [row["Name"] for row in vc.top_vms(vms, "memory")] == ["b", "a"]
 
 
-def test_detail_lines_mark_tools_and_snapshots():
-    lines = vc.vm_detail_lines([
+def test_overview_marks_tools_and_snapshots():
+    lines = vc.vm_overview_lines([
         vm("app-01", tools="toolsNotRunning",
            snapshots=[{"id": 1, "name": "s", "created_at": None}]),
         vm("off-01", power="poweredOff"),
     ])
 
     assert "🟢 app-01" in lines[0]
-    assert "VMware Tools: toolsNotRunning" in lines[0]
-    assert "снапшотов: 1" in lines[0]
-    assert lines[1].startswith("⚪ off-01")
+    assert "⚠️ Tools" in lines[0]
+    assert "📸 1" in lines[0]
+    assert lines[1] == "⚪ Выключены (1): off-01"
 
 
 # ─── Снапшоты ────────────────────────────────────────────────
@@ -539,3 +539,67 @@ def test_build_status_exposes_platform_details():
 
     assert len(status["platform_details"]["hosts"]) == 2
     assert status["platform_details"]["summary"] == ["всего 1 · включено 1 · выключено 0"]
+
+
+# ─── Раздел «Виртуальные машины» в карточке ──────────────────
+
+def test_running_vms_sorted_by_cpu():
+    """Сверху то, что сейчас работает тяжелее всего."""
+    vms = [
+        dict(vm("calm"), cpu_percent=2.0),
+        dict(vm("busy"), cpu_percent=71.0),
+        dict(vm("medium"), cpu_percent=30.0),
+    ]
+
+    names = [line.split()[1] for line in vc.vm_overview_lines(vms)]
+
+    assert names == ["busy", "medium", "calm"]
+
+
+def test_stopped_vms_collapsed_into_one_line():
+    """Два десятка выключенных машин по строке каждая превращают карточку
+    в простыню, где включённые теряются."""
+    vms = [vm("on-01")] + [vm(f"off-{i}", power="poweredOff") for i in range(1, 7)]
+
+    lines = vc.vm_overview_lines(vms)
+
+    assert len(lines) == 2
+    assert lines[1].startswith("⚪ Выключены (6):")
+
+
+def test_many_stopped_vms_are_truncated():
+    vms = [vm(f"off-{i}", power="poweredOff") for i in range(1, 13)]
+
+    line = vc.vm_overview_lines(vms)[0]
+
+    assert line.startswith("⚪ Выключены (12):")
+    assert "и ещё 4" in line
+
+
+def test_running_list_is_capped():
+    vms = [dict(vm(f"vm-{i}"), cpu_percent=i) for i in range(1, 21)]
+
+    lines = vc.vm_overview_lines(vms, limit=5)
+
+    assert len(lines) == 6
+    assert lines[-1] == "…показаны первые 5 из 20 включённых"
+
+
+def test_hot_vm_is_marked():
+    lines = vc.vm_overview_lines([dict(vm("hot"), cpu_percent=95.0)])
+
+    assert lines[0].startswith("🔥 hot")
+
+
+def test_ram_shown_in_gigabytes():
+    lines = vc.vm_overview_lines([dict(vm("app", mem=7864), cpu_percent=4.1)])
+
+    # В топе процессов мегабайты, здесь гигабайты — рядом с хостами так читается
+    assert "RAM 7.7 ГБ" in lines[0]
+
+
+def test_old_tools_not_flagged():
+    """toolsOld — рабочее состояние, поднимать из-за него флаг незачем."""
+    lines = vc.vm_overview_lines([dict(vm("app", tools="toolsOld"), cpu_percent=1.0)])
+
+    assert "Tools" not in lines[0]

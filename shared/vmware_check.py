@@ -257,25 +257,6 @@ def vm_cpu_percent(cpu_mhz_used, num_cpu, host_mhz) -> float:
     return round(_num(cpu_mhz_used) / capacity * 100, 1)
 
 
-def vm_detail_lines(vms: list, limit: int = 20) -> list:
-    """Строки для карточки сервера — как это уже сделано для Hyper-V."""
-    lines = []
-    for vm in sorted(vms, key=lambda v: str(v.get("name") or "").lower()):
-        power = str(vm.get("power_state") or "")
-        mark = "🟢" if power == "poweredOn" else "⚪"
-        line = f"{mark} {vm.get('name')} — {POWER_STATE_MAP.get(power, power)}"
-        tools = vm.get("tools_status")
-        if power == "poweredOn" and tools and tools != "toolsOk":
-            line += f" | VMware Tools: {tools}"
-        snapshots = vm.get("snapshots") or []
-        if snapshots:
-            line += f" | снапшотов: {len(snapshots)}"
-        lines.append(line)
-        if len(lines) >= limit:
-            break
-    return lines
-
-
 def host_detail_lines(hosts: list) -> list:
     """Строки по каждому ESXi-хосту для карточки сервера.
 
@@ -309,6 +290,47 @@ def host_detail_lines(hosts: list) -> list:
         if host.get("in_maintenance"):
             line += " · обслуживание"
         lines.append(line)
+    return lines
+
+
+def vm_overview_lines(vms: list, limit: int = 15) -> list:
+    """Список ВМ для карточки сервера.
+
+    Включённые идут первыми и по убыванию нагрузки на CPU — сверху то, что
+    сейчас работает тяжелее всего. Выключенные не занимают по строке каждая:
+    их имена собираются в одну строку, иначе на парке из двух десятков машин
+    карточка превращается в простыню, где включённые теряются.
+
+    Выравнивание колонок не используется намеренно: бот шлёт обычный текст,
+    шрифт пропорциональный, и пробелы в колонки не сложатся.
+    """
+    lines = []
+    running = [vm for vm in vms if str(vm.get("power_state")) == "poweredOn"]
+    stopped = [vm for vm in vms if str(vm.get("power_state")) != "poweredOn"]
+
+    running.sort(key=lambda vm: _num(vm.get("cpu_percent")), reverse=True)
+    for vm in running[:limit]:
+        cpu = round(_num(vm.get("cpu_percent")), 1)
+        ram_gb = round(_num(vm.get("memory_mb_used")) / 1024, 1)
+        mark = "🔥" if cpu >= 80 else "🟢"
+        line = f"{mark} {vm.get('name')} — CPU {cpu}% · RAM {ram_gb} ГБ"
+        tools = vm.get("tools_status")
+        if tools and tools not in ("toolsOk", "toolsOld"):
+            line += " · ⚠️ Tools"
+        if vm.get("snapshots"):
+            line += f" · 📸 {len(vm['snapshots'])}"
+        lines.append(line)
+
+    if len(running) > limit:
+        # Без согласования по числу: «и ещё 1 включённых» читается как ошибка
+        lines.append(f"…показаны первые {limit} из {len(running)} включённых")
+
+    if stopped:
+        names = ", ".join(str(vm.get("name")) for vm in stopped[:8])
+        if len(stopped) > 8:
+            names += f" и ещё {len(stopped) - 8}"
+        lines.append(f"⚪ Выключены ({len(stopped)}): {names}")
+
     return lines
 
 
@@ -436,7 +458,6 @@ def build_status(raw: dict, server: dict) -> dict:
         for item in overcommitted_datastores(datastores)
     ]
 
-    detail_lines = vm_detail_lines(vms)
 
     return {
         "disks": map_datastores(datastores),
@@ -449,7 +470,9 @@ def build_status(raw: dict, server: dict) -> dict:
         "top_memory": top_vms(vms, "memory"),
         "server_time_utc": raw.get("server_time_utc"),
         "unhealthy_disks": unhealthy,
-        "service_details": {"vmware": detail_lines} if detail_lines else {},
+        # service_details — про службы сервера; ВМ и хосты живут в
+        # platform_details, у карточки для них отдельные разделы
+        "service_details": {},
         # Ниже — сверх общего контракта, для алертов по снапшотам.
         # Лишние ключи монитор игнорирует.
         "snapshots": snapshots,
@@ -457,6 +480,7 @@ def build_status(raw: dict, server: dict) -> dict:
         "host_count": len(hosts),
         "platform_details": {
             "hosts": host_detail_lines(hosts),
+            "vms": vm_overview_lines(vms),
             "summary": [vm_summary_line(vms)] if vms else [],
         },
     }
