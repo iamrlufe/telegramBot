@@ -88,7 +88,7 @@ def validate_config(servers) -> None:
         seen_hosts[host_key] = name
 
         stype = server.get("type")
-        if stype is not None and stype not in ("windows", "linux", "device"):
+        if stype is not None and stype not in ("windows", "linux", "device", "vmware"):
             raise ValueError(f"Сервер «{name}»: тип «{stype}» неизвестен")
 
         if "services" in server and not isinstance(server["services"], list):
@@ -190,9 +190,19 @@ def validate_config(servers) -> None:
             if bah < 1 or bah > 720:
                 raise ValueError(f"Сервер «{name}»: backup_alert_hours должно быть от 1 до 720")
 
-        for flag in ("dbsize", "verify_backup", "backup_size_check"):
+        for flag in ("dbsize", "verify_backup", "backup_size_check", "verify_ssl"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
+
+        for field in ("snapshot_alert_days", "snapshot_alert_gb"):
+            if field not in server:
+                continue
+            try:
+                value = int(server[field])
+            except (TypeError, ValueError):
+                raise ValueError(f"Сервер «{name}»: {field} должно быть числом")
+            if value < 1:
+                raise ValueError(f"Сервер «{name}»: {field} должно быть больше нуля")
 
         reg = server.get("reg_file")
         if reg is not None and not str(reg).lower().endswith(".reg"):
@@ -262,6 +272,7 @@ FIELD_DEFS = {
                   "• linux — сервер Linux, опрос по SSH\n"
                   "• device — сетевое устройство (коммутатор, шлюз, "
                   "принтер, камера), только ping\n"
+                  "• vmware — vCenter или отдельный ESXi, опрос по HTTPS\n"
                   "Пропусти — windows.",
         "kind": "type",
     },
@@ -372,6 +383,28 @@ FIELD_DEFS = {
                   "config/servers.json — полем \"size_check\": true/false у пути.",
         "kind": "bool",
     },
+    "verify_ssl": {
+        "label": "Проверять сертификат",
+        "prompt": "Проверять TLS-сертификат vCenter/ESXi? (да/нет)\n"
+                  "У vSphere сертификат почти всегда самоподписанный, и тогда "
+                  "проверка не пройдёт — отвечай «нет».\n"
+                  "Пропусти — проверять (безопасное значение по умолчанию).",
+        "kind": "bool",
+    },
+    "snapshot_alert_days": {
+        "label": "Снапшот: возраст (дней)",
+        "prompt": "Алерт, если снапшот старше N дней. Например: 7\n"
+                  "Забытый снапшот — самая частая причина внезапно кончившегося "
+                  "места на датасторе.\n"
+                  "Пропусти — по возрасту не проверять.",
+        "kind": "int",
+    },
+    "snapshot_alert_gb": {
+        "label": "Снапшот: размер (ГБ)",
+        "prompt": "Алерт, если снапшот вырос больше N ГБ. Например: 50\n"
+                  "Пропусти — по размеру не проверять.",
+        "kind": "int",
+    },
     "reg_file": {
         "label": "Reg-файл",
         "prompt": "Полный путь к .reg файлу НА САМОМ СЕРВЕРЕ. Бот импортирует его "
@@ -387,6 +420,7 @@ WIZARD_ORDER = [
     "backups_sql", "backups_1c", "backups_veeam", "onec_logs",
     "dbsize", "retention_days", "backup_alert_hours", "backup_size_check",
     "verify_backup", "reg_file",
+    "verify_ssl", "snapshot_alert_days", "snapshot_alert_gb",
 ]
 REQUIRED_FIELDS = {"name", "host"}
 
@@ -402,9 +436,30 @@ WINDOWS_ONLY_FIELDS = {
     "onec_logs", "dbsize", "retention_days", "verify_backup", "reg_file",
 }
 
+# Поля только для vmware: TLS до vCenter и пороги по снапшотам.
+# На остальных типах их показывать незачем.
+VMWARE_ONLY_FIELDS = {
+    "verify_ssl", "snapshot_alert_days", "snapshot_alert_gb",
+}
+
+# Чего у VMware нет: бэкапы, MSSQL, журналы 1С и реестр Windows.
+# Каталогов с копиями там тоже нет — датастор не файловая система,
+# доступная монитору, поэтому пути бэкапов исключаются целиком.
+VMWARE_EXCLUDED_FIELDS = WINDOWS_ONLY_FIELDS | {
+    "backups_sql", "backups_1c", "backups_veeam",
+    "backup_alert_hours", "backup_size_check",
+}
+
 # Шаги мастера для Linux: то же, что на Windows, минус Windows-only поля
 LINUX_WIZARD_ORDER = [
-    key for key in WIZARD_ORDER if key not in WINDOWS_ONLY_FIELDS
+    key for key in WIZARD_ORDER
+    if key not in WINDOWS_ONLY_FIELDS and key not in VMWARE_ONLY_FIELDS
+]
+
+# Шаги мастера для VMware: адрес vCenter/ESXi, учётка, TLS, список ВМ
+# под контролем и пороги по снапшотам
+VMWARE_WIZARD_ORDER = [
+    key for key in WIZARD_ORDER if key not in VMWARE_EXCLUDED_FIELDS
 ]
 
 
@@ -416,7 +471,9 @@ def build_wizard_order(type_value) -> list:
         return ["name", "host", "type"]
     if type_value == "linux":
         return list(LINUX_WIZARD_ORDER)
-    return list(WIZARD_ORDER)
+    if type_value == "vmware":
+        return list(VMWARE_WIZARD_ORDER)
+    return [key for key in WIZARD_ORDER if key not in VMWARE_ONLY_FIELDS]
 
 
 # Популярные systemd-юниты: выбор кнопками при типе linux
@@ -479,8 +536,9 @@ EDIT_FIELDS = [
     ["backups_veeam", "retention_days"],
     ["backup_alert_hours"],
     ["reg_file"],
+    ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
-TOGGLE_FIELDS = ["dbsize", "verify_backup", "backup_size_check"]
+TOGGLE_FIELDS = ["dbsize", "verify_backup", "backup_size_check", "verify_ssl"]
 
 
 # ─── Разбор значений (чистые функции) ────────────────────────
@@ -516,7 +574,9 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
             return True, "linux", None
         if low in {"device", "dev", "d", "устройство", "сетевое", "network"}:
             return True, "device", None
-        return False, None, "Ответь windows, linux или device (или пропусти)"
+        if low in {"vmware", "vm", "esxi", "vcenter", "vsphere", "вмваре"}:
+            return True, "vmware", None
+        return False, None, "Ответь windows, linux, device или vmware (или пропусти)"
 
     if kind in ("text", "secret"):
         return True, text, None
@@ -778,7 +838,12 @@ def build_summary(server: dict) -> str:
             continue
         if server_type == "device" and key not in ("host", "type"):
             continue
-        if server_type == "linux" and key in WINDOWS_ONLY_FIELDS:
+        if server_type == "linux" and (key in WINDOWS_ONLY_FIELDS
+                                       or key in VMWARE_ONLY_FIELDS):
+            continue
+        if server_type == "vmware" and key in VMWARE_EXCLUDED_FIELDS:
+            continue
+        if server_type != "vmware" and key in VMWARE_ONLY_FIELDS:
             continue
         lines.append(f"{FIELD_DEFS[key]['label']}: {display_value(server, key)}")
     return "\n".join(lines)
@@ -865,7 +930,13 @@ def edit_fields_kb(server: dict):
         if server_type == "device":
             row_keys = [key for key in row_keys if key in ("name", "host", "type")]
         elif server_type == "linux":
-            row_keys = [key for key in row_keys if key not in WINDOWS_ONLY_FIELDS]
+            row_keys = [key for key in row_keys
+                        if key not in WINDOWS_ONLY_FIELDS
+                        and key not in VMWARE_ONLY_FIELDS]
+        elif server_type == "vmware":
+            row_keys = [key for key in row_keys if key not in VMWARE_EXCLUDED_FIELDS]
+        else:
+            row_keys = [key for key in row_keys if key not in VMWARE_ONLY_FIELDS]
         if not row_keys:
             continue
         keyboard.append([
@@ -1412,6 +1483,9 @@ HELP_SERVERS = """🖧 ТИПЫ СЕРВЕРОВ И ПОЛЯ
   иначе они просто не собираются (в логе будет сказано, почему).
 • device — коммутатор/шлюз/принтер/камера: только ping и алерт падения,
   полный опрос и перезагрузка не поддерживаются.
+• vmware — vCenter или отдельный ESXi, опрос по HTTPS (порт 443).
+  Датасторы идут как обычные диски, ВМ из списка «Сервисы» — как
+  службы, плюс алерты по снапшотам. Подробнее — раздел 🖥 VMware.
 
 ━━━━━━━━━━━━━━━━━━━━
 📋 ПОЛЯ СЕРВЕРА
@@ -1531,6 +1605,45 @@ HELP_TIMING = """⏰ РАСПИСАНИЯ И ОТЧЁТЫ
 
 Долгие задачи (verify может идти до 2 часов на большой базе) крутятся
 в отдельном потоке и не тормозят обычный опрос."""
+
+
+HELP_VMWARE = """🖥 VMWARE (vCenter / ESXi)
+
+Тип сервера vmware опрашивает vSphere по HTTPS, порт 443. Ни SSH,
+ни агента на хостах не нужно — API включён всегда.
+
+Одна запись = одна точка подключения. vCenter даёт сразу всю
+инфраструктуру, отдельный ESXi — только себя.
+
+━━━━━━━━━━━━━━━━━━━━
+👤 УЧЁТНАЯ ЗАПИСЬ
+
+Роль Read-only на корне vCenter и ОБЯЗАТЕЛЬНО галочка
+«Propagate to children». Без неё права действуют только на сам
+объект vCenter: подключение пройдёт, а список датасторов и ВМ
+будет пустым — и это не выглядит как ошибка.
+
+Завести можно в Administration → Single Sign On → Users and Groups,
+домен vsphere.local. Для ESXi вне vCenter нужен локальный
+пользователь на каждом хосте: доменные учётки там не работают.
+
+Сертификат у vSphere почти всегда самоподписанный — тогда в мастере
+на вопрос «Проверять сертификат» отвечай «нет».
+
+━━━━━━━━━━━━━━━━━━━━
+📊 ЧТО СОБИРАЕТСЯ
+
+• датасторы — как обычные диски: пороги 15/10/5%, прогноз
+  заполнения, графики
+• хосты — память, загрузка CPU, uptime
+• ВМ из списка «Сервисы» — погасшая ВМ даёт обычный алерт
+• снапшоты — алерт по возрасту и размеру (пороги в мастере)
+• проблемы платформы — недоступные датасторы, перевыделение
+  тонких дисков, датчики железа, режим обслуживания
+
+Бэкапов, verify, MSSQL и журналов 1С у этого типа нет — эти поля
+мастер не спрашивает. Кнопки «Топ каталогов» под алертом датастора
+тоже нет: датастор монитору не файловая система."""
 
 
 HELP_RIGHTS = """🔐 ПРАВА И БЕЗОПАСНОСТЬ
@@ -1691,6 +1804,7 @@ HELP_SECTIONS = {
     "menu":    ("📂 Меню и команды",       HELP_MENU),
     "servers": ("🖧 Серверы и поля",       HELP_SERVERS),
     "backups": ("💾 Бэкапы",               HELP_BACKUPS),
+    "vmware":  ("🖥 VMware",               HELP_VMWARE),
     "alerts":  ("🔔 Алерты и тишина",      HELP_ALERTS),
     "timing":  ("⏰ Расписания",            HELP_TIMING),
     "rights":  ("🔐 Права и защита",       HELP_RIGHTS),

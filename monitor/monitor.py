@@ -26,6 +26,7 @@ from disk_health import purge_disk_health, save_disk_health
 from alerts import (
     check_disk_alert,
     check_disk_forecast_alert,
+    check_snapshot_alerts,
     check_disk_temp_alert,
     check_raid_alert,
     alert_server_online,
@@ -241,11 +242,12 @@ def process_server(server: dict):
             for disk in info["disks"]
         ])
 
+        kind = server_type(server)
         for disk in info["disks"]:
             free = float(disk["FreeGB"])
             used = float(disk["UsedGB"])
             print(f"  💽 {name} {disk['Name']}: free={free}GB used={used}GB", flush=True)
-            check_disk_alert(name, disk)
+            check_disk_alert(name, disk, kind)
 
             # Прогноз заполнения — по истории из БД, уже с учётом только что
             # сохранённого замера. Ошибку глушим: без прогноза мониторинг
@@ -259,7 +261,7 @@ def process_server(server: dict):
                         f"хватит на {round(trend['days_left'])} дн",
                         flush=True
                     )
-                check_disk_forecast_alert(name, disk["Name"], trend)
+                check_disk_forecast_alert(name, disk["Name"], trend, kind)
             except Exception as e:
                 print(f"  ⚠️ {name} {disk['Name']}: прогноз не построен: {e}", flush=True)
 
@@ -336,6 +338,21 @@ def process_server(server: dict):
 
             print(f"  ⚙️ {name} {service_name}: {service.get('Status', 'unknown')}", flush=True)
             check_service_alert(name, service)
+
+        # Снапшоты приходят только от VMware — у остальных типов ключа нет
+        if info.get("snapshots") is not None:
+            print(
+                f"  📸 {name}: ВМ {info.get('vm_count', 0)}, "
+                f"хостов {info.get('host_count', 0)}, "
+                f"снапшотов {len(info['snapshots'])}",
+                flush=True
+            )
+            check_snapshot_alerts(
+                name,
+                info["snapshots"],
+                max_age_days=server.get("snapshot_alert_days"),
+                max_size_gb=server.get("snapshot_alert_gb"),
+            )
 
         return "online"
 

@@ -89,5 +89,20 @@
     "name": "gw-01.example.local",
     "host": "192.0.2.30",
     "services": []
+  },
+  {
+    "_comment": "VMware: vCenter или отдельный ESXi. Опрос по HTTPS/443, роль Read-only с Propagate to children. services — имена ВМ, за которыми следим.",
+    "name": "vcenter.example.local",
+    "host": "192.0.2.50",
+    "type": "vmware",
+    "username": "monitor@vsphere.local",
+    "password": "",
+    "verify_ssl": false,
+    "services": [
+      "dc-01",
+      "app-01"
+    ],
+    "snapshot_alert_days": 7,
+    "snapshot_alert_gb": 50
   }
 ]

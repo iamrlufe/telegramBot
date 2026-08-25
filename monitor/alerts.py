@@ -20,6 +20,7 @@ QUIET_NOTICE_STATE_FILE = "/app/data/quiet_notice_state.json"
 DOCKER_STATE_FILE = "/app/data/docker_alert_state.json"
 SMART_STATE_FILE = "/app/data/smart_alert_state.json"
 TIME_DRIFT_STATE_FILE = "/app/data/time_drift_state.json"
+SNAPSHOT_STATE_FILE = "/app/data/snapshot_alert_state.json"
 
 TIME_DRIFT_ALERT_SEC = 120   # алерт при дрейфе больше 2 минут
 TIME_DRIFT_OK_SEC = 60       # восстановление при дрейфе меньше минуты
@@ -144,11 +145,17 @@ def server_alert_kb(server_name: str) -> dict:
     ]}
 
 
-def disk_alert_kb(server_name: str, disk_name: str) -> dict:
+def disk_alert_kb(server_name: str, disk_name: str, top_dirs: bool = True) -> dict:
+    """top_dirs=False — для датасторов VMware: разбор занятого места идёт
+    через robocopy или du, а датастор монитору как файловая система
+    недоступен. Кнопка, которая гарантированно вернёт ошибку, хуже, чем
+    её отсутствие."""
     kb = server_alert_kb(server_name)
-    kb["inline_keyboard"].insert(1, [
-        {"text": "📂 Топ каталогов", "callback_data": f"al_topdirs:{server_name}:{disk_name}"},
-    ])
+    if top_dirs:
+        kb["inline_keyboard"].insert(1, [
+            {"text": "📂 Топ каталогов",
+             "callback_data": f"al_topdirs:{server_name}:{disk_name}"},
+        ])
     return kb
 
 
@@ -355,6 +362,64 @@ def save_json(path: str, data: dict):
         raise
 
 
+# ─── Снапшоты VMware ─────────────────────────────────────────
+
+def check_snapshot_alerts(server_name: str, snapshots: list,
+                          max_age_days: int = None, max_size_gb: float = None):
+    """Алерт о снапшотах, вышедших за порог по возрасту или размеру.
+
+    Состояние храним, чтобы не повторять алерт каждые пять минут: пока
+    набор проблемных снапшотов не изменился, молчим. Исчезли все — шлём
+    одно сообщение о том, что снапшотов больше нет, и забываем сервер.
+    """
+    from vmware_check import stale_snapshots
+
+    if is_muted(server_name):
+        return
+    if not max_age_days and not max_size_gb:
+        return
+
+    flagged = stale_snapshots(snapshots, max_age_days, max_size_gb)
+    current = sorted(f"{item['vm']}/{item['name']}" for item in flagged)
+
+    with _state_lock:
+        state = load_json(SNAPSHOT_STATE_FILE)
+        previous = state.get(server_name) or []
+
+        if current == sorted(previous):
+            return
+
+        if not current:
+            state.pop(server_name, None)
+            save_json(SNAPSHOT_STATE_FILE, state)
+            send_or_defer(
+                f"✅ Снапшоты убраны\n"
+                f"🖥 Сервер: {server_name}\n"
+                f"Снапшотов сверх порога больше нет"
+            )
+            return
+
+        state[server_name] = current
+        save_json(SNAPSHOT_STATE_FILE, state)
+
+    lines = [
+        f"📸 СТАРЫЕ СНАПШОТЫ",
+        f"🖥 Сервер: {server_name}",
+        f"Найдено: {len(flagged)}",
+        "",
+    ]
+    for item in flagged[:10]:
+        lines.append(
+            f"• {item['vm']} · {item['name']} — {', '.join(item['reasons'])}"
+        )
+    if len(flagged) > 10:
+        lines.append(f"…и ещё {len(flagged) - 10}")
+    lines.append("")
+    lines.append("⚠️ Снапшот растёт, пока живёт, и съедает место на датасторе")
+
+    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name))
+
+
 # ─── Алерты по дискам ────────────────────────────────────────
 
 DISK_LEVELS = (5, 10, 15)      # пороги «свободно меньше N %»
@@ -369,7 +434,7 @@ def _disk_level(free_pct: float):
     return None
 
 
-def check_disk_alert(server_name: str, disk: dict):
+def check_disk_alert(server_name: str, disk: dict, kind: str = "windows"):
     """
     Алерт только при УХУДШЕНИИ: переход в более строгий порог или первое
     попадание в проблемную зону. Улучшение (место освободилось) состояние
@@ -421,7 +486,8 @@ def check_disk_alert(server_name: str, disk: dict):
         f"🔓 Свободно: {free} ГБ ({free_pct}%)\n"
         f"📦 Занято: {used} ГБ\n"
         f"⚠️ Рекомендуется проверить диск",
-        reply_markup=disk_alert_kb(server_name, disk["Name"])
+        reply_markup=disk_alert_kb(server_name, disk["Name"],
+                                   top_dirs=kind != "vmware")
     )
 
 
@@ -593,7 +659,8 @@ DISK_FORECAST_ALERT_DAYS = _num_env("DISK_FORECAST_ALERT_DAYS", 14)
 DISK_FORECAST_OK_DAYS = DISK_FORECAST_ALERT_DAYS * 2   # запас против дребезга
 
 
-def check_disk_forecast_alert(server_name: str, disk_name: str, trend: dict):
+def check_disk_forecast_alert(server_name: str, disk_name: str, trend: dict,
+                              kind: str = "windows"):
     """Алерт, когда по тренду место кончится раньше DISK_FORECAST_ALERT_DAYS.
     Снимается только при двукратном запасе — иначе прогноз, гуляющий вокруг
     порога, слал бы «кончится/не кончится» каждый цикл."""
@@ -632,7 +699,8 @@ def check_disk_forecast_alert(server_name: str, disk_name: str, trend: dict):
             f"(по {trend['points']} замерам за {round(trend['span_days'])} дн)\n"
             f"⏳ При таком темпе места хватит на ~{round(days_left)} дн\n"
             f"⚠️ Успеть освободить заранее дешевле, чем разбирать аварию",
-            reply_markup=disk_alert_kb(server_name, disk_name)
+            reply_markup=disk_alert_kb(server_name, disk_name,
+                                       top_dirs=kind != "vmware")
         )
     else:
         send_or_defer(

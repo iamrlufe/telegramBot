@@ -220,10 +220,15 @@ def _format_vm_line(vm: dict) -> str:
 
 
 def check_server(server: dict) -> dict:
-    if server_type(server) == "linux":
+    kind = server_type(server)
+    if kind == "linux":
         # Импорт по месту: paramiko нужен только при наличии Linux-серверов
         from linux_check import check_linux_server
         return check_linux_server(server)
+    if kind == "vmware":
+        # Импорт по месту: pyVmomi нужен только при наличии VMware в конфиге
+        from vmware_check import check_vmware_server
+        return check_vmware_server(server)
 
     service_specs = normalize_services(server)
 

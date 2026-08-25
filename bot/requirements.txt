@@ -3,3 +3,4 @@ psycopg2-binary==2.9.9
 pywinrm==0.4.3
 paramiko==3.5.0
 matplotlib==3.9.2
+pyvmomi==8.0.3.0.1

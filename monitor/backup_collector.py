@@ -758,8 +758,9 @@ def run_backup_cycle():
             continue
 
         kind = server_type(server)
-        if kind == "device":
-            # Сетевому устройству доступен только ping — опрашивать нечего
+        if kind in ("device", "vmware"):
+            # Сетевому устройству доступен только ping, а датастор VMware —
+            # не файловая система: каталогов с копиями там нет.
             continue
 
         print(f"[backup] Проверяю: {name} ({host})", flush=True)
