@@ -395,3 +395,73 @@ def test_disk_alert_keyboard_hides_top_dirs_for_vmware():
     assert "📂 Топ каталогов" not in buttons(
         disk_alert_kb("vcenter", "ds-01", top_dirs=False)
     )
+
+
+# ─── verify_ssl: флаг, у которого «по умолчанию» = включено ───
+
+def test_answer_no_writes_explicit_false():
+    """Ответ «нет» обязан записать false, а не просто не писать поле.
+
+    У обычных флагов (dbsize) отсутствие означает «выключено», у
+    verify_ssl — наоборот, «проверять». Если «нет» не пишет ничего,
+    ответ теряется и подключение падает на проверке сертификата.
+    """
+    from config_editor import parse_field_value
+
+    ok, value, error = parse_field_value("verify_ssl", "нет")
+
+    assert (ok, error) == (True, None)
+    assert value is False
+
+
+def test_answer_yes_omits_field_as_default():
+    from config_editor import parse_field_value
+
+    ok, value, _ = parse_field_value("verify_ssl", "да")
+
+    assert ok and value is None
+
+
+@pytest.mark.parametrize("text", ["no", "нет", "off", "n"])
+def test_various_negative_answers_write_false(text):
+    from config_editor import parse_field_value
+
+    ok, value, _ = parse_field_value("verify_ssl", text)
+    if ok:                       # набор синонимов задаётся FALSE_WORDS
+        assert value is False
+
+
+def test_false_survives_write_to_config():
+    from config_editor import apply_field
+
+    server = {}
+    apply_field(server, "verify_ssl", False)
+
+    assert server["verify_ssl"] is False
+
+
+def test_display_shows_default_as_yes():
+    from config_editor import display_value
+
+    assert display_value({}, "verify_ssl") == "да"
+    assert display_value({"verify_ssl": False}, "verify_ssl") == "нет"
+
+
+def test_check_uses_config_value():
+    """Ради чего всё: false в конфиге должен доходить до подключения."""
+    assert vc._verify_ssl({"verify_ssl": False}) is False
+    assert vc._verify_ssl({"verify_ssl": True}) is True
+
+
+def test_check_defaults_to_verifying(monkeypatch):
+    monkeypatch.delenv("VMWARE_VERIFY_SSL", raising=False)
+
+    assert vc._verify_ssl({}) is True
+
+
+def test_env_can_switch_verification_off(monkeypatch):
+    monkeypatch.setenv("VMWARE_VERIFY_SSL", "false")
+
+    assert vc._verify_ssl({}) is False
+    # Значение в конфиге сильнее переменной окружения
+    assert vc._verify_ssl({"verify_ssl": True}) is True

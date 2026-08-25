@@ -389,7 +389,7 @@ FIELD_DEFS = {
                   "У vSphere сертификат почти всегда самоподписанный, и тогда "
                   "проверка не пройдёт — отвечай «нет».\n"
                   "Пропусти — проверять (безопасное значение по умолчанию).",
-        "kind": "bool",
+        "kind": "bool_on",
     },
     "snapshot_alert_days": {
         "label": "Снапшот: возраст (дней)",
@@ -538,7 +538,12 @@ EDIT_FIELDS = [
     ["reg_file"],
     ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
-TOGGLE_FIELDS = ["dbsize", "verify_backup", "backup_size_check", "verify_ssl"]
+TOGGLE_FIELDS = ["dbsize", "verify_backup", "backup_size_check"]
+
+# Флаги, отсутствие которых в конфиге означает «включено», а не «выключено».
+# Для них выключение пишется явным false — иначе ответ «нет» бесследно
+# исчезает при чтении конфига.
+DEFAULT_ON_FIELDS = {"verify_ssl"}
 
 
 # ─── Разбор значений (чистые функции) ────────────────────────
@@ -653,6 +658,18 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
             return True, True, None
         if low in FALSE_WORDS:
             return True, None, None   # False = поле не пишем
+        return False, None, "Ответь «да» или «нет» (или пропусти)"
+
+    if kind == "bool_on":
+        # Флаг, у которого значение по умолчанию — «включено» (verify_ssl).
+        # Здесь «нет» обязано записать явный false: если поле просто не
+        # писать, при чтении вернётся значение по умолчанию, то есть «да»,
+        # и ответ пользователя потеряется.
+        low = text.lower()
+        if low in TRUE_WORDS:
+            return True, None, None   # True = значение по умолчанию, поле не пишем
+        if low in FALSE_WORDS:
+            return True, False, None
         return False, None, "Ответь «да» или «нет» (или пропусти)"
 
     if kind == "int":
@@ -795,6 +812,8 @@ def display_value(server: dict, key: str) -> str:
 
     if key == "type":
         return str(value or "windows")
+    if key in DEFAULT_ON_FIELDS:
+        return "да" if value is not False else "нет"
     if value is None or value == []:
         return "—"
     if key == "password":
@@ -958,6 +977,14 @@ def edit_fields_kb(server: dict):
             InlineKeyboardButton(
                 f"Проверка размера: {'✅' if server.get('backup_size_check') else '❌'}",
                 callback_data="cfg_toggle:backup_size_check"
+            ),
+        ])
+    if server_type == "vmware":
+        keyboard.append([
+            InlineKeyboardButton(
+                f"Проверять сертификат: "
+                f"{'❌' if server.get('verify_ssl') is False else '✅'}",
+                callback_data="cfg_toggle:verify_ssl"
             ),
         ])
     keyboard.append([
@@ -1246,8 +1273,14 @@ async def toggle_field(query, context, field: str):
         await safe_edit_message(query, f"❌ Сервер {server_name} не найден.", reply_markup=menu_kb())
         return
 
-    new_value = not server.get(field)
-    apply_field(server, field, True if new_value else None)
+    default = field in DEFAULT_ON_FIELDS
+    new_value = not server.get(field, default)
+    if default:
+        # «включено» — значение по умолчанию, поле не пишем;
+        # «выключено» — пишем явный false
+        apply_field(server, field, None if new_value else False)
+    else:
+        apply_field(server, field, True if new_value else None)
     try:
         save_config(servers)
     except Exception as e:
