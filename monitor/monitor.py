@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from server_check import check_server, server_type
-from service_details import save_service_details
+from service_details import save_details_from_info
 from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
 from backup_maintenance import run_backup_maintenance
@@ -286,11 +286,7 @@ def process_server(server: dict):
         save_process_metrics(name, "memory", info.get("top_memory", []))
 
         # Детали сервисов (контейнеры Docker, сайты веб-серверов) — для бота
-        save_service_details(
-            name,
-            info.get("service_details") or {},
-            info.get("platform_details") or {},
-        )
+        save_details_from_info(name, info)
 
         check_smart_alert(name, info.get("unhealthy_disks") or [])
         check_disk_temp_alert(name, info.get("disk_temps") or [])

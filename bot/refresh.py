@@ -3,7 +3,7 @@ import json
 from pgconn import get_conn
 from ping_tools import ping_host
 from server_check import check_server, server_type
-from service_details import save_service_details
+from service_details import save_details_from_info
 from winrm_errors import parse_status
 
 SERVERS_FILE = "/app/config/servers.json"
@@ -129,7 +129,7 @@ def refresh_server(server_name: str):
 
         info = check_server(server)
         save_online(server_name, info)
-        save_service_details(server_name, info.get("service_details") or {})
+        save_details_from_info(server_name, info)
         return True, None
     except Exception as e:
         error = str(e)

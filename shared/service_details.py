@@ -44,6 +44,23 @@ def load_service_details(server_name: str) -> dict:
     return services if isinstance(services, dict) else {}
 
 
+def save_details_from_info(server_name: str, info: dict):
+    """Сохраняет обе секции из ответа опроса сервера.
+
+    Нужен, чтобы не повторять разбор info в двух местах: монитор в своём
+    цикле и бот по кнопке «Проверить сейчас» вызывают одно и то же. Раньше
+    у каждого был свой вызов, и когда добавилась секция platform, бот
+    остался со старым — сохранял только services, а пустой результат
+    удалял запись целиком: нажатие «Обновить» стирало разбивку по хостам
+    и список ВМ до следующего цикла монитора.
+    """
+    save_service_details(
+        server_name,
+        info.get("service_details") or {},
+        info.get("platform_details") or {},
+    )
+
+
 def load_platform_details(server_name: str) -> dict:
     """{раздел: [строки]} про саму платформу (хосты ESXi); пусто, если нет."""
     entry = load_all().get(server_name) or {}
