@@ -22,7 +22,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(alerts, "is_muted", lambda name: False)
     sent = []
     monkeypatch.setattr(alerts, "send_or_defer",
-                        lambda text, reply_markup=None: sent.append(text))
+                        lambda text, reply_markup=None, ack_key=None: sent.append(text))
     return sent
 
 
@@ -72,13 +72,14 @@ def test_long_series_trimmed_in_message(state):
     assert "и ещё 4" in state[0]
 
 
-def test_state_file_does_not_grow_forever(state, tmp_path):
-    """Файл состояния живёт годами — ключи нужно ограничивать."""
-    for n in range(alerts.BACKUP_FAIL_KEYS_KEPT + 40):
+def test_state_keeps_keys_within_window(state, tmp_path):
+    """Ключи держатся по времени: ограничение числом приводило к тому,
+    что вытесненные события снова считались новыми."""
+    for n in range(200):
         alerts.check_backup_failure_alerts(
             "sql-01.example.local", [dict(EVENT, key=f"k{n}")])
     saved = json.loads((tmp_path / "backup_fail_state.json").read_text())
-    assert len(saved["sql-01.example.local"]) <= alerts.BACKUP_FAIL_KEYS_KEPT
+    assert len(saved["sql-01.example.local"]) == 200
 
 
 # ─── Сбор событий из SQL ─────────────────────────────────────

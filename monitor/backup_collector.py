@@ -621,7 +621,8 @@ def _check_weekly_schedule_alert(server_name: str, backup_type: str, backup_path
                 f"📁 {backup_path} ({backup_type})\n\n"
                 f"⏰ Ожидалась к {deadline_label} {deadline.strftime('%d.%m.%Y %H:%M')} — файла нет.\n"
                 f"📅 Последний известный: {last_seen}\n\n"
-                f"‼️ Проверьте задание недельного бэкапа немедленно!"
+                f"‼️ Проверьте задание недельного бэкапа немедленно!",
+                ack_key=f"backup_weekly:{server_name}:{backup_path}",
             )
     elif key in state:
         state.pop(key, None)
@@ -662,7 +663,8 @@ def _check_backup_alerts(server_name: str, backup_type: str,
                 f"🖥 {server_name}\n"
                 f"📁 {backup_path} ({backup_type})\n\n"
                 f"‼️ Каталог ПУСТ — файлов бэкапа нет вообще.\n"
-                f"❗️ Проверьте задание бэкапа немедленно!"
+                f"❗️ Проверьте задание бэкапа немедленно!",
+                ack_key=f"backup_empty:{server_name}:{backup_path}",
             )
         return
 
@@ -685,7 +687,8 @@ def _check_backup_alerts(server_name: str, backup_type: str,
                     f"📁 {backup_path} ({backup_type})\n\n"
                     f"⏰ Свежего бэкапа нет уже {round(age_hours)} ч ({age_days} дн)\n"
                     f"📅 Последний: {_fmt_local(metrics['newest_file'])}\n\n"
-                    f"‼️ Бэкапы важны — проверьте задание немедленно!"
+                    f"‼️ Бэкапы важны — проверьте задание немедленно!",
+                    ack_key=f"backup_stale:{server_name}:{backup_path}",
                 )
             return
 
@@ -727,7 +730,8 @@ def _check_backup_alerts(server_name: str, backup_type: str,
                             f"📦 Размер: {round(current_gb, 2)} ГБ ({pct}% от обычного)\n"
                             f"📊 Обычно: ~{round(baseline, 2)} ГБ (медиана {len(history)} посл. бэкапов)\n"
                             f"📅 Файл: {_fmt_local(metrics['newest_file'])}\n\n"
-                            f"‼️ Похоже, бэкап скопирован не до конца — проверьте вручную!"
+                            f"‼️ Похоже, бэкап скопирован не до конца — проверьте вручную!",
+                            ack_key=f"backup_small:{server_name}:{backup_path}",
                         )
                 elif state.get(size_key) == file_marker or size_key in state:
                     state.pop(size_key, None)
@@ -765,7 +769,8 @@ def _check_onec_log_alerts(server_name: str, log_name: str, log_path: str,
         f"📁 {log_name}: {log_path}\n"
         f"📦 Размер: {total_gb} ГБ\n"
         f"Порог: {'критично' if level == 'crit' else 'предупреждение'} "
-        f"({crit_gb if level == 'crit' else warn_gb} ГБ)"
+        f"({crit_gb if level == 'crit' else warn_gb} ГБ)",
+        ack_key=f"onec_log:{server_name}:{log_name}",
     )
 
 

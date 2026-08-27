@@ -47,6 +47,7 @@ from config_editor import (
 )
 from pg_admin import get_pg_stats, cleanup_options_kb
 import audit
+from alerts_ack import ack_alert
 from tg_utils import (
     safe_edit_message,
     safe_answer_query,
@@ -542,6 +543,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_config_menu(update, context)
 
 
+# ─── Приём алертов ──────────────────────────────────────────
+
+async def ack_callback(query):
+    """Кнопка «Принято» под алертом: подавляет именно этот алерт.
+
+    Полезно, когда причина известна и устранена, а источник ещё какое-то
+    время отдаёт старые записи — например джоб удалён, но его ошибки
+    остаются в логе SQL на сутки.
+    """
+    digest = query.data.split(":", 1)[1]
+    key, until = await asyncio.to_thread(ack_alert, digest)
+    if key is None:
+        await query.message.reply_text(
+            "Не удалось определить алерт — вероятно, состояние сброшено."
+        )
+        return
+    await query.message.reply_text(
+        f"✅ Принято: {key}\n"
+        f"Такой алерт не придёт до {until.strftime('%d.%m %H:%M')}.\n"
+        f"Список принятых и отмена — ⚙️ Настройка → 🔕 Принятые алерты.",
+    )
+
+
 # ─── Инлайн кнопки — детали сервера ─────────────────────────
 
 def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
@@ -615,7 +639,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
 
-    if query.data.startswith("backup_"):
+    if query.data.startswith("ack:"):
+        await ack_callback(query)
+
+    elif query.data.startswith("backup_"):
         await backup_callback(query, context)
 
     elif query.data.startswith("sqllog_"):

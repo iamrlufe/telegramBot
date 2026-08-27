@@ -306,7 +306,8 @@ def run_verify(servers: list):
                     f"📁 {backup_path}\n"
                     f"{file_line}\n"
                     f"❌ RESTORE VERIFYONLY: {res['status']}\n"
-                    f"{str(detail)[:200]}"
+                    f"{str(detail)[:200]}",
+                    ack_key=f"verify:{name}:{backup_path}",
                 )
 
     print("[verify] Цикл завершён", flush=True)

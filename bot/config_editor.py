@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
 
+from alerts_ack import active_acks, unack_alert
 from tg_utils import safe_edit_message, load_muted, save_muted, mute_expired, split_message
 from ping_tools import is_valid_host
 from backup_bot import load_delete_user_ids, build_paginated_server_keyboard
@@ -907,6 +908,7 @@ def menu_kb():
         [InlineKeyboardButton("➕ Добавить сервер", callback_data="cfg_add")],
         [InlineKeyboardButton("✏️ Изменить сервер", callback_data="cfg_edit_list")],
         [InlineKeyboardButton("🔕 Mute алертов", callback_data="cfg_mute_menu")],
+        [InlineKeyboardButton("✅ Принятые алерты", callback_data="cfg_acks")],
         [InlineKeyboardButton("🐘 База мониторинга", callback_data="cfg_pgsize")],
         [InlineKeyboardButton("🗑 Очистка истории", callback_data="cfg_pgclean_menu")],
         [InlineKeyboardButton("📜 Аудит изменений", callback_data="cfg_audit")],
@@ -1590,6 +1592,13 @@ HELP_ALERTS = """🔔 АЛЕРТЫ
 Приходят сами, без запроса. Повтор — только при смене уровня
 проблемы, чтобы не заваливать чат одинаковыми сообщениями.
 
+Под каждым алертом-проблемой есть кнопка ✅ Принято: она глушит именно
+этот алерт (проблема + объект) на сутки, а не весь сервер. Пригодится,
+когда причина уже устранена, а источник ещё отдаёт старые записи —
+например джоб удалён, но его ошибки лежат в логе SQL сутки.
+Список принятых и досрочная отмена — ⚙️ Настройка → ✅ Принятые алерты.
+Срок меняется переменной ALERT_ACK_HOURS в .env.
+
 Что ловится:
 • падение и восстановление сервера (ping не отвечает 15 раз подряд)
 • недоступность по WinRM/SSH с разбором причины
@@ -2135,6 +2144,36 @@ HELP_SECTIONS = {
 }
 
 
+async def show_acks(query):
+    """Список принятых (подавленных) алертов с возможностью вернуть.
+
+    Без такого списка подавление превращается в чёрную дыру: алерт молчит,
+    и вспомнить, кто и что заглушил, негде.
+    """
+    items = await asyncio.to_thread(active_acks)
+    if not items:
+        text = ("✅ ПРИНЯТЫЕ АЛЕРТЫ\n\n"
+                "Сейчас ничего не подавлено — все алерты приходят.\n\n"
+                "Кнопка «Принято» появляется под каждым алертом. Она "
+                "заглушает именно этот алерт (сервер + объект), а не весь "
+                "сервер: для полной тишины есть mute.")
+        keyboard = [[InlineKeyboardButton("◀️ Меню", callback_data="cfg_menu")]]
+        await safe_edit_message(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = ["✅ ПРИНЯТЫЕ АЛЕРТЫ\n"]
+    keyboard = []
+    for item in items[:20]:
+        until = datetime.fromisoformat(item["until"]).astimezone(ALMATY)
+        lines.append(f"• {item['key']}\n   до {until.strftime('%d.%m %H:%M')}")
+        keyboard.append([InlineKeyboardButton(
+            f"🔔 Вернуть: {item['key'][:40]}",
+            callback_data=f"cfg_unack:{item['digest']}")])
+    keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="cfg_menu")])
+    await safe_edit_message(query, "\n".join(lines),
+                            InlineKeyboardMarkup(keyboard))
+
+
 def help_menu_kb():
     keyboard, row = [], []
     for key, (title, _text) in HELP_SECTIONS.items():
@@ -2176,6 +2215,18 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data
+
+    if data == "cfg_acks":
+        await show_acks(query)
+        return
+
+    if data.startswith("cfg_unack:"):
+        digest = data.split(":", 1)[1]
+        key = await asyncio.to_thread(unack_alert, digest)
+        await query.message.reply_text(
+            f"🔔 Алерт снова включён: {key or 'неизвестный'}")
+        await show_acks(query)
+        return
 
     if data == "cfg_menu":
         context.user_data.pop(STATE_KEY, None)

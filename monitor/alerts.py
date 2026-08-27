@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from alerts_ack import (
+    ACK_HOURS, is_acked, with_ack_button, purge_acks_for_server,
+)
 from winrm_errors import error_to_status
 
 ALMATY = ZoneInfo("Asia/Almaty")
@@ -274,6 +277,7 @@ def purge_server_state(server_name: str):
         "/app/data/backup_alert_state.json",
         BACKUP_FAIL_STATE_FILE,
     ]
+    purge_acks_for_server(server_name)
     prefix = f"{server_name}:"
     with _state_lock:
         for path in state_files:
@@ -287,11 +291,23 @@ def purge_server_state(server_name: str):
                 save_json(path, state)
 
 
-def send_or_defer(text: str, reply_markup: dict = None):
+def send_or_defer(text: str, reply_markup: dict = None, ack_key: str = None):
     """В тихие часы копим до утра, иначе отправляем сразу.
 
     Исключений нет: тихий режим глушит ВСЁ, включая падение сервера и SMART.
-    Ночью ничего не пробивает — накопленное уходит утренней сводкой."""
+    Ночью ничего не пробивает — накопленное уходит утренней сводкой.
+
+    ack_key делает алерт «принимаемым»: под сообщением появляется кнопка
+    «Принято», а пока подавление держится, такой алерт не отправляется.
+    Проверка и кнопка сидят здесь, а не в каждом check_*, чтобы возможность
+    появилась у всех алертов сразу и не забылась в новых.
+    """
+    if ack_key:
+        if is_acked(ack_key):
+            print(f"[alerts] Подавлен (принят): {ack_key}", flush=True)
+            return
+        reply_markup = with_ack_button(reply_markup, ack_key)
+
     if not in_quiet_hours():
         send_telegram(text, reply_markup)
         return
@@ -366,9 +382,12 @@ def save_json(path: str, data: dict):
 
 # ─── Провалившийся бэкап MSSQL ───────────────────────────────
 
-# Сколько ключей событий помним на сервер: защита от разрастания файла
-# состояния, при этом хватает, чтобы не повторить алерт по кругу.
-BACKUP_FAIL_KEYS_KEPT = 60
+# Ключи помним по времени, а не последние N штук. Ограничение числом было
+# ошибкой: BACKUP LOG выполняется каждые 5 минут, за сутки набегает под
+# три сотни сбоев, буфер из 60 ключей переполнялся — вытесненные события
+# снова считались новыми, и алерт шёл по кругу. Держим двойное окно
+# поиска, чтобы событие точно не «протухло» раньше, чем выпадет из логов.
+BACKUP_FAIL_KEEP_HOURS = 48
 
 # В одно сообщение больше не кладём: серия одинаковых сбоев за ночь всё
 # равно читается по первым записям, а Telegram режет длинный текст.
@@ -386,16 +405,27 @@ def check_backup_failure_alerts(server_name: str, events: list):
     if is_muted(server_name) or not events:
         return
 
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=BACKUP_FAIL_KEEP_HOURS)).isoformat()
+
     with _state_lock:
         state = load_json(BACKUP_FAIL_STATE_FILE)
-        seen = state.get(server_name) or []
-        seen_set = set(seen)
+        seen = state.get(server_name) or {}
+        # Старый формат — список ключей без времени; переносим одним разом,
+        # иначе после обновления все прошлые сбои прилетят как новые.
+        if isinstance(seen, list):
+            seen = {key: now.isoformat() for key in seen}
+        seen = {key: when for key, when in seen.items() if when > cutoff}
 
-        fresh = [e for e in events if e.get("key") and e["key"] not in seen_set]
+        fresh = [e for e in events if e.get("key") and e["key"] not in seen]
         if not fresh:
+            state[server_name] = seen
+            save_json(BACKUP_FAIL_STATE_FILE, state)
             return
 
-        state[server_name] = (seen + [e["key"] for e in fresh])[-BACKUP_FAIL_KEYS_KEPT:]
+        for event in fresh:
+            seen[event["key"]] = now.isoformat()
+        state[server_name] = seen
         save_json(BACKUP_FAIL_STATE_FILE, state)
 
     lines = [
@@ -414,7 +444,8 @@ def check_backup_failure_alerts(server_name: str, events: list):
     if len(fresh) > BACKUP_FAIL_IN_MESSAGE:
         lines.append(f"… и ещё {len(fresh) - BACKUP_FAIL_IN_MESSAGE}")
 
-    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name))
+    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name),
+                  ack_key=f"backup_fail:{server_name}")
 
 
 # ─── Снапшоты VMware ─────────────────────────────────────────
@@ -472,7 +503,8 @@ def check_snapshot_alerts(server_name: str, snapshots: list,
     lines.append("")
     lines.append("⚠️ Снапшот растёт, пока живёт, и съедает место на датасторе")
 
-    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name))
+    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name),
+                  ack_key=f"snapshot:{server_name}")
 
 
 # ─── Алерты по дискам ────────────────────────────────────────
@@ -541,6 +573,7 @@ def check_disk_alert(server_name: str, disk: dict, kind: str = "windows"):
         f"🔓 Свободно: {free} ГБ ({free_pct}%)\n"
         f"📦 Занято: {used} ГБ\n"
         f"⚠️ Рекомендуется проверить диск",
+        ack_key=f"disk:{server_name}:{disk['Name']}",
         reply_markup=disk_alert_kb(server_name, disk["Name"],
                                    top_dirs=kind != "vmware")
     )
@@ -594,7 +627,8 @@ def alert_server_offline(server: dict, error: str):
         f"🖥 Сервер: {server['name']}\n"
         f"🌐 Хост: {server['host']}\n"
         f"❌ Ошибка: {str(error)[:600]}",
-        reply_markup=server_alert_kb(server["name"])
+        reply_markup=server_alert_kb(server["name"]),
+        ack_key=f"unreachable:{server['name']}",
     )
 
 
@@ -617,7 +651,8 @@ def alert_server_down(server: dict):
         f"🖥 Сервер: {server['name']}\n"
         f"🌐 Хост: {server['host']}\n"
         f"❌ Ping не отвечает",
-        reply_markup=server_alert_kb(server["name"])
+        reply_markup=server_alert_kb(server["name"]),
+        ack_key=f"offline:{server['name']}",
     )
 
 
@@ -693,7 +728,11 @@ def check_docker_alerts(server_name: str, containers: list):
         save_json(DOCKER_STATE_FILE, state_all)
 
     for message in messages:
-        send_or_defer(message, reply_markup=server_alert_kb(server_name))
+        # Ключ по первой строке сообщения: в одном цикле уходят алерты про
+        # разные объекты (контейнеры, массивы, диски), и общий ключ на
+        # сервер подавлял бы заодно и их.
+        send_or_defer(message, reply_markup=server_alert_kb(server_name),
+                      ack_key=f"{server_name}:{message.splitlines()[0][:60]}")
 
 
 # ─── Прогноз заполнения диска ────────────────────────────────
@@ -755,7 +794,8 @@ def check_disk_forecast_alert(server_name: str, disk_name: str, trend: dict,
             f"⏳ При таком темпе места хватит на ~{round(days_left)} дн\n"
             f"⚠️ Успеть освободить заранее дешевле, чем разбирать аварию",
             reply_markup=disk_alert_kb(server_name, disk_name,
-                                       top_dirs=kind != "vmware")
+                                       top_dirs=kind != "vmware"),
+            ack_key=f"forecast:{server_name}:{disk_name}",
         )
     else:
         send_or_defer(
@@ -859,7 +899,11 @@ def check_raid_alert(server_name: str, arrays: list):
             save_json(RAID_STATE_FILE, state)
 
     for message in messages:
-        send_or_defer(message, reply_markup=server_alert_kb(server_name))
+        # Ключ по первой строке сообщения: в одном цикле уходят алерты про
+        # разные объекты (контейнеры, массивы, диски), и общий ключ на
+        # сервер подавлял бы заодно и их.
+        send_or_defer(message, reply_markup=server_alert_kb(server_name),
+                      ack_key=f"{server_name}:{message.splitlines()[0][:60]}")
 
 
 # ─── Температура дисков ──────────────────────────────────────
@@ -925,7 +969,11 @@ def check_disk_temp_alert(server_name: str, disk_temps: list):
             save_json(DISK_TEMP_STATE_FILE, state)
 
     for message in messages:
-        send_or_defer(message, reply_markup=server_alert_kb(server_name))
+        # Ключ по первой строке сообщения: в одном цикле уходят алерты про
+        # разные объекты (контейнеры, массивы, диски), и общий ключ на
+        # сервер подавлял бы заодно и их.
+        send_or_defer(message, reply_markup=server_alert_kb(server_name),
+                      ack_key=f"{server_name}:{message.splitlines()[0][:60]}")
 
 
 # ─── SMART и дрейф времени ───────────────────────────────────
@@ -954,7 +1002,8 @@ def check_smart_alert(server_name: str, unhealthy: list):
             f"🖥 Сервер: {server_name}\n"
             f"{disks}\n"
             f"⚠️ Проверь диск и бэкапы — возможен выход из строя",
-            reply_markup=server_alert_kb(server_name)
+            reply_markup=server_alert_kb(server_name),
+            ack_key=f"smart:{server_name}",
         )
     else:
         send_or_defer(
@@ -992,7 +1041,8 @@ def check_time_drift(server_name: str, server_time_utc):
             f"🖥 Сервер: {server_name}\n"
             f"Расхождение с монитором: ~{minutes} мин\n"
             f"⚠️ Проверь NTP: рассинхрон ломает 1С, Kerberos и время бэкапов",
-            reply_markup=server_alert_kb(server_name)
+            reply_markup=server_alert_kb(server_name),
+            ack_key=f"timedrift:{server_name}",
         )
     else:
         send_or_defer(
@@ -1067,5 +1117,6 @@ def check_service_alert(server_name: str, service: dict):
 
     send_or_defer(
         message,
-        reply_markup=service_alert_kb(server_name, service_name) if is_problem else None
+        reply_markup=service_alert_kb(server_name, service_name) if is_problem else None,
+        ack_key=f"service:{server_name}:{service_name}" if is_problem else None,
     )
