@@ -17,7 +17,8 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from winlog import (
     read_reboots, read_service_failures, read_disk_errors,
     read_app_errors, read_failed_logons, group_failed_logons,
-    read_host_state, explain_event, friendly_winlog_error, CERT_WARN_DAYS,
+    read_host_state, explain_event, friendly_winlog_error,
+    CERT_OK_DAYS, CERT_WARN_DAYS,
 )
 from refresh import load_server
 from server_check import server_type
@@ -176,10 +177,12 @@ def format_logons(rows: list, hours: int) -> str:
                 "нехватке раздел вернул бы ошибку. Чаще всего выключен сам "
                 "аудит отказов — Windows пишет событие 4625, только если "
                 "включена политика «Аудит входа в систему» на отказ. "
-                "Проверить на сервере:\n"
-                "auditpol /get /subcategory:\"Вход в систему\"\n"
-                "Включить:\n"
-                "auditpol /set /subcategory:\"Вход в систему\" /failure:enable")
+                "Включить на сервере (cmd от администратора):\n"
+                "auditpol /set /subcategory:\"Вход в систему\" "
+                "/success:enable /failure:enable\n"
+                "auditpol /set /subcategory:\"Блокировка учетных записей\" "
+                "/failure:enable\n\n"
+                "Полный список команд — в справке бота, раздел 📜 Логи Windows.")
     total = sum(row.get("count", 1) for row in rows)
     lines = [f"🔐 Неудачные входы за {period_name(hours)} — {total} событий\n"]
     for row in rows[:SHOW_LIMIT]:
@@ -223,16 +226,19 @@ def format_host_state(data: dict, hours: int) -> str:
     certs = data.get("certs") or []
     lines.append("")
     if certs:
-        lines.append(f"📜 Сертификаты, истекающие в ближайшие {CERT_WARN_DAYS} дн.:")
+        lines.append(f"📜 Сертификаты ({len(certs)}), ближайшие к истечению сверху:")
+        lines.append(f"   🟢 больше {CERT_OK_DAYS} дн. · 🟡 меньше · "
+                     f"🔴 {CERT_WARN_DAYS} дн. и меньше")
         for cert in certs[:SHOW_LIMIT]:
             days = cert.get("days")
-            mark = "❌" if isinstance(days, int) and days < 0 else "⚠️"
-            when = "истёк" if isinstance(days, int) and days < 0 else f"через {days} дн."
-            lines.append(f"   {mark} {_short(cert.get('subject'), 70)}")
-            lines.append(f"      до {cert.get('until')} — {when}")
+            left = ("истёк" if isinstance(days, int) and days < 0
+                    else f"{days} дн." if days is not None else "срок неизвестен")
+            lines.append(f"{cert.get('level', '⚪')} {_short(_cert_name(cert), 60)}")
+            lines.append(f"      до {cert.get('until')} — осталось {left}")
+            if cert.get("iis"):
+                lines.append(f"      IIS: {', '.join(cert['iis'][:3])}")
     else:
-        lines.append(f"📜 Сертификаты: ничего не истекает в ближайшие "
-                     f"{CERT_WARN_DAYS} дн.")
+        lines.append("📜 Сертификатов в хранилище компьютера нет")
 
     fixes = data.get("hotfix") or []
     if fixes:
@@ -241,6 +247,16 @@ def format_host_state(data: dict, hours: int) -> str:
         for fix in fixes:
             lines.append(f"   {fix.get('id')}  {fix.get('on') or 'дата неизвестна'}")
     return "\n".join(lines)
+
+
+def _cert_name(cert: dict) -> str:
+    """Из Subject берём CN: полная строка (O=…, OU=…, C=…) не читается."""
+    subject = cert.get("subject") or ""
+    for part in subject.split(","):
+        part = part.strip()
+        if part.upper().startswith("CN="):
+            return part[3:]
+    return subject or "без имени"
 
 
 def _read_logons(server, hours):

@@ -197,6 +197,7 @@ _LOGON_PROJECTION = (
     "ip = ($d | Where-Object { $_.Name -eq 'IpAddress' }).'#text'; "
     "host = ($d | Where-Object { $_.Name -eq 'WorkstationName' }).'#text'; "
     "ltype = ($d | Where-Object { $_.Name -eq 'LogonType' }).'#text'; "
+    "eid = $_.Id; "
     "status = ($d | Where-Object { $_.Name -eq 'SubStatus' }).'#text'; "
     "status2 = ($d | Where-Object { $_.Name -eq 'Status' }).'#text' }"
 )
@@ -205,7 +206,9 @@ _LOGON_PROJECTION = (
 def read_failed_logons(server: dict, hours: int = 24,
                        limit: int = DEFAULT_LIMIT) -> list:
     """Неудачные входы в Windows (4625): кто, откуда, каким способом, почему."""
-    flt = "LogName='Security'; StartTime=$start; Id=4625"
+    # 4740 (учётная запись заблокирована) — прямое следствие перебора
+    # паролей, и попадает в тот же журнал: показываем вместе с отказами.
+    flt = "LogName='Security'; StartTime=$start; Id=4625,4740"
     rows = _query(server, hours, flt, _LOGON_PROJECTION, limit)
     for row in rows:
         # SubStatus точнее Status: в 4625 общий Status почти всегда 0xC000006D,
@@ -217,6 +220,10 @@ def read_failed_logons(server: dict, hours: int = 24,
         row["code"] = _normalize_status(code)
         row["reason"] = LOGON_FAILURE_REASONS.get(row["code"], "")
         row["how"] = LOGON_TYPES.get(str(row.get("ltype") or "").strip(), "")
+        if str(row.get("eid") or "") == "4740":
+            row["reason"] = ("учётная запись заблокирована после серии "
+                             "неудачных попыток")
+            row["how"] = ""
     return rows
 
 
@@ -233,7 +240,8 @@ def group_failed_logons(rows: list) -> list:
     grouped = {}
     for row in rows:
         key = (row.get("user") or "", row.get("ip") or "",
-               row.get("host") or "", row.get("code") or "")
+               row.get("host") or "", row.get("code") or "",
+               str(row.get("eid") or ""))
         item = grouped.get(key)
         when = row.get("d") or ""
         if item is None:
@@ -249,9 +257,29 @@ def group_failed_logons(rows: list) -> list:
 
 # ─── Состояние хоста: перезагрузка, сертификаты, обновления ──
 
-# Сертификат предупреждает заранее: 60 дней хватает, чтобы успеть
-# перевыпустить, и не настолько много, чтобы список превратился в шум.
-CERT_WARN_DAYS = 60
+# Пороги для сертификатов. Пользуемся тремя уровнями: пока больше двух
+# месяцев — это фон, месяц — пора планировать, две недели — уже горит.
+CERT_OK_DAYS = 60
+CERT_WARN_DAYS = 14
+
+# Показываем все сертификаты, а не только истекающие: «ничего не истекает»
+# не отвечает на вопрос «а что вообще стоит и до какого числа».
+CERT_LIST_LIMIT = 25
+
+
+def cert_level(days) -> str:
+    """🟢 больше двух месяцев · 🟡 меньше · 🔴 две недели и меньше."""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return "⚪"
+    if days < 0:
+        return "⛔"
+    if days <= CERT_WARN_DAYS:
+        return "🔴"
+    if days < CERT_OK_DAYS:
+        return "🟡"
+    return "🟢"
 
 
 def read_host_state(server: dict) -> dict:
@@ -269,9 +297,14 @@ def read_host_state(server: dict) -> dict:
     $sm = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager' -Name PendingFileRenameOperations
     if ($sm.PendingFileRenameOperations) {{ $reasons += 'файлы ждут замены при перезагрузке' }}
     $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $certs = @(Get-ChildItem Cert:\\LocalMachine\\My | Where-Object {{ $_.NotAfter -lt (Get-Date).AddDays({CERT_WARN_DAYS}) }} | ForEach-Object {{ @{{ subject = $_.Subject; until = $_.NotAfter.ToString('yyyy-MM-dd'); days = [int]($_.NotAfter - (Get-Date)).TotalDays }} }})
+    $certs = @(Get-ChildItem Cert:\\LocalMachine\\My | Sort-Object NotAfter | Select-Object -First {CERT_LIST_LIMIT} | ForEach-Object {{ @{{ subject = $_.Subject; until = $_.NotAfter.ToString('yyyy-MM-dd'); days = [int]($_.NotAfter - (Get-Date)).TotalDays; thumb = $_.Thumbprint }} }})
+    $iis = @()
+    if (Get-Module -ListAvailable -Name WebAdministration) {{
+        Import-Module WebAdministration -ErrorAction SilentlyContinue
+        $iis = @(Get-ChildItem IIS:\\SslBindings | ForEach-Object {{ @{{ bind = ($_.PSChildName -replace '!', ':'); thumb = $_.Thumbprint }} }})
+    }}
     $fixes = @(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 3 | ForEach-Object {{ @{{ id = $_.HotFixID; on = $(if ($_.InstalledOn) {{ $_.InstalledOn.ToString('yyyy-MM-dd') }} else {{ '' }}) }} }})
-    Out-B64 @{{ reboot = $reasons; boot = $(if ($boot) {{ $boot.ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }}); certs = $certs; hotfix = $fixes }}
+    Out-B64 @{{ reboot = $reasons; boot = $(if ($boot) {{ $boot.ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }}); certs = $certs; hotfix = $fixes; iis = $iis }}
     """
     raw = run_ps(server["host"], script,
                  server.get("username"), server.get("password"),
@@ -281,10 +314,21 @@ def read_host_state(server: dict) -> dict:
         data = data[0] if data else {}
     # PowerShell сворачивает список из одного элемента в сам элемент —
     # без нормализации разбор ниже спотыкается на единственном сертификате.
-    for key in ("reboot", "certs", "hotfix"):
+    for key in ("reboot", "certs", "hotfix", "iis"):
         value = data.get(key)
         if value is None:
             data[key] = []
         elif not isinstance(value, list):
             data[key] = [value]
+
+    # Привязка IIS ищется по отпечатку: имя сайта в самом сертификате не
+    # хранится, а знать «этот истекает на боевом сайте» важнее всего.
+    bindings = {}
+    for item in data["iis"]:
+        thumb = (item.get("thumb") or "").upper()
+        if thumb:
+            bindings.setdefault(thumb, []).append(item.get("bind") or "")
+    for cert in data["certs"]:
+        cert["level"] = cert_level(cert.get("days"))
+        cert["iis"] = bindings.get((cert.get("thumb") or "").upper(), [])
     return data

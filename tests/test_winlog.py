@@ -289,20 +289,108 @@ def test_no_pending_reboot_stated_positively():
     assert "не требуется" in text
 
 
-def test_expired_certificate_marked_differently():
-    """Истёкший и истекающий — разные ситуации, метка должна различаться."""
-    text = winlog_bot.format_host_state({
-        "reboot": [], "boot": "", "hotfix": [],
-        "certs": [{"subject": "CN=old.example.local", "until": "2026-08-01",
-                   "days": -20}],
-    }, 24)
-    assert "❌" in text and "истёк" in text
+# ─── Сертификаты: уровни и IIS ───────────────────────────────
+
+def test_cert_levels_follow_thresholds():
+    assert winlog.cert_level(90) == "🟢"
+    assert winlog.cert_level(45) == "🟡"
+    assert winlog.cert_level(14) == "🔴"
+    assert winlog.cert_level(-3) == "⛔"
 
 
-def test_expiring_certificate_shows_days_left():
+def test_cert_level_boundaries():
+    """Границы: 60 — ещё зелёный, 59 — жёлтый, 15 — жёлтый, 14 — красный."""
+    assert winlog.cert_level(winlog.CERT_OK_DAYS) == "🟢"
+    assert winlog.cert_level(winlog.CERT_OK_DAYS - 1) == "🟡"
+    assert winlog.cert_level(winlog.CERT_WARN_DAYS + 1) == "🟡"
+    assert winlog.cert_level(winlog.CERT_WARN_DAYS) == "🔴"
+
+
+def test_cert_level_handles_garbage():
+    assert winlog.cert_level(None) == "⚪"
+
+
+def test_all_certificates_listed_not_only_expiring(monkeypatch):
+    """«Ничего не истекает» не отвечало, что вообще стоит и до какого числа."""
+    scripts = _fake_ps(monkeypatch, {})
+    winlog.read_host_state(SERVER)
+    assert "Where-Object { $_.NotAfter -lt" not in scripts[0]
+    assert "Sort-Object NotAfter" in scripts[0]
+
+
+def test_iis_binding_matched_by_thumbprint(monkeypatch):
+    """Имя сайта в сертификате не хранится — связь только по отпечатку."""
+    _fake_ps(monkeypatch, {
+        "reboot": [], "boot": "", "hotfix": [],
+        "certs": [{"subject": "CN=portal.example.local", "until": "2026-10-01",
+                   "days": 35, "thumb": "AABBCC"}],
+        "iis": [{"bind": "0.0.0.0:443", "thumb": "aabbcc"}],
+    })
+    data = winlog.read_host_state(SERVER)
+    assert data["certs"][0]["iis"] == ["0.0.0.0:443"]
+    assert data["certs"][0]["level"] == "🟡"
+
+
+def test_cert_without_iis_binding_has_empty_list(monkeypatch):
+    _fake_ps(monkeypatch, {
+        "reboot": [], "boot": "", "hotfix": [], "iis": [],
+        "certs": [{"subject": "CN=srv", "until": "2027-01-01", "days": 300,
+                   "thumb": "DDEEFF"}],
+    })
+    assert winlog.read_host_state(SERVER)["certs"][0]["iis"] == []
+
+
+def test_cert_output_shows_days_and_site():
     text = winlog_bot.format_host_state({
         "reboot": [], "boot": "", "hotfix": [],
-        "certs": [{"subject": "CN=rdp.example.local", "until": "2026-10-01",
-                   "days": 30}],
+        "certs": [{"subject": "CN=portal.example.local, O=Example, C=KZ",
+                   "until": "2026-10-01", "days": 35, "level": "🟡",
+                   "iis": ["0.0.0.0:443"]}],
     }, 24)
-    assert "через 30 дн." in text
+    assert "🟡" in text and "осталось 35 дн." in text
+    assert "portal.example.local" in text
+    assert "O=Example" not in text, "полный Subject не читается"
+    assert "IIS: 0.0.0.0:443" in text
+
+
+def test_expired_cert_shown_as_expired():
+    text = winlog_bot.format_host_state({
+        "reboot": [], "boot": "", "hotfix": [], "certs": [
+            {"subject": "CN=old", "until": "2026-08-01", "days": -20,
+             "level": "⛔", "iis": []}]}, 24)
+    assert "⛔" in text and "истёк" in text
+
+
+def test_legend_explains_colors():
+    text = winlog_bot.format_host_state({
+        "reboot": [], "boot": "", "hotfix": [], "certs": [
+            {"subject": "CN=a", "until": "2027-01-01", "days": 300,
+             "level": "🟢", "iis": []}]}, 24)
+    assert "🟢" in text and "🔴" in text
+
+
+def test_lockout_event_included(monkeypatch):
+    """4740 — прямое следствие перебора паролей, показываем рядом с 4625."""
+    scripts = _fake_ps(monkeypatch, [])
+    winlog.read_failed_logons(SERVER)
+    assert "Id=4625,4740" in scripts[0]
+
+
+def test_lockout_event_explained(monkeypatch):
+    _fake_ps(monkeypatch, [{"d": "2026-08-27 13:00:00", "user": "ivanov",
+                            "domain": "DOM", "ip": "", "host": "PC-1",
+                            "ltype": "", "status": "", "status2": "",
+                            "eid": 4740}])
+    row = winlog.read_failed_logons(SERVER)[0]
+    assert "заблокирована" in row["reason"]
+
+
+def test_lockout_not_merged_with_failures():
+    """Отказ входа и блокировка — разные события одного пользователя."""
+    rows = [
+        {"d": "2026-08-27 13:00:00", "user": "ivanov", "ip": "192.0.2.5",
+         "host": "", "code": "0xC000006A", "eid": 4625},
+        {"d": "2026-08-27 13:01:00", "user": "ivanov", "ip": "192.0.2.5",
+         "host": "", "code": "0xC000006A", "eid": 4740},
+    ]
+    assert len(winlog.group_failed_logons(rows)) == 2
