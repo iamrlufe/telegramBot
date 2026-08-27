@@ -28,7 +28,8 @@ from alerts_ack import active_acks, unack_alert
 from tg_utils import safe_edit_message, load_muted, save_muted, mute_expired, split_message
 from ping_tools import is_valid_host
 from backup_bot import load_delete_user_ids, build_paginated_server_keyboard
-from backup_schedule import WEEKDAY_NAMES, path_schedule, weekday_label
+from backup_schedule import (WEEKDAY_NAMES, path_schedule, weekday_label,
+                             weekday_short)
 import pg_admin
 import audit
 
@@ -848,6 +849,46 @@ def _path_str(item):
 PRESERVED_PATH_KEYS = ("schedule_weekday", "schedule_by_hour", "size_check",
                        "ignore_logs")
 
+# Поля, значение которых — список путей с настройками. У них своё меню:
+# путь редактируется кнопками, а не строкой с «=» и «@».
+PATH_FIELDS = ("backups_sql", "backups_1c", "backups_veeam", "onec_logs")
+
+
+def normalize_path(path: str) -> str:
+    """Ключ сравнения путей. `E:\\Backups`, `e:\\backups\\` и `E:/Backups` —
+    один и тот же каталог, а в конфиге они жили как разные записи, и монитор
+    опрашивал его дважды."""
+    text = str(path or "").strip().replace("/", "\\")
+    stripped = text.rstrip("\\")
+    # У корня диска и корня Linux слэш — часть пути, а не хвост
+    if not stripped or stripped.endswith(":"):
+        return text.lower()
+    return stripped.lower()
+
+
+def dedupe_paths(items: list) -> list:
+    """Схлопывает повторы пути, сливая настройки: побеждает последняя
+    непустая. Дубли попадали в конфиг при правке руками и удваивали опрос."""
+    result = []
+    index_by_key = {}
+    for item in items or []:
+        path = _path_str(item)
+        if not path:
+            continue
+        key = normalize_path(path)
+        if key not in index_by_key:
+            index_by_key[key] = len(result)
+            result.append(item)
+            continue
+
+        position = index_by_key[key]
+        old, new = result[position], item
+        if isinstance(new, dict):
+            merged = dict(old) if isinstance(old, dict) else {"path": path}
+            merged.update({k: v for k, v in new.items() if v is not None})
+            result[position] = merged
+    return result
+
 
 def _merge_onec_logs(existing: list, new_items: list) -> list:
     """Список журналов задаётся целиком, но название журнала и пороги уже
@@ -857,14 +898,16 @@ def _merge_onec_logs(existing: list, new_items: list) -> list:
     for item in existing or []:
         path = _path_str(item)
         if path:
-            old_by_path[path] = dict(item) if isinstance(item, dict) else {}
+            old_by_path[normalize_path(path)] = (
+                dict(item) if isinstance(item, dict) else {}
+            )
 
     merged = []
     for item in new_items:
         path = _path_str(item)
         if not path:
             continue
-        entry = old_by_path.get(path, {})
+        entry = old_by_path.get(normalize_path(path), {})
         entry.pop("path", None)
         if isinstance(item, dict):
             for field in ("warn_gb", "crit_gb"):
@@ -875,7 +918,7 @@ def _merge_onec_logs(existing: list, new_items: list) -> list:
                 else:
                     entry[field] = item[field]
         merged.append({"path": path, **entry} if entry else path)
-    return merged
+    return dedupe_paths(merged)
 
 
 def _merge_backup_paths(existing: list, new_items: list) -> list:
@@ -890,7 +933,7 @@ def _merge_backup_paths(existing: list, new_items: list) -> list:
     for i, item in enumerate(merged):
         p = _path_str(item)
         if p:
-            index_by_path[p] = i
+            index_by_path[normalize_path(p)] = i
 
     def _finalize(entry, path):
         """None у поля = снято явно («@-»); путь без настроек — снова строка."""
@@ -901,29 +944,223 @@ def _merge_backup_paths(existing: list, new_items: list) -> list:
         p = _path_str(item)
         if not p:
             continue
+        key = normalize_path(p)
         entry = dict(item) if isinstance(item, dict) else {"path": p}
-        if p in index_by_path:
-            old = merged[index_by_path[p]]
+        if key in index_by_path:
+            old = merged[index_by_path[key]]
             if isinstance(old, dict):
-                for key in PRESERVED_PATH_KEYS:
-                    if key in old and key not in entry:
-                        entry[key] = old[key]
-            merged[index_by_path[p]] = _finalize(entry, p)
+                for preserved in PRESERVED_PATH_KEYS:
+                    if preserved in old and preserved not in entry:
+                        entry[preserved] = old[preserved]
+            merged[index_by_path[key]] = _finalize(entry, p)
         else:
             merged.append(_finalize(entry, p))
-            index_by_path[p] = len(merged) - 1
-    return merged
+            index_by_path[key] = len(merged) - 1
+    return dedupe_paths(merged)
 
 
-def apply_field(server: dict, key: str, value):
-    """Записывает значение в конфиг сервера; None удаляет поле."""
+# ─── Меню путей (бэкапы, журналы 1С) ─────────────────────────
+
+# Раньше все пути поля правились одной строкой с «=» и «@»: список путей
+# уезжал в неразборчивую простыню, удалить один путь было нельзя (только
+# очистить поле целиком), а отсутствие расписания вообще ничем не выдавало
+# себя. Теперь список — экран с кнопкой на каждый путь, а добавление
+# осталось текстовым: залить пять путей одним сообщением быстрее, чем
+# кнопками.
+
+SIZE_CHECK_CYCLE = (None, True, False)
+
+
+def field_items(server: dict, field: str) -> list:
+    """Список путей поля в том виде, в каком он лежит в конфиге."""
+    if field.startswith("backups_"):
+        backup_type = field.split("_", 1)[1]
+        value = (server.get("backups") or {}).get(backup_type)
+    else:
+        value = server.get(field)
+    if isinstance(value, (str, dict)):
+        value = [value]
+    return list(value or [])
+
+
+def path_button_label(path: str, limit: int = 24) -> str:
+    """На кнопке — хвост пути: у E:\\SQLBackup\\base_one\\FULL
+    различается именно он, а начало у всех путей одинаковое."""
+    parts = [part for part in str(path).replace("/", "\\").split("\\") if part]
+    label = "\\".join(parts[-2:]) if len(parts) > 1 else (parts[0] if parts else path)
+    return label if len(label) <= limit else "…" + label[-(limit - 1):]
+
+
+def path_details(field: str, item) -> list:
+    """Строки описания пути. Прочерк ставится и там, где настройки нет:
+    «расписание: нет» отвечает на вопрос, почему копия проверяется по
+    возрасту, — раньше отсутствие расписания было просто не видно."""
+    data = item if isinstance(item, dict) else {}
+    lines = []
+
+    if field == "onec_logs":
+        warn, crit = data.get("warn_gb"), data.get("crit_gb")
+        if warn is None and crit is None:
+            lines.append("   📏 пороги: общие (5 / 10 ГБ)")
+        else:
+            warn_text = f"{_gb(warn)} ГБ" if warn is not None else "общий (5 ГБ)"
+            crit_text = f"{_gb(crit)} ГБ" if crit is not None else "общий (10 ГБ)"
+            lines.append(f"   📏 пороги: {warn_text} / {crit_text}")
+        if data.get("name"):
+            lines.append(f"   🏷 название: {data['name']}")
+        return lines
+
+    schedule = path_schedule(item)
+    if schedule:
+        lines.append(
+            f"   🗓 недельно: {weekday_short(schedule[0])} {schedule[1]:02d}:00"
+        )
+        lines.append("   ⏱ порог возраста: не применяется (недельная копия)")
+    else:
+        hours = data.get("alert_hours")
+        lines.append(
+            f"   ⏱ порог возраста: {hours} ч" if hours
+            else "   ⏱ порог возраста: общий"
+        )
+        lines.append("   🗓 расписание: нет")
+
+    size_check = data.get("size_check")
+    if size_check is True:
+        lines.append("   🔍 проверка размера: включена")
+    elif size_check is False:
+        lines.append("   🔍 проверка размера: выключена")
+
+    if data.get("ignore_logs"):
+        lines.append("   📄 журналы .trn: не учитываются")
+    return lines
+
+
+def paths_menu_text(server_name: str, field: str, items: list) -> str:
+    label = FIELD_DEFS[field]["label"]
+    lines = [f"✏️ {server_name} · {label}", "━" * 20, ""]
+    if not items:
+        lines.append("Путей пока нет. Добавь их кнопкой ниже.")
+        return "\n".join(lines)
+
+    for number, item in enumerate(items, start=1):
+        lines.append(f"{number}. {_path_str(item)}")
+        lines += path_details(field, item)
+        lines.append("")
+    lines.append("Нажми на путь, чтобы изменить его настройки.")
+    return "\n".join(lines)
+
+
+def paths_menu_kb(server_name: str, field: str, items: list):
+    buttons = [
+        InlineKeyboardButton(
+            f"{number}. {path_button_label(_path_str(item))}",
+            callback_data=f"cfg_p:{field}:{number - 1}"
+        )
+        for number, item in enumerate(items, start=1)
+    ]
+    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    keyboard.append([
+        InlineKeyboardButton("➕ Добавить пути", callback_data=f"cfg_padd:{field}")
+    ])
+    if items:
+        keyboard.append([
+            InlineKeyboardButton("🧹 Очистить всё", callback_data=f"cfg_pclear:{field}")
+        ])
+    keyboard.append([
+        InlineKeyboardButton("◀️ К серверу", callback_data=f"cfg_editsrv:{server_name}")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def path_card_text(server_name: str, field: str, item) -> str:
+    lines = [f"📁 {_path_str(item)}", "━" * 20, ""]
+    lines += [line.strip() for line in path_details(field, item)]
+    lines.append("")
+    lines.append(f"{server_name} · {FIELD_DEFS[field]['label']}")
+    return "\n".join(lines)
+
+
+def path_card_kb(field: str, index: int, item):
+    data = item if isinstance(item, dict) else {}
+    prefix = f"{field}:{index}"
+
+    if field == "onec_logs":
+        keyboard = [[
+            InlineKeyboardButton("📏 Пороги", callback_data=f"cfg_plim:{prefix}"),
+        ]]
+    else:
+        size_check = data.get("size_check")
+        size_label = ("🔍 Размер: вкл" if size_check is True
+                      else "🔍 Размер: выкл" if size_check is False
+                      else "🔍 Размер: общий")
+        logs_label = ("📄 .trn: не учитывать" if data.get("ignore_logs")
+                      else "📄 .trn: учитывать")
+        keyboard = [
+            [
+                InlineKeyboardButton("⏱ Порог часов", callback_data=f"cfg_ph:{prefix}"),
+                InlineKeyboardButton("🗓 Расписание", callback_data=f"cfg_psch:{prefix}"),
+            ],
+            [
+                InlineKeyboardButton(size_label, callback_data=f"cfg_psz:{prefix}"),
+                InlineKeyboardButton(logs_label, callback_data=f"cfg_plog:{prefix}"),
+            ],
+        ]
+
+    keyboard.append([
+        InlineKeyboardButton("🗑 Удалить путь", callback_data=f"cfg_pdel:{prefix}")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("◀️ К списку", callback_data=f"cfg_plist:{field}")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def schedule_days_kb(field: str, index: int, has_schedule: bool):
+    prefix = f"{field}:{index}"
+    buttons = [
+        InlineKeyboardButton(weekday_short(day), callback_data=f"cfg_pday:{prefix}:{day}")
+        for day in WEEKDAY_NAMES
+    ]
+    keyboard = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    if has_schedule:
+        keyboard.append([
+            InlineKeyboardButton("🚫 Убрать расписание",
+                                 callback_data=f"cfg_pday:{prefix}:-")
+        ])
+    keyboard.append([
+        InlineKeyboardButton("◀️ Назад", callback_data=f"cfg_p:{prefix}")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def schedule_hours_kb(field: str, index: int, day: str):
+    prefix = f"{field}:{index}"
+    buttons = [
+        InlineKeyboardButton(f"{hour:02d}:00",
+                             callback_data=f"cfg_phour:{prefix}:{day}:{hour}")
+        for hour in range(24)
+    ]
+    keyboard = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+    keyboard.append([
+        InlineKeyboardButton("◀️ Назад", callback_data=f"cfg_psch:{prefix}")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+
+def apply_field(server: dict, key: str, value, merge: bool = True):
+    """Записывает значение в конфиг сервера; None удаляет поле.
+
+    merge=False пишет список путей как есть — так сохраняются правки из
+    меню путей, где пользователь уже видит итоговый список целиком.
+    Текстовый ввод, наоборот, дозаписывает: там называют один путь."""
     if key.startswith("backups_"):
         backup_type = key.split("_", 1)[1]
         backups = server.get("backups") or {}
         if not value:
             backups.pop(backup_type, None)
         else:
-            if FIELD_DEFS[key]["kind"] == "backup_paths":
+            if merge and FIELD_DEFS[key]["kind"] == "backup_paths":
                 existing = backups.get(backup_type) or []
                 if not isinstance(existing, list):
                     existing = [existing]
@@ -936,7 +1173,8 @@ def apply_field(server: dict, key: str, value):
         return
 
     if key == "onec_logs" and value:
-        value = _merge_onec_logs(server.get("onec_logs") or [], value)
+        value = (_merge_onec_logs(server.get("onec_logs") or [], value)
+                 if merge else dedupe_paths(value))
 
     if value is None:
         server.pop(key, None)
@@ -1339,6 +1577,10 @@ async def ask_edit_field(query, context, field: str):
             )
             return
 
+    if field in PATH_FIELDS:
+        await show_paths_menu(query, context, field)
+        return
+
     context.user_data[STATE_KEY] = {"mode": "edit_field", "server": server_name, "field": field}
     d = FIELD_DEFS[field]
     await safe_edit_message(
@@ -1727,10 +1969,17 @@ Host — IP или hostname, уникальный.
   и следим именно за ним, а не за мёртвой 32-битной службой.
 Бэкапы sql / 1c / veeam — каталоги с копиями (см. раздел 💾 Бэкапы).
 Журналы 1С — каталоги журнала регистрации, контроль размера.
-   Свои пороги для пути: путь=100/150 (ГБ, предупреждение/критично),
-   путь=100 — только предупреждение, путь=- — вернуть общие
-   пороги (5 и 10 ГБ). Пути задаются списком целиком, но
-   пороги и название известного пути сохраняются.
+   Пороги правятся кнопкой 📏 Пороги в карточке пути; при
+   добавлении их можно задать сразу: путь=100/150 (ГБ,
+   предупреждение/критично), путь=100 — только предупреждение.
+
+Бэкапы и журналы 1С открывают список путей: строка на путь со
+   всеми его настройками и кнопка на каждый. В карточке пути —
+   ⏱ Порог часов, 🗓 Расписание (день и час выбираются кнопками),
+   🔍 Размер, 📄 .trn, 🗑 Удалить путь. Добавление осталось
+   текстовым: несколько путей одним сообщением быстрее.
+   Строка «🗓 расписание: нет» показывается всегда — видно, что
+   путь проверяется по возрасту, а не по недельному дедлайну.
 DB Size — на сервере есть MSSQL: собираются размеры баз и открывается
   кнопка 🗄 SQL-логи в карточке (см. раздел 🗄 SQL-логи).
 Exchange — это почтовый сервер: открывает кнопку 📧 Почта (входы в OWA,
@@ -2377,6 +2626,193 @@ async def cmd_config_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── Экраны меню путей ───────────────────────────────────────
+
+def load_server_or_none(server_name: str):
+    try:
+        servers = load_config()
+        return next((s for s in servers if s.get("name") == server_name), None)
+    except Exception:
+        return None
+
+
+def update_path_items(server_name: str, field: str, items: list) -> tuple:
+    """Пишет список путей целиком: в меню виден итоговый список, дозапись
+    здесь только мешала бы удалять."""
+    servers = load_config()
+    server = next((s for s in servers if s.get("name") == server_name), None)
+    if not server:
+        return False, f"Сервер {server_name} не найден в конфиге"
+    apply_field(server, field, items or None, merge=False)
+    save_config(servers)
+    return True, server.get("name")
+
+
+async def show_paths_menu(query, context, field: str):
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    server = load_server_or_none(server_name)
+    if not server:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    context.user_data.pop(STATE_KEY, None)
+    items = field_items(server, field)
+    await safe_edit_message(
+        query,
+        paths_menu_text(server_name, field, items),
+        reply_markup=paths_menu_kb(server_name, field, items)
+    )
+
+
+async def show_path_card(query, context, field: str, index: int):
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    server = load_server_or_none(server_name)
+    if not server:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    items = field_items(server, field)
+    if index >= len(items):
+        await show_paths_menu(query, context, field)
+        return
+    context.user_data.pop(STATE_KEY, None)
+    await safe_edit_message(
+        query,
+        path_card_text(server_name, field, items[index]),
+        reply_markup=path_card_kb(field, index, items[index])
+    )
+
+
+def _entry_dict(item) -> dict:
+    return dict(item) if isinstance(item, dict) else {"path": item}
+
+
+def _pack_entry(entry: dict):
+    """Путь без настроек снова хранится строкой — так конфиг читается легче."""
+    cleaned = {k: v for k, v in entry.items() if v is not None}
+    return cleaned if len(cleaned) > 1 else cleaned.get("path")
+
+
+async def change_path_entry(query, context, field: str, index: int, changes: dict):
+    """Точечная правка одной настройки пути: пришло None — ключ снимается."""
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    server = load_server_or_none(server_name)
+    if not server:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    items = field_items(server, field)
+    if index >= len(items):
+        await show_paths_menu(query, context, field)
+        return
+
+    entry = _entry_dict(items[index])
+    for key, value in changes.items():
+        if value is None:
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    items[index] = _pack_entry(entry)
+
+    try:
+        ok, result = await asyncio.to_thread(
+            update_path_items, server_name, field, items
+        )
+    except Exception as e:
+        ok, result = False, f"ошибка записи: {str(e)[:120]}"
+    if not ok:
+        await safe_edit_message(query, f"❌ {result}", reply_markup=menu_kb())
+        return
+
+    audit.log_config_change(
+        query.from_user, "edit", server_name,
+        f"{FIELD_DEFS[field]['label']}: {_path_str(items[index])} — "
+        + ", ".join(f"{k}={v}" for k, v in changes.items())
+    )
+    await show_path_card(query, context, field, index)
+
+
+async def delete_path_entry(query, context, field: str, index: int):
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    server = load_server_or_none(server_name)
+    if not server:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    items = field_items(server, field)
+    if index >= len(items):
+        await show_paths_menu(query, context, field)
+        return
+
+    removed = _path_str(items.pop(index))
+    try:
+        ok, result = await asyncio.to_thread(
+            update_path_items, server_name, field, items
+        )
+    except Exception as e:
+        ok, result = False, f"ошибка записи: {str(e)[:120]}"
+    if not ok:
+        await safe_edit_message(query, f"❌ {result}", reply_markup=menu_kb())
+        return
+
+    audit.log_config_change(
+        query.from_user, "edit", server_name,
+        f"{FIELD_DEFS[field]['label']}: удалён путь {removed}"
+    )
+    await show_paths_menu(query, context, field)
+
+
+async def ask_path_value(query, context, field: str, index: int, mode: str):
+    """Значение, которого кнопками не наберёшь (часы, пороги), спрашиваем
+    текстом — но по одному, без синтаксиса «=» и «@»."""
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    server = load_server_or_none(server_name)
+    if not server:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    items = field_items(server, field)
+    if index >= len(items):
+        await show_paths_menu(query, context, field)
+        return
+
+    context.user_data[STATE_KEY] = {
+        "mode": mode, "server": server_name, "field": field, "idx": index,
+    }
+    if mode == "path_hours":
+        prompt = ("⏱ Пришли порог возраста в часах (число от 1 до 720).\n"
+                  "«-» — вернуть общий порог сервера.")
+    else:
+        prompt = ("📏 Пришли пороги размера в гигабайтах: "
+                  "предупреждение/критично, например 100/150.\n"
+                  "Одно число задаёт только предупреждение, "
+                  "«-» — вернуть общие пороги (5 и 10 ГБ).")
+
+    await safe_edit_message(
+        query,
+        f"📁 {_path_str(items[index])}\n\n{prompt}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"cfg_p:{field}:{index}")
+        ]])
+    )
+
+
+async def ask_path_add(query, context, field: str):
+    server_name = context.user_data.get(EDIT_SERVER_KEY)
+    if not server_name:
+        await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+        return
+    context.user_data[STATE_KEY] = {
+        "mode": "path_add", "server": server_name, "field": field,
+    }
+    await safe_edit_message(
+        query,
+        f"➕ {server_name} · {FIELD_DEFS[field]['label']}\n\n"
+        f"{FIELD_DEFS[field]['prompt']}\n\n"
+        "Уже добавленные пути останутся: перечисленные допишутся или "
+        "обновятся. Настройки каждого пути потом правятся кнопками.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"cfg_plist:{field}")
+        ]])
+    )
+
+
+
 async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
     if not can_configure(query.from_user):
         await safe_edit_message(query, "⛔ Нет прав на изменение конфигурации.")
@@ -2486,6 +2922,108 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cfg_f:"):
         await ask_edit_field(query, context, data.split(":", 1)[1])
 
+    elif data.startswith("cfg_plist:"):
+        await show_paths_menu(query, context, data.split(":", 1)[1])
+
+    elif data.startswith("cfg_padd:"):
+        await ask_path_add(query, context, data.split(":", 1)[1])
+
+    elif data.startswith("cfg_pclear:"):
+        field = data.split(":", 1)[1]
+        server_name = context.user_data.get(EDIT_SERVER_KEY)
+        try:
+            ok, result = await asyncio.to_thread(
+                update_path_items, server_name, field, []
+            )
+        except Exception as e:
+            ok, result = False, f"ошибка записи: {str(e)[:120]}"
+        if not ok:
+            await safe_edit_message(query, f"❌ {result}", reply_markup=menu_kb())
+            return
+        audit.log_config_change(query.from_user, "edit", server_name,
+                                f"{FIELD_DEFS[field]['label']}: очищено")
+        await show_paths_menu(query, context, field)
+
+    elif data.startswith("cfg_p:"):
+        _, field, index = data.split(":", 2)
+        await show_path_card(query, context, field, int(index))
+
+    elif data.startswith("cfg_pdel:"):
+        _, field, index = data.split(":", 2)
+        await delete_path_entry(query, context, field, int(index))
+
+    elif data.startswith("cfg_ph:"):
+        _, field, index = data.split(":", 2)
+        await ask_path_value(query, context, field, int(index), "path_hours")
+
+    elif data.startswith("cfg_plim:"):
+        _, field, index = data.split(":", 2)
+        await ask_path_value(query, context, field, int(index), "path_limits")
+
+    elif data.startswith("cfg_psz:"):
+        _, field, index = data.split(":", 2)
+        index = int(index)
+        server = load_server_or_none(context.user_data.get(EDIT_SERVER_KEY))
+        items = field_items(server, field) if server else []
+        current = (items[index].get("size_check")
+                   if index < len(items) and isinstance(items[index], dict) else None)
+        # общий → включена → выключена → снова общий
+        nxt = SIZE_CHECK_CYCLE[(SIZE_CHECK_CYCLE.index(current) + 1)
+                               % len(SIZE_CHECK_CYCLE)]
+        await change_path_entry(query, context, field, index, {"size_check": nxt})
+
+    elif data.startswith("cfg_plog:"):
+        _, field, index = data.split(":", 2)
+        index = int(index)
+        server = load_server_or_none(context.user_data.get(EDIT_SERVER_KEY))
+        items = field_items(server, field) if server else []
+        current = (items[index].get("ignore_logs")
+                   if index < len(items) and isinstance(items[index], dict) else None)
+        await change_path_entry(query, context, field, index,
+                                {"ignore_logs": None if current else True})
+
+    elif data.startswith("cfg_psch:"):
+        _, field, index = data.split(":", 2)
+        index = int(index)
+        server = load_server_or_none(context.user_data.get(EDIT_SERVER_KEY))
+        items = field_items(server, field) if server else []
+        if index >= len(items):
+            await show_paths_menu(query, context, field)
+            return
+        schedule = path_schedule(items[index])
+        current = (f"Сейчас: {weekday_label(schedule[0])}, {schedule[1]:02d}:00"
+                   if schedule else "Сейчас: расписания нет, "
+                                    "путь проверяется по возрасту файла")
+        await safe_edit_message(
+            query,
+            f"🗓 {_path_str(items[index])}\n\n{current}\n\n"
+            "Копия раз в неделю: выбери день, потом час. "
+            "Порог возраста к такому пути не применяется.",
+            reply_markup=schedule_days_kb(field, index, bool(schedule))
+        )
+
+    elif data.startswith("cfg_pday:"):
+        _, field, index, day = data.split(":", 3)
+        index = int(index)
+        if day == "-":
+            await change_path_entry(query, context, field, index,
+                                    {"schedule_weekday": None,
+                                     "schedule_by_hour": None})
+            return
+        await safe_edit_message(
+            query,
+            f"🗓 {weekday_label(day)} — в котором часу проверять?",
+            reply_markup=schedule_hours_kb(field, index, day)
+        )
+
+    elif data.startswith("cfg_phour:"):
+        _, field, index, day, hour = data.split(":", 4)
+        # Недельная копия и порог по возрасту исключают друг друга
+        await change_path_entry(query, context, field, int(index),
+                                {"schedule_weekday": day,
+                                 "schedule_by_hour": int(hour),
+                                 "alert_hours": None})
+
     elif data.startswith("cfg_toggle:"):
         await toggle_field(query, context, data.split(":", 1)[1])
 
@@ -2562,6 +3100,115 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
         await pg_admin.show_cleanup_preview(query, days)
 
 
+async def handle_path_text(update, context, state: dict, text: str, send) -> bool:
+    """Текстовый ввод из меню путей: добавление списком, часы и пороги —
+    по одному значению, без синтаксиса."""
+    field, server_name = state["field"], state["server"]
+    mode = state["mode"]
+    cancel_to = (f"cfg_plist:{field}" if mode == "path_add"
+                 else f"cfg_p:{field}:{state.get('idx', 0)}")
+
+    def back_kb():
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=cancel_to)
+        ]])
+
+    if mode == "path_add":
+        ok, value, error = parse_field_value(field, text)
+        if not ok:
+            await send(f"⚠️ {error}\nПопробуй ещё раз:", back_kb())
+            return True
+        if value is None:
+            await send("⚠️ Пришли хотя бы один путь.", back_kb())
+            return True
+        try:
+            servers = load_config()
+            server = next((s for s in servers if s.get("name") == server_name), None)
+            if not server:
+                raise ValueError(f"Сервер {server_name} не найден в конфиге")
+            apply_field(server, field, value)      # дозапись к существующим
+            save_config(servers)
+        except Exception as e:
+            await send(f"❌ ошибка записи: {str(e)[:120]}", menu_kb())
+            context.user_data.pop(STATE_KEY, None)
+            return True
+        audit.log_config_change(
+            update.effective_user, "edit", server_name,
+            f"{FIELD_DEFS[field]['label']}: добавлено "
+            + ", ".join(_path_str(item) for item in value)
+        )
+    else:
+        index = state.get("idx", 0)
+        stripped = (text or "").strip()
+        if mode == "path_hours":
+            if stripped in SKIP_INPUTS:
+                changes = {"alert_hours": None}
+            else:
+                try:
+                    hours = int(stripped)
+                except ValueError:
+                    await send("⚠️ Часы — это число от 1 до 720.", back_kb())
+                    return True
+                if not 1 <= hours <= 720:
+                    await send("⚠️ Часы — от 1 до 720.", back_kb())
+                    return True
+                # Недельная копия проверяется по расписанию, а не по возрасту
+                changes = {"alert_hours": hours, "schedule_weekday": None,
+                           "schedule_by_hour": None}
+        else:
+            if stripped in SKIP_INPUTS:
+                changes = {"warn_gb": None, "crit_gb": None}
+            else:
+                ok, value, error = parse_field_value(
+                    "onec_logs", f"x={stripped}"
+                )
+                if not ok:
+                    await send(f"⚠️ {error.replace('«x»', 'пути')}\n"
+                               "Например: 100/150", back_kb())
+                    return True
+                entry = value[0] if value else {}
+                changes = {"warn_gb": entry.get("warn_gb"),
+                           "crit_gb": entry.get("crit_gb")}
+
+        try:
+            servers = load_config()
+            server = next((s for s in servers if s.get("name") == server_name), None)
+            if not server:
+                raise ValueError(f"Сервер {server_name} не найден в конфиге")
+            items = field_items(server, field)
+            if index >= len(items):
+                raise ValueError("путь уже удалён")
+            entry = _entry_dict(items[index])
+            for key, val in changes.items():
+                if val is None:
+                    entry.pop(key, None)
+                else:
+                    entry[key] = val
+            items[index] = _pack_entry(entry)
+            apply_field(server, field, items, merge=False)
+            save_config(servers)
+        except Exception as e:
+            await send(f"❌ ошибка записи: {str(e)[:120]}", menu_kb())
+            context.user_data.pop(STATE_KEY, None)
+            return True
+        audit.log_config_change(
+            update.effective_user, "edit", server_name,
+            f"{FIELD_DEFS[field]['label']}: {_path_str(items[index])} — "
+            + ", ".join(f"{k}={v}" for k, v in changes.items())
+        )
+
+    context.user_data.pop(STATE_KEY, None)
+    server = load_server_or_none(server_name)
+    items = field_items(server, field) if server else []
+    await send(
+        "✅ Сохранено. Мониторинг подхватит изменения в течение 5 минут.\n\n"
+        + paths_menu_text(server_name, field, items),
+        paths_menu_kb(server_name, field, items)
+    )
+    return True
+
+
+
 async def handle_config_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Обрабатывает текстовый ввод для мастера/редактора.
@@ -2617,6 +3264,9 @@ async def handle_config_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await wizard_advance(context, send, value)
         return True
+
+    if state["mode"] in ("path_add", "path_hours", "path_limits"):
+        return await handle_path_text(update, context, state, text, send)
 
     if state["mode"] == "edit_field":
         field = state["field"]

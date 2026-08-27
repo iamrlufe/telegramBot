@@ -30,6 +30,18 @@ WEEKDAY_LABELS_RU = [
 ]
 
 
+WEEKDAY_SHORT_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def weekday_short(weekday: str) -> str:
+    """Короткое название — для кнопок выбора дня: семь «понедельников»
+    в ряд не помещаются."""
+    try:
+        return WEEKDAY_SHORT_RU[WEEKDAY_NAMES.index(weekday)]
+    except ValueError:
+        return weekday
+
+
 def weekday_label(weekday: str) -> str:
     """Русское название дня недели для текста алерта."""
     try:

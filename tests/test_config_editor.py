@@ -10,6 +10,7 @@ from config_editor import (
     parse_field_value,
     validate_config,
 )
+import config_editor as ce
 from tg_utils import TELEGRAM_TEXT_LIMIT, split_message
 
 
@@ -469,3 +470,104 @@ def test_onec_log_config_validation():
     no_path = [{"name": "srv", "host": "192.0.2.10", "onec_logs": [{"warn_gb": 5}]}]
     with pytest.raises(ValueError, match="нужен путь"):
         validate_config(no_path)
+
+
+# ─── Меню путей: список, карточка, дубли ─────────────────────
+
+def test_paths_are_deduplicated_by_normalized_path():
+    """В боевом конфиге пути дублировались, и монитор опрашивал каталог
+    дважды. Регистр и хвостовой слэш — тот же путь."""
+    items = ce.dedupe_paths([
+        r"E:\Backups",
+        {"path": "e:\\backups\\", "alert_hours": 40},
+        r"E:\Other",
+    ])
+    assert items == [{"path": "e:\\backups\\", "alert_hours": 40}, r"E:\Other"]
+
+
+def test_normalize_path_keeps_drive_root():
+    assert ce.normalize_path(r"E:\Backups\ ".strip()) == r"e:\backups"
+    assert ce.normalize_path("E:/Backups") == r"e:\backups"
+    assert ce.normalize_path("E:\\") == "e:\\"
+    assert ce.normalize_path("/volume1/backup/") == "\\volume1\\backup"
+
+
+def test_merge_does_not_create_duplicates_for_same_path():
+    merged = ce._merge_backup_paths(
+        [r"E:\Backups"], [{"path": "e:\\backups", "alert_hours": 40}]
+    )
+    assert len(merged) == 1
+    assert merged[0]["alert_hours"] == 40
+
+
+def test_field_items_reads_both_shapes():
+    server = {"backups": {"sql": [r"E:\B1", {"path": r"E:\B2"}]},
+              "onec_logs": {"path": r"D:\logs"}}
+    assert len(ce.field_items(server, "backups_sql")) == 2
+    assert ce.field_items(server, "onec_logs") == [{"path": r"D:\logs"}]
+    assert ce.field_items({}, "backups_veeam") == []
+
+
+def test_path_button_label_shows_the_tail():
+    """Начало у путей одинаковое, различается хвост."""
+    assert ce.path_button_label(r"E:\SQLBackup\base_one\FULL") == r"base_one\FULL"
+    assert ce.path_button_label("/volume4/1c/base") == "1c\\base"
+    long_label = ce.path_button_label("E:\\" + "x" * 40 + "\\" + "y" * 40)
+    assert len(long_label) <= 24 and long_label.startswith("…")
+
+
+def test_path_details_says_when_schedule_is_absent():
+    """Отсутствие расписания раньше ничем себя не выдавало, и было
+    непонятно, почему недельная копия ругается на возраст."""
+    lines = ce.path_details("backups_sql", r"E:\Backups")
+    assert "   ⏱ порог возраста: общий" in lines
+    assert "   🗓 расписание: нет" in lines
+
+
+def test_path_details_for_weekly_copy():
+    lines = ce.path_details("backups_sql", {
+        "path": r"E:\Full", "schedule_weekday": "mon", "schedule_by_hour": 9,
+    })
+    assert any("🗓 недельно: пн 09:00" in line for line in lines)
+    assert any("не применяется" in line for line in lines)
+
+
+def test_path_details_for_onec_thresholds():
+    common = ce.path_details("onec_logs", r"D:\logs")
+    assert any("общие (5 / 10 ГБ)" in line for line in common)
+
+    own = ce.path_details("onec_logs", {"path": r"D:\logs", "warn_gb": 100})
+    assert any("100 ГБ / общий (10 ГБ)" in line for line in own)
+
+
+def test_paths_menu_text_is_numbered_and_multiline():
+    """Раньше все пути шли одной строкой через запятую и «съезжали»."""
+    items = [r"E:\B1", {"path": r"E:\B2", "alert_hours": 40}]
+    text = ce.paths_menu_text("sql-01", "backups_sql", items)
+
+    assert "1. E:\\B1" in text
+    assert "2. E:\\B2" in text
+    assert "   ⏱ порог возраста: 40 ч" in text
+    assert text.count("\n") > len(items)
+
+
+def test_paths_menu_text_when_empty():
+    assert "Путей пока нет" in ce.paths_menu_text("sql-01", "backups_sql", [])
+
+
+def test_apply_field_without_merge_can_remove_path():
+    """Удаление пути кнопкой: список пишется целиком, иначе дозапись
+    вернула бы удалённое обратно."""
+    server = {"backups": {"sql": [r"E:\B1", r"E:\B2"]}}
+    ce.apply_field(server, "backups_sql", [r"E:\B2"], merge=False)
+    assert server["backups"]["sql"] == [r"E:\B2"]
+
+    ce.apply_field(server, "backups_sql", [r"E:\B1"])
+    assert server["backups"]["sql"] == [r"E:\B2", r"E:\B1"]
+
+
+def test_pack_entry_drops_empty_settings():
+    assert ce._pack_entry({"path": r"E:\B", "alert_hours": None}) == r"E:\B"
+    assert ce._pack_entry({"path": r"E:\B", "alert_hours": 40}) == {
+        "path": r"E:\B", "alert_hours": 40,
+    }
