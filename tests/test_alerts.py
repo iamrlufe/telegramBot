@@ -152,3 +152,67 @@ def test_docker_problem_classification():
     assert alerts._docker_problem("Paused") == "paused"
     assert alerts._docker_problem("Created") == "created"
     assert alerts._docker_problem("") == "ok"
+
+
+# ─── Повтор напоминаний (ALERT_REPEAT_HOURS) ─────────────────
+
+def _now(hh=12, mm=0):
+    return datetime(2026, 8, 29, hh, mm, tzinfo=alerts.ALMATY)
+
+
+def test_new_problem_is_always_reported():
+    assert alerts.alert_due({}, "srv:C", "crit", _now()) is True
+
+
+def test_level_change_is_reported_immediately():
+    state = {}
+    alerts.mark_alert_sent(state, "srv:C", "warn", _now(12))
+    assert alerts.alert_due(state, "srv:C", "crit", _now(12, 5)) is True
+
+
+def test_same_level_is_repeated_after_the_interval(monkeypatch):
+    """Раньше алерт приходил один раз и молчал, пока проблема висит."""
+    monkeypatch.setattr(alerts, "ALERT_REPEAT_HOURS", 3)
+    state = {}
+    alerts.mark_alert_sent(state, "srv:C", "crit", _now(12))
+
+    assert alerts.alert_due(state, "srv:C", "crit", _now(14, 59)) is False
+    assert alerts.alert_due(state, "srv:C", "crit", _now(15, 0)) is True
+
+
+def test_repeat_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(alerts, "ALERT_REPEAT_HOURS", 0)
+    state = {}
+    alerts.mark_alert_sent(state, "srv:C", "crit", _now(12))
+    assert alerts.alert_due(state, "srv:C", "crit", _now(23, 0)) is False
+
+
+def test_repeat_is_silent_during_quiet_hours(monkeypatch):
+    """Иначе утренняя сводка состояла бы из одинаковых сообщений."""
+    monkeypatch.setattr(alerts, "ALERT_REPEAT_HOURS", 3)
+    monkeypatch.setenv("QUIET_HOURS", "23:00-07:00")
+    state = {}
+    alerts.mark_alert_sent(state, "srv:C", "crit", _now(20))
+
+    assert alerts.alert_due(state, "srv:C", "crit", _now(23, 30)) is False
+
+    morning = datetime(2026, 8, 30, 7, 5, tzinfo=alerts.ALMATY)
+    assert alerts.alert_due(state, "srv:C", "crit", morning) is True
+
+
+def test_old_state_format_is_read_and_not_re_alerted(monkeypatch):
+    """В /app/data лежат записи прежнего формата — просто уровень, без
+    времени. Обновление не должно поднимать тревогу задним числом."""
+    monkeypatch.setattr(alerts, "ALERT_REPEAT_HOURS", 3)
+    state = {"srv:C": "crit"}
+
+    assert alerts.alert_level(state["srv:C"]) == "crit"
+    assert alerts.alert_due(state, "srv:C", "crit", _now()) is False
+    assert alerts.alert_due(state, "srv:C", "warn", _now()) is True
+
+
+def test_mark_alert_sent_keeps_level_readable():
+    state = {}
+    alerts.mark_alert_sent(state, "srv:C", "crit", _now(12))
+    assert alerts.alert_level(state["srv:C"]) == "crit"
+    assert state["srv:C"]["sent"].startswith("2026-08-29T12:00")

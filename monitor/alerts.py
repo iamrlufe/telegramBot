@@ -291,6 +291,73 @@ def purge_server_state(server_name: str):
                 save_json(path, state)
 
 
+# ─── Повтор напоминаний ──────────────────────────────────────
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Как часто напоминать о проблеме, которая никуда не делась. Раньше алерт
+# приходил ровно один раз — при смене уровня, — и молчал, пока проблема
+# висит: сообщение легко было пролистать и забыть. 0 отключает повторы,
+# кнопка «Принято» глушит конкретный алерт на ALERT_ACK_HOURS.
+ALERT_REPEAT_HOURS = _int_env("ALERT_REPEAT_HOURS", 3)
+
+
+def alert_level(value):
+    """Уровень из записи состояния. Записи бывают двух видов: старые — просто
+    уровень, новые — вместе со временем отправки. Читать умеет оба, поэтому
+    обновление не требует чистки /app/data."""
+    if isinstance(value, dict) and "level" in value:
+        return value["level"]
+    return value
+
+
+def _alert_sent_at(value):
+    if not isinstance(value, dict):
+        return None
+    try:
+        return datetime.fromisoformat(value["sent"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def alert_due(state: dict, key: str, level, now: datetime = None) -> bool:
+    """Слать ли алерт: уровень сменился либо тот же висит дольше
+    ALERT_REPEAT_HOURS.
+
+    В тихие часы повтор не поднимается вовсе — иначе утренняя сводка
+    состояла бы из одинаковых сообщений. Первичный алерт по-прежнему
+    откладывается до утра, как и раньше."""
+    previous = state.get(key)
+    if previous is None:
+        return True
+    if alert_level(previous) != level:
+        return True
+    if ALERT_REPEAT_HOURS <= 0:
+        return False
+
+    sent_at = _alert_sent_at(previous)
+    if sent_at is None:
+        # Запись в старом формате: время неизвестно. Молча переходим на новый
+        # при следующей отметке, не поднимая тревогу задним числом.
+        return False
+
+    now = now or datetime.now(ALMATY)
+    if in_quiet_hours(now):
+        return False
+    return now - sent_at >= timedelta(hours=ALERT_REPEAT_HOURS)
+
+
+def mark_alert_sent(state: dict, key: str, level, now: datetime = None):
+    """Запоминает уровень и время — из них считается следующий повтор."""
+    now = now or datetime.now(ALMATY)
+    state[key] = {"level": level, "sent": now.isoformat()}
+
+
 def send_or_defer(text: str, reply_markup: dict = None, ack_key: str = None):
     """В тихие часы копим до утра, иначе отправляем сразу.
 
@@ -544,7 +611,7 @@ def check_disk_alert(server_name: str, disk: dict, kind: str = "windows"):
 
     with _state_lock:
         state = load_json(DISK_STATE_FILE)
-        old_level = state.get(key)
+        old_level = alert_level(state.get(key))
 
         if new_level is None:
             # Вышли из проблемной зоны — сбрасываем, но только с запасом
@@ -554,16 +621,19 @@ def check_disk_alert(server_name: str, disk: dict, kind: str = "windows"):
             return
 
         if old_level is not None:
-            if new_level >= old_level:
-                # Стало не хуже: тревогу не поднимаем. Состояние смягчаем
-                # только если место выросло с запасом — иначе колебания
-                # у границы порога снова дали бы «ухудшение» и новый алерт.
-                if new_level > old_level and free_pct >= old_level + DISK_HYSTERESIS_PCT:
-                    state[key] = new_level
+            if new_level > old_level:
+                # Стало лучше: тревогу не поднимаем. Состояние смягчаем только
+                # если место выросло с запасом — иначе колебания у границы
+                # порога снова дали бы «ухудшение» и новый алерт.
+                if free_pct >= old_level + DISK_HYSTERESIS_PCT:
+                    mark_alert_sent(state, key, new_level)
                     save_json(DISK_STATE_FILE, state)
                 return
+            if new_level == old_level and not alert_due(state, key, new_level):
+                # Тот же уровень: напоминаем не чаще ALERT_REPEAT_HOURS
+                return
 
-        state[key] = new_level
+        mark_alert_sent(state, key, new_level)
         save_json(DISK_STATE_FILE, state)
 
     send_or_defer(
@@ -586,7 +656,7 @@ def alert_server_online(server: dict):
 
     with _state_lock:
         state = load_json(SERVER_STATE_FILE)
-        old_status = state.get(name)
+        old_status = alert_level(state.get(name))
 
         if old_status is None:
             state[name] = "online"
@@ -616,10 +686,10 @@ def alert_server_offline(server: dict, error: str):
 
     with _state_lock:
         state = load_json(SERVER_STATE_FILE)
-        if state.get(name) == status:
+        if not alert_due(state, name, status):
             return
 
-        state[name] = status
+        mark_alert_sent(state, name, status)
         save_json(SERVER_STATE_FILE, state)
 
     send_or_defer(
@@ -640,10 +710,10 @@ def alert_server_down(server: dict):
 
     with _state_lock:
         state = load_json(SERVER_STATE_FILE)
-        if state.get(name) == "ping_down":
+        if not alert_due(state, name, "ping_down"):
             return
 
-        state[name] = "ping_down"
+        mark_alert_sent(state, name, "ping_down")
         save_json(SERVER_STATE_FILE, state)
 
     send_or_defer(
@@ -840,9 +910,10 @@ def check_raid_alert(server_name: str, arrays: list):
             key = f"{server_name}:{name}"
             seen.add(key)
             level = _raid_level(array)
-            old = state.get(key)
+            old = alert_level(state.get(key))
 
-            if level == old:
+            if level == old and (level is None
+                                 or not alert_due(state, key, level)):
                 continue
 
             members = ""
@@ -865,7 +936,7 @@ def check_raid_alert(server_name: str, arrays: list):
                 )
                 continue
 
-            state[key] = level
+            mark_alert_sent(state, key, level)
             changed = True
 
             if level == "rebuilding":
@@ -931,7 +1002,7 @@ def check_disk_temp_alert(server_name: str, disk_temps: list):
             if not name or temp is None:
                 continue
             key = f"{server_name}:{name}"
-            old = state.get(key)
+            old = alert_level(state.get(key))
 
             if temp >= DISK_TEMP_CRIT_C:
                 level = "crit"
@@ -940,7 +1011,8 @@ def check_disk_temp_alert(server_name: str, disk_temps: list):
             else:
                 level = None
 
-            if level == old:
+            if level == old and (level is None
+                                 or not alert_due(state, key, level)):
                 continue
             if level is None:
                 # Остываем — снимаем только с запасом
@@ -953,7 +1025,7 @@ def check_disk_temp_alert(server_name: str, disk_temps: list):
                     )
                 continue
 
-            state[key] = level
+            mark_alert_sent(state, key, level)
             changed = True
             icon = "🔥" if level == "crit" else "🌡"
             limit = DISK_TEMP_CRIT_C if level == "crit" else DISK_TEMP_WARN_C
@@ -1087,7 +1159,7 @@ def check_service_alert(server_name: str, service: dict):
         if status.lower() == "running":
             if key not in state:
                 return
-            old_status = state.pop(key)
+            old_status = alert_level(state.pop(key))
             save_json(SERVICE_STATE_FILE, state)
             message = (
                 f"✅ Сервис восстановлен\n"
@@ -1096,9 +1168,9 @@ def check_service_alert(server_name: str, service: dict):
                 f"Предыдущий статус: {old_status}"
             )
         else:
-            if state.get(key) == status:
+            if not alert_due(state, key, status):
                 return
-            state[key] = status
+            mark_alert_sent(state, key, status)
             save_json(SERVICE_STATE_FILE, state)
             is_problem = True
             hint = ""

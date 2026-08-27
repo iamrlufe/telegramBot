@@ -12,6 +12,9 @@ from winrm_client import run_ps
 from linux_check import run_ssh
 from server_check import server_type
 from alerts import (
+    alert_due,
+    alert_level,
+    mark_alert_sent,
     send_or_defer, load_json, save_json, is_muted, check_backup_failure_alerts,
 )
 from backup_schedule import (
@@ -609,8 +612,8 @@ def _check_weekly_schedule_alert(server_name: str, backup_type: str, backup_path
     state = load_json(BACKUP_ALERT_STATE_FILE)
 
     if weekly_backup_missed(newest_file, weekday, by_hour, now):
-        if state.get(key) != "missed":
-            state[key] = "missed"
+        if alert_due(state, key, "missed"):
+            mark_alert_sent(state, key, "missed")
             save_json(BACKUP_ALERT_STATE_FILE, state)
             deadline = most_recent_weekly_deadline(weekday, by_hour, now)
             deadline_label = weekday_label(weekday)
@@ -655,8 +658,8 @@ def _check_backup_alerts(server_name: str, backup_type: str,
     state = load_json(BACKUP_ALERT_STATE_FILE)
 
     if metrics["file_count"] == 0:
-        if state.get(key) != "empty":
-            state[key] = "empty"
+        if alert_due(state, key, "empty"):
+            mark_alert_sent(state, key, "empty")
             save_json(BACKUP_ALERT_STATE_FILE, state)
             send_or_defer(
                 f"🆘🆘 БЭКАП НЕ СОЗДАЁТСЯ 🆘🆘\n\n"
@@ -678,8 +681,8 @@ def _check_backup_alerts(server_name: str, backup_type: str,
         age_hours = (now - metrics["newest_file"]).total_seconds() / 3600
         if age_hours > alert_hours:
             age_days = round(age_hours / 24, 1)
-            if state.get(key) != "old":
-                state[key] = "old"
+            if alert_due(state, key, "old"):
+                mark_alert_sent(state, key, "old")
                 save_json(BACKUP_ALERT_STATE_FILE, state)
                 send_or_defer(
                     f"🆘🆘 БЭКАП УСТАРЕЛ 🆘🆘\n\n"
@@ -757,10 +760,10 @@ def _check_onec_log_alerts(server_name: str, log_name: str, log_path: str,
             save_json(BACKUP_ALERT_STATE_FILE, state)
         return
 
-    if state.get(key) == level:
+    if not alert_due(state, key, level):
         return
 
-    state[key] = level
+    mark_alert_sent(state, key, level)
     save_json(BACKUP_ALERT_STATE_FILE, state)
     icon = "🚨" if level == "crit" else "🟠"
     send_or_defer(
