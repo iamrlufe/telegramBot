@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from winrm_client import run_ps
 from linux_check import run_ssh
 from server_check import server_type
-from alerts import send_or_defer, load_json, save_json, is_muted
+from alerts import (
+    send_or_defer, load_json, save_json, is_muted, check_backup_failure_alerts,
+)
 from backup_schedule import (
     ALMATY,
     most_recent_weekly_deadline,
@@ -297,6 +299,55 @@ END {{
         "disk_total_gb":  round(float(data.get("DiskTotalKB") or 0) / 1024 / 1024, 2),
         "disk_free_gb":   round(float(data.get("DiskFreeKB") or 0) / 1024 / 1024, 2),
     }
+
+
+# ─── Сбои резервного копирования по данным SQL ───────────────
+
+# Окно поиска: сутки. Больше не нужно — алерт шлётся один раз на событие,
+# а старые сбои уже разобраны.
+BACKUP_FAIL_WINDOW_HOURS = 24
+
+
+def check_mssql_backup_failures(server: dict):
+    """Читает ошибки бэкапа из ERRORLOG и истории джоб, шлёт алерт на новые.
+
+    Отдельная проверка нужна потому, что файловый мониторинг видит только
+    отсутствие свежей копии и срабатывает через backup_alert_hours — то
+    есть на сутки позже. SQL знает о сбое сразу и называет причину.
+    """
+    from mssql_log import read_backup_errors
+
+    name = server["name"]
+    data = read_backup_errors(server, hours=BACKUP_FAIL_WINDOW_HOURS)
+    events = []
+
+    for row in data.get("engine", []):
+        when = row.get("d") or ""
+        text = " ".join((row.get("t") or "").split())[:300]
+        if text:
+            events.append({"key": f"e|{when}|{text[:80]}", "when": when,
+                           "text": text})
+
+    for row in data.get("jobs", []):
+        when = row.get("when") or ""
+        job = row.get("job") or ""
+        step = row.get("stepname") or f"шаг {row.get('step')}"
+        message = " ".join((row.get("msg") or "").split())[:200]
+        events.append({
+            "key": f"j|{when}|{job}|{row.get('step')}",
+            "when": when,
+            "text": f"джоб «{job}», {step}: {message}" if message
+                    else f"джоб «{job}», {step}",
+        })
+
+    if events:
+        print(f"  ❌ Сбоев бэкапа по данным SQL: {len(events)}", flush=True)
+    check_backup_failure_alerts(name, events)
+
+    # Недоступность источника (нет прав, недоступен msdb) молчаливо не
+    # прячем: иначе «алертов нет» будет означать «мы просто не смотрели».
+    for problem in data.get("errors", []):
+        print(f"  ⚠️ Проверка сбоев бэкапа: {problem}", flush=True)
 
 
 # ─── WinRM: размеры MSSQL баз ────────────────────────────────
@@ -876,6 +927,14 @@ def run_backup_cycle():
                 print(f"  🗄 MSSQL: {len(sizes)} баз", flush=True)
             except Exception as e:
                 print(f"  ❌ MSSQL dbsize: {e}", flush=True)
+
+            # Сбои резервного копирования по данным самого SQL. Файловая
+            # проверка ловит только отсутствие свежей копии — и лишь через
+            # backup_alert_hours; здесь причина видна в ту же ночь.
+            try:
+                check_mssql_backup_failures(server)
+            except Exception as e:
+                print(f"  ❌ MSSQL backup errors: {e}", flush=True)
 
         # Размеры журналов регистрации 1С
         if isinstance(onec_logs, dict):

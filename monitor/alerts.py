@@ -21,6 +21,7 @@ DOCKER_STATE_FILE = "/app/data/docker_alert_state.json"
 SMART_STATE_FILE = "/app/data/smart_alert_state.json"
 TIME_DRIFT_STATE_FILE = "/app/data/time_drift_state.json"
 SNAPSHOT_STATE_FILE = "/app/data/snapshot_alert_state.json"
+BACKUP_FAIL_STATE_FILE = "/app/data/backup_fail_state.json"
 
 TIME_DRIFT_ALERT_SEC = 120   # алерт при дрейфе больше 2 минут
 TIME_DRIFT_OK_SEC = 60       # восстановление при дрейфе меньше минуты
@@ -271,6 +272,7 @@ def purge_server_state(server_name: str):
         CPU_STATE_FILE, RAM_STATE_FILE, SERVICE_STATE_FILE,
         DISK_FORECAST_STATE_FILE, DISK_TEMP_STATE_FILE, RAID_STATE_FILE,
         "/app/data/backup_alert_state.json",
+        BACKUP_FAIL_STATE_FILE,
     ]
     prefix = f"{server_name}:"
     with _state_lock:
@@ -360,6 +362,55 @@ def save_json(path: str, data: dict):
         except OSError:
             pass
         raise
+
+
+# ─── Провалившийся бэкап MSSQL ───────────────────────────────
+
+# Сколько ключей событий помним на сервер: защита от разрастания файла
+# состояния, при этом хватает, чтобы не повторить алерт по кругу.
+BACKUP_FAIL_KEYS_KEPT = 60
+
+# В одно сообщение больше не кладём: серия одинаковых сбоев за ночь всё
+# равно читается по первым записям, а Telegram режет длинный текст.
+BACKUP_FAIL_IN_MESSAGE = 5
+
+
+def check_backup_failure_alerts(server_name: str, events: list):
+    """Алерт о новых сбоях резервного копирования MSSQL.
+
+    Событие опознаётся по ключу «время + суть»: ERRORLOG и история джоб
+    отдают одни и те же записи при каждом опросе, и без запоминания алерт
+    уходил бы каждые пять минут. Новыми считаются только те ключи,
+    которых ещё не было в состоянии.
+    """
+    if is_muted(server_name) or not events:
+        return
+
+    with _state_lock:
+        state = load_json(BACKUP_FAIL_STATE_FILE)
+        seen = state.get(server_name) or []
+        seen_set = set(seen)
+
+        fresh = [e for e in events if e.get("key") and e["key"] not in seen_set]
+        if not fresh:
+            return
+
+        state[server_name] = (seen + [e["key"] for e in fresh])[-BACKUP_FAIL_KEYS_KEPT:]
+        save_json(BACKUP_FAIL_STATE_FILE, state)
+
+    lines = [
+        "❌ БЭКАП НЕ ВЫПОЛНЕН",
+        f"🖥 Сервер: {server_name}",
+        f"Новых сбоев: {len(fresh)}",
+        "",
+    ]
+    for event in fresh[:BACKUP_FAIL_IN_MESSAGE]:
+        when = (event.get("when") or "")[:16]
+        lines.append(f"{when} — {event.get('text', '')}")
+    if len(fresh) > BACKUP_FAIL_IN_MESSAGE:
+        lines.append(f"… и ещё {len(fresh) - BACKUP_FAIL_IN_MESSAGE}")
+
+    send_or_defer("\n".join(lines), reply_markup=server_alert_kb(server_name))
 
 
 # ─── Снапшоты VMware ─────────────────────────────────────────

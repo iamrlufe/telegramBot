@@ -233,3 +233,46 @@ def group_failed_logons(rows: list) -> list:
             item["count"] += 1
             item["last"] = max(item["last"], when)
     return sorted(grouped.values(), key=lambda i: i["last"], reverse=True)
+
+
+# ─── Состояние хоста: перезагрузка, сертификаты, обновления ──
+
+# Сертификат предупреждает заранее: 60 дней хватает, чтобы успеть
+# перевыпустить, и не настолько много, чтобы список превратился в шум.
+CERT_WARN_DAYS = 60
+
+
+def read_host_state(server: dict) -> dict:
+    """Ждёт ли сервер перезагрузки, что с сертификатами и обновлениями.
+
+    Три вещи, которые не видны в обычном опросе и всплывают не вовремя:
+    сервер месяцами ждёт перезагрузки после обновлений, истекает
+    сертификат IIS/RDP, обновления не ставились полгода.
+    """
+    script = PS_OUT_B64_HELPER + f"""
+    $ErrorActionPreference = 'SilentlyContinue'
+    $reasons = @()
+    if (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending') {{ $reasons += 'установка компонентов Windows' }}
+    if (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired') {{ $reasons += 'установленные обновления' }}
+    $sm = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager' -Name PendingFileRenameOperations
+    if ($sm.PendingFileRenameOperations) {{ $reasons += 'файлы ждут замены при перезагрузке' }}
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $certs = @(Get-ChildItem Cert:\\LocalMachine\\My | Where-Object {{ $_.NotAfter -lt (Get-Date).AddDays({CERT_WARN_DAYS}) }} | ForEach-Object {{ @{{ subject = $_.Subject; until = $_.NotAfter.ToString('yyyy-MM-dd'); days = [int]($_.NotAfter - (Get-Date)).TotalDays }} }})
+    $fixes = @(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 3 | ForEach-Object {{ @{{ id = $_.HotFixID; on = $(if ($_.InstalledOn) {{ $_.InstalledOn.ToString('yyyy-MM-dd') }} else {{ '' }}) }} }})
+    Out-B64 @{{ reboot = $reasons; boot = $(if ($boot) {{ $boot.ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }}); certs = $certs; hotfix = $fixes }}
+    """
+    raw = run_ps(server["host"], script,
+                 server.get("username"), server.get("password"),
+                 operation_timeout_sec=120, read_timeout_sec=180)
+    data = ps_json(raw) or {}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    # PowerShell сворачивает список из одного элемента в сам элемент —
+    # без нормализации разбор ниже спотыкается на единственном сертификате.
+    for key in ("reboot", "certs", "hotfix"):
+        value = data.get(key)
+        if value is None:
+            data[key] = []
+        elif not isinstance(value, list):
+            data[key] = [value]
+    return data

@@ -17,7 +17,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from winlog import (
     read_reboots, read_service_failures, read_disk_errors,
     read_app_errors, read_failed_logons, group_failed_logons,
-    explain_event, friendly_winlog_error,
+    read_host_state, explain_event, friendly_winlog_error, CERT_WARN_DAYS,
 )
 from refresh import load_server
 from server_check import server_type
@@ -65,6 +65,7 @@ def winlog_menu_kb(server_name: str, hours: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("⚠️ Приложения", callback_data=cb("app")),
+            InlineKeyboardButton("🩺 Состояние", callback_data=cb("state")),
         ],
         [
             InlineKeyboardButton(f"⏱ {period_name(other)}",
@@ -197,6 +198,45 @@ def format_logons(rows: list, hours: int) -> str:
     return "\n".join(lines)
 
 
+def format_host_state(data: dict, hours: int) -> str:
+    lines = ["🩺 Состояние сервера\n"]
+
+    reasons = data.get("reboot") or []
+    if reasons:
+        lines.append("♻️ Ждёт перезагрузки:")
+        for reason in reasons:
+            lines.append(f"   • {reason}")
+        lines.append("   Пока сервер не перезагружен, часть обновлений не "
+                     "применена, а установка новых может срываться.")
+    else:
+        lines.append("♻️ Перезагрузка не требуется")
+
+    if data.get("boot"):
+        lines.append(f"⏱ Последняя загрузка: {_when(data['boot'])}")
+
+    certs = data.get("certs") or []
+    lines.append("")
+    if certs:
+        lines.append(f"📜 Сертификаты, истекающие в ближайшие {CERT_WARN_DAYS} дн.:")
+        for cert in certs[:SHOW_LIMIT]:
+            days = cert.get("days")
+            mark = "❌" if isinstance(days, int) and days < 0 else "⚠️"
+            when = "истёк" if isinstance(days, int) and days < 0 else f"через {days} дн."
+            lines.append(f"   {mark} {_short(cert.get('subject'), 70)}")
+            lines.append(f"      до {cert.get('until')} — {when}")
+    else:
+        lines.append(f"📜 Сертификаты: ничего не истекает в ближайшие "
+                     f"{CERT_WARN_DAYS} дн.")
+
+    fixes = data.get("hotfix") or []
+    if fixes:
+        lines.append("")
+        lines.append("🔄 Последние обновления:")
+        for fix in fixes:
+            lines.append(f"   {fix.get('id')}  {fix.get('on') or 'дата неизвестна'}")
+    return "\n".join(lines)
+
+
 def _read_logons(server, hours):
     return group_failed_logons(read_failed_logons(server, hours))
 
@@ -207,6 +247,7 @@ SECTIONS = {
     "disk": (read_disk_errors, format_disks),
     "app": (read_app_errors, format_apps),
     "logon": (_read_logons, format_logons),
+    "state": (None, format_host_state),
 }
 
 
@@ -237,7 +278,11 @@ async def winlog_callback(query, context):
     await safe_edit_message(query, f"⏳ Читаю журнал событий: {server_name}…")
     try:
         server = await asyncio.to_thread(load_server, server_name)
-        rows = await asyncio.to_thread(reader, server, hours)
+        if section == "state":
+            # Состояние — это «сейчас»: окно времени к нему неприменимо
+            rows = await asyncio.to_thread(read_host_state, server)
+        else:
+            rows = await asyncio.to_thread(reader, server, hours)
         text = formatter(rows, hours)
     except Exception as e:
         text = f"⚠️ Не удалось прочитать журнал {server_name}:\n{friendly_winlog_error(e)}"

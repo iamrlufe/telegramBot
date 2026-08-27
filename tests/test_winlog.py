@@ -205,3 +205,69 @@ def test_help_section_documents_security_rights():
     text = HELP_SECTIONS["winlog"][1]
     assert "Event Log Readers" in text
     assert "4625" in text and "41" in text
+
+
+# ─── Состояние сервера ───────────────────────────────────────
+
+def test_host_state_script_fits_winrm_limit(monkeypatch):
+    """Скрипт длинный: если не влезет в командную строку, раздел мёртв."""
+    import base64
+    from winrm_client import MAX_PS_COMMAND_CHARS, compact_ps
+    scripts = _fake_ps(monkeypatch, {})
+    winlog.read_host_state(SERVER)
+    encoded = len(base64.b64encode(compact_ps(scripts[0]).encode("utf_16_le")))
+    assert encoded < MAX_PS_COMMAND_CHARS, f"{encoded} из {MAX_PS_COMMAND_CHARS}"
+
+
+def test_host_state_normalizes_single_item(monkeypatch):
+    """PowerShell сворачивает список из одного элемента в сам элемент."""
+    _fake_ps(monkeypatch, {"reboot": "установленные обновления",
+                           "certs": {"subject": "CN=srv", "until": "2026-09-01",
+                                     "days": 5},
+                           "hotfix": {"id": "KB5030219", "on": "2026-08-01"},
+                           "boot": "2026-08-01 03:00:00"})
+    data = winlog.read_host_state(SERVER)
+    assert data["reboot"] == ["установленные обновления"]
+    assert isinstance(data["certs"], list) and len(data["certs"]) == 1
+
+
+def test_host_state_checks_all_reboot_sources(monkeypatch):
+    """Признаков ожидания перезагрузки три, и они независимы."""
+    scripts = _fake_ps(monkeypatch, {})
+    winlog.read_host_state(SERVER)
+    for key in ("Component Based Servicing", "RebootRequired",
+                "PendingFileRenameOperations"):
+        assert key in scripts[0]
+
+
+def test_pending_reboot_explained():
+    text = winlog_bot.format_host_state(
+        {"reboot": ["установленные обновления"], "boot": "2026-08-01 03:00:00",
+         "certs": [], "hotfix": []}, 24)
+    assert "Ждёт перезагрузки" in text
+    assert "не применена" in text
+
+
+def test_no_pending_reboot_stated_positively():
+    text = winlog_bot.format_host_state(
+        {"reboot": [], "boot": "", "certs": [], "hotfix": []}, 24)
+    assert "не требуется" in text
+
+
+def test_expired_certificate_marked_differently():
+    """Истёкший и истекающий — разные ситуации, метка должна различаться."""
+    text = winlog_bot.format_host_state({
+        "reboot": [], "boot": "", "hotfix": [],
+        "certs": [{"subject": "CN=old.example.local", "until": "2026-08-01",
+                   "days": -20}],
+    }, 24)
+    assert "❌" in text and "истёк" in text
+
+
+def test_expiring_certificate_shows_days_left():
+    text = winlog_bot.format_host_state({
+        "reboot": [], "boot": "", "hotfix": [],
+        "certs": [{"subject": "CN=rdp.example.local", "until": "2026-10-01",
+                   "days": 30}],
+    }, 24)
+    assert "через 30 дн." in text
