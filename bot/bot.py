@@ -23,7 +23,8 @@ from telegram.ext import (
 from charts import build_server_chart, build_dashboard_chart, build_top_dirs_chart, period_label
 from db import (
     get_servers_status, get_server_detail, get_disk_usage, get_server_disks,
-    get_problems, build_report,
+    get_problems, build_report, format_problems_for_server,
+    short_server_name,
 )
 from net_tools import http_report, ports_report, resolve_target, single_port_report
 from ping_tools import load_targets, ping_report
@@ -331,10 +332,31 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def build_problems_keyboard(servers: list):
+    """Кнопка на сервер с числом замечаний. Индекс, а не имя, потому что
+    callback_data ограничен 64 байтами, а имена бывают длинными."""
+    buttons = [
+        InlineKeyboardButton(
+            f"{'🔴' if server['crit'] else '🟠'} "
+            f"{short_server_name(server['name'])} ({server['total']})",
+            callback_data=f"probs:{index}"
+        )
+        for index, server in enumerate(servers)
+    ]
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
 async def cmd_problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    await reply_long_message(update.message, await asyncio.to_thread(get_problems))
+    text, servers = await asyncio.to_thread(get_problems)
+    context.user_data["problem_servers"] = servers
+    await reply_long_message(
+        update.message,
+        text,
+        reply_markup=InlineKeyboardMarkup(build_problems_keyboard(servers))
+                     if servers else None
+    )
 
 
 PING_MENU_TEXT = "📡 Выбери сервер или укажи IP/hostname командой:\n/ping 8.8.8.8"
@@ -945,6 +967,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text,
             reply_markup=InlineKeyboardMarkup(build_ping_actions_keyboard("ping")),
             parse_mode="HTML"
+        )
+
+    elif query.data == "probs_menu" or query.data.startswith("probs:"):
+        servers = context.user_data.get("problem_servers")
+        if servers is None:
+            text, servers = await asyncio.to_thread(get_problems)
+            context.user_data["problem_servers"] = servers
+
+        if query.data == "probs_menu":
+            text, servers = await asyncio.to_thread(get_problems)
+            context.user_data["problem_servers"] = servers
+            await safe_edit_message(
+                query,
+                text,
+                reply_markup=InlineKeyboardMarkup(build_problems_keyboard(servers))
+                             if servers else None
+            )
+            return
+
+        index = int(query.data.split(":", 1)[1])
+        if index >= len(servers):
+            await safe_edit_message(query, "Список проблем устарел, открой 🚨 Проблемы заново")
+            return
+
+        keyboard = [[InlineKeyboardButton("◀️ К сводке", callback_data="probs_menu")]]
+        await safe_edit_message(
+            query,
+            format_problems_for_server(servers[index]),
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif query.data.startswith("report:"):

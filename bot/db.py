@@ -14,10 +14,6 @@ from backup_schedule import load_schedule_map, schedule_for, weekly_backup_misse
 
 ALMATY = ZoneInfo("Asia/Almaty")
 STALE_MINUTES = 15
-CPU_WARN = 80
-CPU_CRIT = 90
-RAM_WARN = 80
-RAM_CRIT = 90
 DISK_WARN_FREE = 20
 DISK_CRIT_FREE = 10
 BACKUP_WARN_HOURS = 24
@@ -500,7 +496,7 @@ def get_server_detail(server_name: str) -> str:
 
 # ─── Проблемы ────────────────────────────────────────────────
 
-def get_problems() -> str:
+def collect_problems() -> list:
     backup_targets, config_server_names = _load_backup_targets()
     schedule_map = load_schedule_map(SERVERS_FILE)
     with get_conn() as conn:
@@ -575,10 +571,13 @@ def get_problems() -> str:
         """)
 
     now_utc = datetime.now(timezone.utc)
-    critical = []
-    warning = []
-    disk_critical = []
-    disk_warning = []
+    problems = []
+
+    def add(level, kind, server, text, weight=0.0, hint=None):
+        """Проблема хранится разобранной, а не готовой строкой: из тех же
+        записей собирается и сводка по категориям, и разбор по серверу."""
+        problems.append({"level": level, "kind": kind, "server": server,
+                         "text": text, "weight": weight, "hint": hint})
 
     icons = {
         "auth_failed":      "🔑",
@@ -597,14 +596,16 @@ def get_problems() -> str:
 
         if status != "online":
             icon = icons.get(status, "❓")
-            line = f"{icon} {server_name}: {status} ({time_str})"
+            line = f"{icon} {status} ({time_str})"
             if error:
                 line += f"\n   {error.splitlines()[0][:90]}"
-            critical.append(line)
+            add("crit", "status", server_name, line, weight=age_min)
             continue
 
         if age_min > STALE_MINUTES:
-            warning.append(f"⚠️ {server_name}: данные старше {round(age_min)} мин ({time_str})")
+            add("warn", "stale", server_name,
+                f"⚠️ данные старше {round(age_min)} мин ({time_str})",
+                weight=age_min)
 
     for server_name, disk_name, free_gb, used_gb, created_at in disk_rows:
         free = float(free_gb)
@@ -613,11 +614,14 @@ def get_problems() -> str:
         if total <= 0:
             continue
         free_pct = round(free / total * 100, 1)
-        detail = f"{server_name} {disk_name}: свободно {free_pct}% ({free} ГБ)"
+        detail = f"{disk_name}: свободно {free_pct}% ({free} ГБ)"
+        hint = f"минимум {free_pct}% свободно"
         if free_pct < DISK_CRIT_FREE:
-            disk_critical.append(f"🔴 {detail}")
+            add("crit", "disk", server_name, f"🔴 {detail}",
+                weight=100 - free_pct, hint=hint)
         elif free_pct < DISK_WARN_FREE:
-            disk_warning.append(f"🟠 {detail}")
+            add("warn", "disk", server_name, f"🟠 {detail}",
+                weight=100 - free_pct, hint=hint)
 
     # RAID: развал массива не виден ни по свободному месту, ни по SMART
     # отдельного диска — в сводке проблем ему самое место
@@ -630,18 +634,15 @@ def get_problems() -> str:
                 counts = f" ({array.get('active')}/{array['total']})"
             if array.get("progress"):
                 percent = array["progress"].get("percent")
-                critical.append(
-                    f"🔄 {config_name}: RAID {array.get('name')} "
-                    f"восстанавливается{counts} — {percent}%"
-                )
+                add("crit", "raid", config_name,
+                    f"🔄 RAID {array.get('name')} восстанавливается{counts} — {percent}%")
             else:
-                critical.append(
-                    f"🚨 {config_name}: RAID {array.get('name')} деградирован{counts}"
-                )
+                add("crit", "raid", config_name,
+                    f"🚨 RAID {array.get('name')} деградирован{counts}")
 
     for service_name, display_name, service_status, server_name, checked_at in service_rows:
         label = display_name if display_name and display_name != service_name else service_name
-        critical.append(f"🚨 {server_name}: сервис {label} = {service_status}")
+        add("crit", "service", server_name, f"🚨 сервис {label} = {service_status}")
 
     for (
         server_name, backup_type, backup_path, file_count,
@@ -654,13 +655,15 @@ def get_problems() -> str:
 
         created_utc = created_at.replace(tzinfo=timezone.utc)
         age_min = (now_utc - created_utc).total_seconds() / 60
-        label = f"{server_name} {backup_type.upper()} {backup_path}"
+        label = f"{backup_type.upper()} {backup_path}"
 
         if age_min > BACKUP_STALE_MINUTES:
-            warning.append(f"⚠️ {label}: метрики backup старше {round(age_min)} мин")
+            add("warn", "backup_stale", server_name,
+                f"⚠️ {label}: метрики backup старше {round(age_min)} мин",
+                weight=age_min)
 
         if not file_count:
-            critical.append(f"🚨 {label}: нет файлов backup")
+            add("crit", "backup", server_name, f"🚨 {label}: нет файлов backup")
             continue
 
         schedule = schedule_for(schedule_map, server_name, backup_type, backup_path)
@@ -672,27 +675,37 @@ def get_problems() -> str:
                 # Недельная копия: между плановыми днями возраст растёт законно,
                 # проблема — только пропущенный дедлайн (см. shared/backup_schedule.py)
                 if weekly_backup_missed(newest, schedule[0], schedule[1]):
-                    critical.append(
+                    age_days = round((now_utc - newest).total_seconds() / 86400, 1)
+                    add("crit", "backup", server_name,
                         f"🚨 {label}: пропущена недельная копия "
-                        f"(последняя {round((now_utc - newest).total_seconds() / 86400, 1)} дн назад)"
-                    )
+                        f"(последняя {age_days} дн назад)",
+                        weight=age_days, hint=f"худший {age_days} дн")
             else:
                 age_hours = (now_utc - newest).total_seconds() / 3600
                 if age_hours > BACKUP_WARN_HOURS:
-                    warning.append(f"🟠 {label}: последний backup {round(age_hours / 24, 1)} дн назад")
+                    age_days = round(age_hours / 24, 1)
+                    add("warn", "backup", server_name,
+                        f"🟠 {label}: последний backup {age_days} дн назад",
+                        weight=age_days, hint=f"худший {age_days} дн")
         elif schedule:
-            critical.append(f"🚨 {label}: пропущена недельная копия (нет даты последнего backup)")
+            add("crit", "backup", server_name,
+                f"🚨 {label}: пропущена недельная копия (нет даты последнего backup)")
         else:
-            warning.append(f"🟠 {label}: нет даты последнего backup")
+            add("warn", "backup", server_name, f"🟠 {label}: нет даты последнего backup")
 
         total = float(disk_total_gb or 0)
         free = float(disk_free_gb or 0)
         if total > 0:
             free_pct = round(free / total * 100, 1)
+            hint = f"минимум {free_pct}% свободно"
             if free_pct < DISK_CRIT_FREE:
-                disk_critical.append(f"🔴 {label}: диск backup свободно {free_pct}% ({free} ГБ)")
+                add("crit", "disk", server_name,
+                    f"🔴 {label}: диск backup свободно {free_pct}% ({free} ГБ)",
+                    weight=100 - free_pct, hint=hint)
             elif free_pct < DISK_WARN_FREE:
-                disk_warning.append(f"🟠 {label}: диск backup свободно {free_pct}% ({free} ГБ)")
+                add("warn", "disk", server_name,
+                    f"🟠 {label}: диск backup свободно {free_pct}% ({free} ГБ)",
+                    weight=100 - free_pct, hint=hint)
 
     for (
         server_name, log_name, log_path, total_size_gb,
@@ -700,56 +713,135 @@ def get_problems() -> str:
     ) in onec_log_rows:
         created_utc = created_at.replace(tzinfo=timezone.utc)
         age_min = (now_utc - created_utc).total_seconds() / 60
-        label = f"{server_name} 1C log {log_name}: {log_path}"
+        label = f"1C log {log_name}: {log_path}"
 
         if age_min > ONEC_LOG_STALE_MINUTES:
-            warning.append(f"⚠️ {label}: метрики старше {round(age_min)} мин")
+            add("warn", "stale", server_name,
+                f"⚠️ {label}: метрики старше {round(age_min)} мин", weight=age_min)
 
         if status != "ok":
             detail = error.splitlines()[0][:90] if error else status
-            critical.append(f"🚨 {label}: {detail}")
+            add("crit", "onec", server_name, f"🚨 {label}: {detail}")
             continue
 
         size_gb = float(total_size_gb or 0)
+        hint = f"крупнейший {size_gb} ГБ"
         if size_gb >= ONEC_LOG_CRIT_GB:
-            critical.append(f"🚨 {label}: размер {size_gb} ГБ")
+            add("crit", "onec", server_name, f"🚨 {label}: размер {size_gb} ГБ",
+                weight=size_gb, hint=hint)
         elif size_gb >= ONEC_LOG_WARN_GB:
-            warning.append(f"🟠 {label}: размер {size_gb} ГБ")
+            add("warn", "onec", server_name, f"🟠 {label}: размер {size_gb} ГБ",
+                weight=size_gb, hint=hint)
 
     for server_name, backup_path, file_path, status, error, created_at in verify_rows:
         detail = (error or status or "").splitlines()[0][:90]
-        critical.append(
-            f"🚨 {server_name}: backup не прошёл RESTORE VERIFYONLY\n"
-            f"   {backup_path}: {detail}"
-        )
+        add("crit", "verify", server_name,
+            f"🚨 backup не прошёл RESTORE VERIFYONLY\n   {backup_path}: {detail}")
 
-    if not critical and not warning and not disk_critical and not disk_warning:
-        return "✅ Проблем не обнаружено"
+    return problems
 
-    msg = "🚨 ТРЕБУЕТ ВНИМАНИЯ\n\n"
-    msg += f"💽 Диски критично: {len(disk_critical)}\n"
-    msg += f"💽 Диски предупреждение: {len(disk_warning)}\n"
-    msg += f"🔴 Прочее критично: {len(critical)}\n"
-    msg += f"🟠 Прочее предупреждения: {len(warning)}\n\n"
 
-    if disk_critical or disk_warning:
-        msg += "💽 ДИСКИ\n"
-        if disk_critical:
-            msg += "\n".join(disk_critical) + "\n"
-        if disk_warning:
-            msg += ("\n" if disk_critical else "") + "\n".join(disk_warning)
-        msg += "\n\n"
+KIND_TITLES = {
+    "status":       ("🖥", "Серверы не на связи"),
+    "service":      ("🚨", "Службы"),
+    "raid":         ("🧱", "RAID"),
+    "disk":         ("💽", "Диски"),
+    "backup":       ("💾", "Бэкапы"),
+    "verify":       ("🧪", "Проверка бэкапов"),
+    "onec":         ("📋", "Журналы 1С"),
+    "backup_stale": ("⏱", "Метрики бэкапов устарели"),
+    "stale":        ("⏱", "Данные устарели"),
+}
 
-    if critical:
-        msg += "🔴 КРИТИЧНО\n"
-        msg += "\n".join(critical)
-        msg += "\n\n"
+NO_PROBLEMS = "✅ Проблем не обнаружено"
 
-    if warning:
-        msg += "🟠 ПРЕДУПРЕЖДЕНИЯ\n"
-        msg += "\n".join(warning)
 
-    return msg
+def short_server_name(name: str, limit: int = 18) -> str:
+    """Кнопка узкая: домен обрезается, длинное имя усекается."""
+    short = name.split(".", 1)[0]
+    return short if len(short) <= limit else short[:limit - 1] + "…"
+
+
+def problems_by_server(problems: list) -> list:
+    """Серверы для кнопок: сначала с критичным, дальше по числу замечаний."""
+    grouped = defaultdict(list)
+    for item in problems:
+        grouped[item["server"]].append(item)
+
+    servers = []
+    for name, items in grouped.items():
+        crit = sum(1 for i in items if i["level"] == "crit")
+        servers.append({"name": name, "items": items, "crit": crit,
+                        "total": len(items)})
+    servers.sort(key=lambda s: (-s["crit"], -s["total"], s["name"]))
+    return servers
+
+
+def format_problems_summary(problems: list) -> str:
+    if not problems:
+        return NO_PROBLEMS
+
+    crit = [i for i in problems if i["level"] == "crit"]
+    warn = [i for i in problems if i["level"] == "warn"]
+
+    lines = [
+        "🚨 ТРЕБУЕТ ВНИМАНИЯ",
+        f"🔴 Критично: {len(crit)} · 🟠 Предупреждений: {len(warn)}",
+        "",
+    ]
+
+    grouped = defaultdict(list)
+    for item in problems:
+        grouped[item["kind"]].append(item)
+
+    for kind, (icon, title) in KIND_TITLES.items():
+        items = grouped.get(kind)
+        if not items:
+            continue
+        servers = len({i["server"] for i in items})
+        line = f"{icon} {title}: {len(items)}"
+        if servers > 1:
+            line += f" на {servers} серверах"
+        worst = max(items, key=lambda i: i["weight"])
+        if worst.get("hint"):
+            line += f" · {worst['hint']}"
+        lines.append(line)
+
+    lines.append("")
+    lines.append("Разбор по серверу — кнопки ниже.")
+    return "\n".join(lines)
+
+
+def format_problems_for_server(server: dict) -> str:
+    """Все замечания одного сервера, сгруппированные по разделам."""
+    lines = [
+        f"🖥 {server['name']}",
+        f"🔴 Критично: {server['crit']} · "
+        f"🟠 Предупреждений: {server['total'] - server['crit']}",
+    ]
+
+    grouped = defaultdict(list)
+    for item in server["items"]:
+        grouped[item["kind"]].append(item)
+
+    for kind, (icon, title) in KIND_TITLES.items():
+        items = grouped.get(kind)
+        if not items:
+            continue
+        lines.append("")
+        lines.append(f"{icon} {title.upper()} ({len(items)})")
+        items.sort(key=lambda i: (i["level"] != "crit", -i["weight"], i["text"]))
+        lines += [item["text"] for item in items]
+
+    return "\n".join(lines)
+
+
+def get_problems() -> tuple:
+    """Сводка по категориям и серверы для кнопок. Плоский список строк
+    разрастался до трёх десятков почти одинаковых строк — по пути на каждую
+    базу, — и главное в нём терялось."""
+    problems = collect_problems()
+    return format_problems_summary(problems), problems_by_server(problems)
 
 
 # ─── Отчёт ───────────────────────────────────────────────────
