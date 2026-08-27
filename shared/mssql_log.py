@@ -280,6 +280,11 @@ def _run_sql(server: dict, tsql: str, columns: str,
     return data
 
 
+# Публичное имя для соседних модулей (mssql_health): та же обвязка,
+# чтобы не плодить второй способ ходить в SQL.
+run_query = _run_sql
+
+
 def _since(hours: int) -> str:
     return (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 

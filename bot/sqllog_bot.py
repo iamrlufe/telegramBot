@@ -22,6 +22,9 @@ from mssql_log import (
     read_agent_jobs, read_backup_history, friendly_sql_error,
     explain_engine_error,
 )
+from mssql_health import (
+    read_log_files, read_checkdb, read_activity, read_file_space,
+)
 from refresh import load_server
 from tg_utils import safe_edit_message
 
@@ -71,6 +74,14 @@ def sqllog_menu_kb(server_name: str, hours: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📼 Копии из msdb", callback_data=cb("history")),
+        ],
+        [
+            InlineKeyboardButton("📓 Журналы транзакций", callback_data=cb("tlog")),
+            InlineKeyboardButton("🩺 CHECKDB", callback_data=cb("checkdb")),
+        ],
+        [
+            InlineKeyboardButton("⏳ Что идёт сейчас", callback_data=cb("now")),
+            InlineKeyboardButton("📦 Файлы БД", callback_data=cb("files")),
         ],
         [
             InlineKeyboardButton(f"⏱ {period_name(other)}", callback_data=switch),
@@ -247,6 +258,84 @@ def format_history(rows: list, hours: int) -> str:
     return "\n".join(lines)
 
 
+def format_tlog(rows: list, hours: int) -> str:
+    if not rows:
+        return "📓 Журналы транзакций\n\nНет пользовательских баз или нет доступа."
+    lines = ["📓 Журналы транзакций\n"]
+    for row in rows[:SHOW_LIMIT]:
+        lines.append(f"{row.get('db')}  журнал {row.get('log_gb')} ГБ  "
+                     f"(данные {row.get('data_gb')} ГБ)  {row.get('model')}")
+        wait = (row.get("waitfor") or "").strip()
+        if wait and wait.upper() != "NOTHING":
+            detail = row.get("why") or wait
+            lines.append(f"   ⚠️ {detail}")
+    lines.append("\nЖурнал растёт, пока его нельзя переиспользовать. Модель Full "
+                 "без регулярного BACKUP LOG — самая частая причина.")
+    return "\n".join(lines)
+
+
+def format_checkdb(rows: list, hours: int) -> str:
+    if not rows:
+        return ("🩺 DBCC CHECKDB\n\nДанные не получены. Чтение даты последней "
+                "проверки идёт через DBCC DBINFO и требует прав sysadmin.")
+    lines = ["🩺 Последняя проверка целостности\n"]
+    for row in rows[:SHOW_LIMIT]:
+        last = row.get("lastgood") or ""
+        days = row.get("days")
+        # 1900-01-01 — заглушка SQL: проверки не было ни разу.
+        if not last or last.startswith("1900"):
+            lines.append(f"❌ {row.get('db')} — не проверялась ни разу")
+            continue
+        mark = "✅" if isinstance(days, int) and days <= 14 else "⚠️"
+        lines.append(f"{mark} {row.get('db')} — {_when(last)}"
+                     f"{f', {days} дн. назад' if days is not None else ''}")
+    lines.append("\nБез CHECKDB повреждение находят при попытке восстановиться, "
+                 "когда испорченные копии уже вытеснили здоровые.")
+    return "\n".join(lines)
+
+
+def format_activity(rows: list, hours: int) -> str:
+    if not rows:
+        return ("⏳ Сейчас на сервере\n\nДолгих запросов и блокировок нет: "
+                "ничего не выполняется дольше 5 секунд и никто никого не ждёт.")
+    lines = ["⏳ Сейчас на сервере\n"]
+    for row in rows[:SHOW_LIMIT]:
+        head = (f"spid {row.get('spid')}  {row.get('sec')} с  "
+                f"{row.get('db') or '?'}  {row.get('login') or ''}")
+        lines.append(head)
+        blocker = row.get("blocker")
+        if blocker and str(blocker) not in ("0", "None"):
+            lines.append(f"   ⛔ заблокирован сессией {blocker}")
+        source = " · ".join(x for x in (row.get("hostname"), row.get("app")) if x)
+        if source:
+            lines.append(f"   {_short(source, 90)}")
+        if row.get("sqltext"):
+            lines.append(f"   {_short(row.get('sqltext'), 150)}")
+    return "\n".join(lines)
+
+
+def format_files(rows: list, hours: int) -> str:
+    if not rows:
+        return "📦 Файлы БД\n\nДанные не получены."
+    capped = [r for r in rows if r.get("capped")]
+    lines = ["📦 Файлы БД\n"]
+    if capped:
+        lines.append("⚠️ Не смогут вырасти (автоприрост выключен или задан предел):")
+        for row in capped[:SHOW_LIMIT]:
+            lines.append(f"   {row.get('db')} · {row.get('fname')} "
+                         f"({row.get('kind')})  {row.get('size_gb')} ГБ")
+        lines.append("")
+    lines.append("Крупнейшие файлы:")
+    for row in rows[:SHOW_LIMIT]:
+        limit = row.get("limit_gb")
+        tail = f"  предел {limit} ГБ" if limit else ""
+        lines.append(f"   {row.get('db')} · {row.get('fname')} "
+                     f"({row.get('kind')})  {row.get('size_gb')} ГБ{tail}")
+    lines.append("\nМесто на диске и возможность вырасти — разные вещи: файл с "
+                 "выключенным автоприростом встаёт, когда диск ещё наполовину пуст.")
+    return "\n".join(lines)
+
+
 def _when(value) -> str:
     """'2026-08-27 00:00:00' → '27.08 00:00'.
 
@@ -269,6 +358,10 @@ def _short(text, limit: int) -> str:
 # ─── Callback ────────────────────────────────────────────────
 
 SECTIONS = {
+    "tlog": (read_log_files, format_tlog),
+    "checkdb": (read_checkdb, format_checkdb),
+    "now": (read_activity, format_activity),
+    "files": (read_file_space, format_files),
     "login": (read_login_errors, format_logins),
     "backup": (read_backup_errors, format_backup_errors),
     "engine": (read_engine_errors, format_engine),
@@ -293,7 +386,9 @@ async def sqllog_callback(query, context):
     if section == "menu":
         await safe_edit_message(
             query,
-            f"🗄 SQL-логи — {server_name}\nПериод: {period_name(hours)}",
+            f"🗄 SQL — {server_name}\nПериод журналов: {period_name(hours)}\n"
+            f"Разделы состояния (журналы транзакций, CHECKDB, файлы, "
+            f"«что идёт сейчас») период не используют.",
             reply_markup=sqllog_menu_kb(server_name, hours),
         )
         return
@@ -306,7 +401,11 @@ async def sqllog_callback(query, context):
     await safe_edit_message(query, f"⏳ Читаю SQL-лог: {server_name}…")
     try:
         server = await asyncio.to_thread(load_server, server_name)
-        if section == "history":
+        if section in ("tlog", "checkdb", "now", "files"):
+            # Состояние — это «сейчас», окно времени к нему неприменимо
+            rows = await asyncio.to_thread(reader, server)
+            text = formatter(rows, hours)
+        elif section == "history":
             # msdb фильтруется днями, а подпись периода — общая для всех разделов
             days = max(1, hours // 24)
             rows = await asyncio.to_thread(reader, server, days)
