@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host.",
+    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи.",
     "name": "sql-01.example.local",
     "host": "192.0.2.10",
     "services": [

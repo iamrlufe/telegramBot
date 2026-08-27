@@ -28,6 +28,7 @@ from db import (
 from ping_tools import load_targets, ping_custom, ping_target
 from refresh import refresh_server, load_server
 from dirdig import DIG_MAX_DEPTH, DIG_TOKENS, dig_kb
+from sqllog_bot import has_mssql, sql_token, sqllog_callback
 from remote_ops import get_top_dirs, restart_service, reboot_server
 from backup_bot import (
     cmd_backup_menu,
@@ -543,7 +544,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
     """Кнопки под карточкой сервера. Перезагрузка проверяет права по клику."""
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("◀️ Назад", callback_data="servers_list"),
             InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh:{server_name}"),
@@ -555,7 +556,21 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📂 Кто съел место", callback_data=f"disks:{server_name}"),
         ],
-    ])
+    ]
+
+    # SQL-логи только там, где есть MSSQL. Признак — тот же флаг dbsize:
+    # заводить второй переключатель на тот же факт означало бы, что рано или
+    # поздно они разойдутся. Сломанный конфиг не должен уносить всю карточку.
+    try:
+        if has_mssql(load_server(server_name)):
+            rows.append([InlineKeyboardButton(
+                "🗄 SQL-логи",
+                callback_data=f"sqllog_menu:{sql_token(server_name, 24)}",
+            )])
+    except Exception as e:
+        print(f"[bot] SQL-логи: сервер {server_name} не прочитан: {e}", flush=True)
+
+    return InlineKeyboardMarkup(rows)
 
 
 def server_disks_kb(server_name: str, disks: list) -> InlineKeyboardMarkup:
@@ -586,6 +601,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data.startswith("backup_"):
         await backup_callback(query, context)
+
+    elif query.data.startswith("sqllog_"):
+        await sqllog_callback(query, context)
 
     elif query.data.startswith("cfg_"):
         await config_callback(query, context)
