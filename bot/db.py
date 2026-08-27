@@ -1,4 +1,6 @@
 import json
+import os
+
 import psycopg2
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -11,13 +13,39 @@ from disk_health import format_disk_health, load_disk_health
 from backup_files import disk_of_path
 from backup_verify import path_str
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
+from linux_check import PSEUDO_MOUNT_PREFIXES
 
 ALMATY = ZoneInfo("Asia/Almaty")
 STALE_MINUTES = 15
 DISK_WARN_FREE = 20
 DISK_CRIT_FREE = 10
 BACKUP_WARN_HOURS = 24
+
+
+def is_pseudo_disk(name: str) -> bool:
+    """Псевдо-ФС ядра, попавшая в базу до того, как её начали отсеивать при
+    сборе: `/sys/firmware/efi/efivars` — хранилище переменных UEFI, всегда
+    заполненное, и в отчёте оно значилось критическим диском с 0%."""
+    return name != "/" and name.startswith(PSEUDO_MOUNT_PREFIXES)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Копия недельной давности и вчерашняя лежали в одной жёлтой куче: порог
+# делит «отстал» и «бэкапа фактически нет».
+BACKUP_CRIT_HOURS = _int_env("BACKUP_CRIT_HOURS", 72)
 BACKUP_STALE_MINUTES = 30
+
+# Метрика диска, которая перестала обновляться, остаётся в базе навсегда:
+# DISTINCT ON выдаёт последнюю запись, даже если ей неделя. Так в отчёте
+# держались тома, которых больше нет, — отключённые диски, переименованные
+# буквы и отсеянные псевдо-ФС вроде efivarfs.
+DISK_METRIC_FRESH_HOURS = 2
 ONEC_LOG_WARN_GB = 5
 ONEC_LOG_CRIT_GB = 10
 ONEC_LOG_STALE_MINUTES = 30
@@ -210,7 +238,8 @@ def get_server_disks(server_name: str) -> list:
             WHERE server_name = %s
             ORDER BY disk_name, created_at DESC
         """, (server_name,))
-        return [(dn, float(free or 0), float(used or 0)) for dn, free, used in cur.fetchall()]
+        return [(dn, float(free or 0), float(used or 0))
+                for dn, free, used in cur.fetchall() if not is_pseudo_disk(dn)]
 
 
 def _top_line(row, by: str) -> str:
@@ -253,7 +282,7 @@ def get_server_detail(server_name: str) -> str:
             WHERE server_name = %s
             ORDER BY disk_name, created_at DESC
         """, (server_name,))
-        disk_rows = cur.fetchall()
+        disk_rows = [row for row in cur.fetchall() if not is_pseudo_disk(row[0])]
 
         cur.execute("""
             SELECT DISTINCT ON (service_name)
@@ -514,8 +543,9 @@ def collect_problems() -> list:
             SELECT DISTINCT ON (server_name, disk_name)
                    server_name, disk_name, free_gb, used_gb, created_at
             FROM disk_metrics
+            WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
             ORDER BY server_name, disk_name, created_at DESC
-        """)
+        """, (DISK_METRIC_FRESH_HOURS,))
         disk_rows = cur.fetchall()
 
         service_rows = _fetch_optional(cur, """
@@ -608,6 +638,8 @@ def collect_problems() -> list:
                 weight=age_min)
 
     for server_name, disk_name, free_gb, used_gb, created_at in disk_rows:
+        if is_pseudo_disk(disk_name):
+            continue
         free = float(free_gb)
         used = float(used_gb)
         total = free + used
@@ -682,7 +714,12 @@ def collect_problems() -> list:
                         weight=age_days, hint=f"худший {age_days} дн")
             else:
                 age_hours = (now_utc - newest).total_seconds() / 3600
-                if age_hours > BACKUP_WARN_HOURS:
+                if age_hours > BACKUP_CRIT_HOURS:
+                    age_days = round(age_hours / 24, 1)
+                    add("crit", "backup", server_name,
+                        f"🔴 {label}: последний backup {age_days} дн назад",
+                        weight=age_days, hint=f"худший {age_days} дн")
+                elif age_hours > BACKUP_WARN_HOURS:
                     age_days = round(age_hours / 24, 1)
                     add("warn", "backup", server_name,
                         f"🟠 {label}: последний backup {age_days} дн назад",
@@ -875,8 +912,9 @@ def collect_report_data() -> tuple:
             SELECT DISTINCT ON (server_name, disk_name)
                    server_name, disk_name, free_gb, used_gb
             FROM disk_metrics
+            WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
             ORDER BY server_name, disk_name, created_at DESC
-        """)
+        """, (DISK_METRIC_FRESH_HOURS,))
         disk_rows = cur.fetchall()
 
         cur.execute("""
@@ -890,6 +928,8 @@ def collect_report_data() -> tuple:
     server_statuses = {row[0]: row[1:] for row in status_rows}
     disks_by_server = defaultdict(list)
     for server, disk, free, used in disk_rows:
+        if is_pseudo_disk(disk):
+            continue
         disks_by_server[server].append((disk, float(free), float(used)))
 
     servers = []

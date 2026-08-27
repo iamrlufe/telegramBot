@@ -104,3 +104,32 @@ def test_server_detail_puts_critical_first():
 def test_short_server_name_for_buttons():
     assert bot_db.short_server_name("nas.example.local") == "nas"
     assert bot_db.short_server_name("a" * 30) == "a" * 17 + "…"
+
+
+def test_pseudo_disks_from_old_rows_are_ignored():
+    """Метрики efivarfs успели попасть в базу до фильтра при сборе, и
+    отчёт продолжал показывать «/sys/firmware/efi/efivars 0%»: последняя
+    запись остаётся в базе, даже когда новых уже не приходит."""
+    assert bot_db.is_pseudo_disk("/sys/firmware/efi/efivars")
+    assert bot_db.is_pseudo_disk("/proc/anything")
+    assert bot_db.is_pseudo_disk("/run/user/1000")
+    assert not bot_db.is_pseudo_disk("/")
+    assert not bot_db.is_pseudo_disk("/volume1")
+    assert not bot_db.is_pseudo_disk("C")
+
+
+def test_stale_disk_rows_are_cut_off_by_query():
+    """Диск, метрики которого перестали приходить, исчезает из отчёта, а не
+    висит с последним известным значением."""
+    import re
+
+    source = (ROOT / "bot" / "db.py").read_text(encoding="utf-8")
+    # запросы «по всем серверам» — из них и строятся отчёт и проблемы
+    queries = re.findall(
+        r"DISTINCT ON \(server_name, disk_name\)(.*?)ORDER BY", source, re.S
+    )
+    assert len(queries) == 2, "ожидались выборки дисков отчёта и проблем"
+    for tail in queries:
+        assert "INTERVAL '1 hour' * %s" in tail, \
+            "выборка дисков без ограничения по свежести"
+    assert bot_db.DISK_METRIC_FRESH_HOURS >= 1

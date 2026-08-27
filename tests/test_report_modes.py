@@ -145,3 +145,12 @@ def test_pseudo_filesystems_are_not_disks():
     assert "/sys/firmware/efi/efivars" not in names
     assert "/snap/core" not in names
     assert names == ["/"]  # /boot меньше гигабайта — тоже отсеян
+
+
+def test_backup_older_than_crit_threshold_is_critical():
+    """Копия десятидневной давности лежала в жёлтых наравне со вчерашней."""
+    assert bot_db.BACKUP_CRIT_HOURS > bot_db.BACKUP_WARN_HOURS
+
+    source = (ROOT / "bot" / "db.py").read_text(encoding="utf-8")
+    crit_branch = source.split("age_hours > BACKUP_CRIT_HOURS", 1)[1][:220]
+    assert 'add("crit", "backup"' in crit_branch
