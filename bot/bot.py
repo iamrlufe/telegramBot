@@ -30,6 +30,7 @@ from refresh import refresh_server, load_server
 from dirdig import DIG_MAX_DEPTH, DIG_TOKENS, dig_kb
 from sqllog_bot import has_mssql, sql_token, sqllog_callback
 from winlog_bot import has_winlog, win_token, winlog_callback
+from exchange_bot import has_exchange, ex_token, exchange_callback
 from remote_ops import get_top_dirs, restart_service, reboot_server
 from backup_bot import (
     cmd_backup_menu,
@@ -577,6 +578,11 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
             ))
         if logs_row:
             rows.append(logs_row)
+        if has_exchange(server):
+            rows.append([InlineKeyboardButton(
+                "📧 Почта (Exchange)",
+                callback_data=f"exlog_menu:{ex_token(server_name, 24)}",
+            )])
     except Exception as e:
         print(f"[bot] Логи: сервер {server_name} не прочитан: {e}", flush=True)
 
@@ -617,6 +623,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("winlog_"):
         await winlog_callback(query, context)
+
+    elif query.data.startswith("exlog_"):
+        await exchange_callback(query, context)
 
     elif query.data.startswith("cfg_"):
         await config_callback(query, context)
