@@ -409,9 +409,46 @@ def test_onec_log_path_without_thresholds_stays_string():
 
 
 def test_onec_log_single_threshold_is_warning():
-    ok, value, _ = parse_field_value("onec_logs", r"D:\logs=40")
+    """Одно число задаёт предупреждение; критичный остаётся общим (10 ГБ),
+    поэтому такое значение обязано быть меньше него."""
+    ok, value, _ = parse_field_value("onec_logs", r"D:\logs=3")
     assert ok
-    assert value == [{"path": r"D:\logs", "warn_gb": 40.0}]
+    assert value == [{"path": r"D:\logs", "warn_gb": 3.0}]
+
+
+def test_onec_log_single_threshold_above_common_crit_is_rejected():
+    """`=40` без своего критичного молча не работало: критичный оставался
+    общим (10 ГБ) и срабатывал первым."""
+    ok, _, err = parse_field_value("onec_logs", r"D:\logs=40")
+    assert not ok
+    assert "критичный сработает первым" in err
+    assert "40/60" in err   # подсказка с готовой парой значений
+
+
+def test_onec_limits_conflict_is_silent_when_correct():
+    assert ce.onec_limits_conflict({"warn_gb": 100, "crit_gb": 150}) == ""
+    assert ce.onec_limits_conflict({"warn_gb": 3}) == ""
+    assert ce.onec_limits_conflict({"crit_gb": 20}) == ""
+    assert ce.onec_limits_conflict(r"D:\logs") == ""
+
+
+def test_onec_limits_conflict_for_low_crit_only():
+    """Критичный ниже общего предупреждения — предупреждение не сработает."""
+    assert "не меньше критичного" in ce.onec_limits_conflict({"crit_gb": 4})
+
+
+def test_onec_defaults_match_collector_and_reports():
+    """Пороги по умолчанию продублированы в трёх модулях — расхождение
+    означало бы, что мастер проверяет не то, что делает монитор."""
+    from pathlib import Path
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    for path in ("monitor/backup_collector.py", "bot/db.py"):
+        source = (root / path).read_text(encoding="utf-8")
+        warn = int(re.search(r"ONEC_LOG_WARN_GB = (\d+)", source).group(1))
+        crit = int(re.search(r"ONEC_LOG_CRIT_GB = (\d+)", source).group(1))
+        assert (warn, crit) == (ce.ONEC_DEFAULT_WARN_GB, ce.ONEC_DEFAULT_CRIT_GB), path
 
 
 def test_onec_log_thresholds_validated():

@@ -197,10 +197,15 @@ def validate_config(servers) -> None:
                             f"Сервер «{name}»: onec_logs.{field} "
                             f"({entry['path']}) должно быть больше нуля"
                         )
-                if len(limits) == 2 and limits["warn_gb"] >= limits["crit_gb"]:
+                warn = limits.get("warn_gb", ONEC_DEFAULT_WARN_GB)
+                crit = limits.get("crit_gb", ONEC_DEFAULT_CRIT_GB)
+                if limits and warn >= crit:
+                    # Незаданный порог берётся общий: warn 100 без своего crit
+                    # означает crit 10, и предупреждение не сработает никогда
                     raise ValueError(
                         f"Сервер «{name}»: у {entry['path']} порог "
-                        f"предупреждения должен быть меньше критичного"
+                        f"предупреждения ({warn} ГБ) должен быть меньше "
+                        f"критичного ({crit} ГБ)"
                     )
 
         rd = server.get("retention_days")
@@ -759,6 +764,9 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
             entry = {"path": path_part, "warn_gb": values[0]}
             if len(values) == 2:
                 entry["crit_gb"] = values[1]
+            conflict = onec_limits_conflict(entry)
+            if conflict:
+                return False, None, f"{path_part}: {conflict}"
             items.append(entry)
         return True, items, None
 
@@ -1996,6 +2004,9 @@ Host — IP или hostname, уникальный.
    Пороги правятся кнопкой 📏 Пороги в карточке пути; при
    добавлении их можно задать сразу: путь=100/150 (ГБ,
    предупреждение/критично), путь=100 — только предупреждение.
+   Незаданный порог берётся общий (5 и 10 ГБ), и предупреждение
+   обязано быть меньше действующего критичного: иначе критичный
+   сработает первым и предупреждения не будет вовсе.
 
 Бэкапы и журналы 1С открывают список путей: строка на путь со
    всеми его настройками и кнопка на каждый. В карточке пути —
@@ -2709,6 +2720,43 @@ async def show_path_card(query, context, field: str, index: int):
     )
 
 
+# Общие пороги журналов 1С; те же значения — в monitor/backup_collector.py и
+# bot/db.py, согласованность проверяется тестом.
+ONEC_DEFAULT_WARN_GB = 5
+ONEC_DEFAULT_CRIT_GB = 10
+
+
+def onec_limits_conflict(entry) -> str:
+    """Текст ошибки, если пороги журнала 1С противоречат друг другу.
+
+    Проверяются действующие значения, а не заданные: незаданный порог берётся
+    общий. Из-за этого «предупреждение 100 ГБ» без своего критичного было
+    бессмысленным — критичный оставался общим (10 ГБ) и срабатывал первым.
+
+    Ловится до записи: раньше конфликт всплывал в валидаторе конфига уже как
+    «ошибка записи», без подсказки, что делать."""
+    data = entry if isinstance(entry, dict) else {}
+    warn, crit = data.get("warn_gb"), data.get("crit_gb")
+    if warn is None and crit is None:
+        return ""
+
+    warn_value = float(warn) if warn is not None else ONEC_DEFAULT_WARN_GB
+    crit_value = float(crit) if crit is not None else ONEC_DEFAULT_CRIT_GB
+    if warn_value < crit_value:
+        return ""
+
+    warn_text = f"{_gb(warn_value)} ГБ" + ("" if warn is not None else " (общий)")
+    crit_text = f"{_gb(crit_value)} ГБ" + ("" if crit is not None else " (общий)")
+    return (
+        f"⚠️ Предупреждение {warn_text} не меньше критичного {crit_text} — "
+        f"критичный сработает первым, и предупреждение не появится никогда.\n"
+        f"Пришли оба числа сразу, например "
+        f"{_gb(warn_value)}/{_gb(round(warn_value * 1.5, 1))}, "
+        f"или «-», чтобы вернуть общие пороги "
+        f"({ONEC_DEFAULT_WARN_GB} и {ONEC_DEFAULT_CRIT_GB} ГБ)."
+    )
+
+
 def _entry_dict(item) -> dict:
     return dict(item) if isinstance(item, dict) else {"path": item}
 
@@ -3178,6 +3226,11 @@ async def handle_path_text(update, context, state: dict, text: str, send) -> boo
             if not server:
                 raise ValueError(f"Сервер {server_name} не найден в конфиге")
             apply_field(server, field, value)      # дозапись к существующим
+            for item in field_items(server, field):
+                conflict = onec_limits_conflict(item)
+                if conflict:
+                    await send(f"{_path_str(item)}\n{conflict}", back_kb())
+                    return True
             save_config(servers)
         except Exception as e:
             await send(f"❌ ошибка записи: {str(e)[:120]}", menu_kb())
@@ -3235,6 +3288,12 @@ async def handle_path_text(update, context, state: dict, text: str, send) -> boo
                     entry.pop(key, None)
                 else:
                     entry[key] = val
+
+            conflict = onec_limits_conflict(entry)
+            if conflict:
+                await send(conflict, back_kb())
+                return True
+
             items[index] = _pack_entry(entry)
             apply_field(server, field, items, merge=False)
             save_config(servers)
