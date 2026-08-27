@@ -142,11 +142,15 @@ def test_failures_grouped_and_explained(monkeypatch):
 
 # ─── Вывод ───────────────────────────────────────────────────
 
+def _render(result):
+    return exchange_bot.render(*result, page=0)[0]
+
+
 def test_owa_output_shows_user_ip_and_client():
-    text = exchange_bot.format_owa({"rows": [
+    text = _render(exchange_bot.format_owa({"rows": [
         {"user": "ivanov", "ip": "192.0.2.55", "count": 12,
          "last": "2026-08-27 09:14:22",
-         "ua": "Mozilla/5.0+(Windows+NT+10.0)+Chrome/128.0"}], "scanned": 12}, 24)
+         "ua": "Mozilla/5.0+(Windows+NT+10.0)+Chrome/128.0"}], "scanned": 12}, 24))
     assert "ivanov" in text and "192.0.2.55" in text
     assert "Chrome" in text and "Mozilla" not in text
 
@@ -162,21 +166,21 @@ def test_client_name_survives_unknown_agent():
 
 def test_empty_owa_points_at_iis_logging():
     """Пустой раздел чаще всего значит выключённые логи IIS."""
-    text = exchange_bot.format_owa({"rows": [], "scanned": 0}, 24)
+    text = _render(exchange_bot.format_owa({"rows": [], "scanned": 0}, 24))
     assert "журналов IIS" in text
 
 
 def test_empty_failures_point_at_audit():
-    text = exchange_bot.format_failures([], 24)
+    text = _render(exchange_bot.format_failures([], 24))
     assert "4625" in text and "аудит" in text.lower()
 
 
 def test_failures_output_notes_protocol_ambiguity():
     """OWA, ActiveSync и EWS в Security неразличимы — это надо сказать."""
-    text = exchange_bot.format_failures([{
+    text = _render(exchange_bot.format_failures([{
         "user": "ivanov", "ip": "192.0.2.55", "code": "0xC000006A",
         "reason": "неверный пароль", "count": 5,
-        "last": "2026-08-27 09:00:00"}], 24)
+        "last": "2026-08-27 09:00:00"}], 24))
     assert "ActiveSync" in text and "неразличимы" in text
 
 
@@ -200,3 +204,73 @@ def test_help_section_explains_two_sources():
     from config_editor import HELP_SECTIONS
     text = HELP_SECTIONS["exchange"][1]
     assert "IIS" in text and "4625" in text
+
+
+# ─── Постраничный вывод ──────────────────────────────────────
+
+def _many_rows(n):
+    return {"rows": [{"user": f"user{i}@example.local", "ip": f"192.0.2.{i}",
+                      "count": 100 - i, "last": "2026-08-27 09:00:00",
+                      "ua": "Chrome/128"} for i in range(n)], "scanned": 5000}
+
+
+def test_long_list_is_paginated():
+    """Раньше остаток обрывался фразой «… ещё 25» и был недоступен."""
+    header, blocks = exchange_bot.format_owa(_many_rows(40), 24)
+    assert len(blocks) == 40
+    text, page, total = exchange_bot.render(header, blocks, 0)
+    assert total == 3, "40 записей по 15 на страницу — три страницы"
+    assert "Показано 1–15 из 40" in text
+    assert "… ещё" not in text
+
+
+def test_second_page_shows_next_records():
+    header, blocks = exchange_bot.format_owa(_many_rows(40), 24)
+    text, page, total = exchange_bot.render(header, blocks, 1)
+    assert "user15@example.local" in text
+    assert "user0@example.local" not in text
+    assert "Показано 16–30 из 40" in text
+
+
+def test_last_page_is_partial():
+    header, blocks = exchange_bot.format_owa(_many_rows(40), 24)
+    text, page, total = exchange_bot.render(header, blocks, 2)
+    assert "Показано 31–40 из 40" in text
+
+
+def test_page_number_clamped():
+    """Кнопка из старого сообщения может указывать на исчезнувшую страницу."""
+    header, blocks = exchange_bot.format_owa(_many_rows(40), 24)
+    _, page, total = exchange_bot.render(header, blocks, 99)
+    assert page == total - 1
+
+
+def test_short_list_has_no_pagination_line():
+    header, blocks = exchange_bot.format_owa(_many_rows(5), 24)
+    text, _, total = exchange_bot.render(header, blocks, 0)
+    assert total == 1 and "Показано" not in text
+
+
+def test_nav_buttons_only_when_needed():
+    from tg_utils import nav_row
+    assert nav_row("exlog_page:r1:", 0, 1) == []
+    row = nav_row("exlog_page:r1:", 1, 3)
+    assert len(row) == 3, "назад, счётчик, вперёд"
+
+
+def test_result_cache_is_bounded():
+    """Кэш сводок не должен расти бесконечно в долгоживущем процессе."""
+    for n in range(exchange_bot.EX_RESULTS_MAX + 30):
+        exchange_bot.result_token("mail-01.example.local", 24, "owa",
+                                  [f"b{n}"], "h")
+    assert len(exchange_bot.EX_RESULTS) <= exchange_bot.EX_RESULTS_MAX
+
+
+def test_paginate_helper_boundaries():
+    from tg_utils import paginate
+    chunk, page, total = paginate(list(range(10)), 0, 4)
+    assert chunk == [0, 1, 2, 3] and total == 3
+    chunk, page, total = paginate(list(range(10)), 2, 4)
+    assert chunk == [8, 9] and page == 2
+    chunk, page, total = paginate([], 0, 4)
+    assert chunk == [] and total == 1

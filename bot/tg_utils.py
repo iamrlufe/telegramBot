@@ -121,3 +121,35 @@ async def safe_answer_query(query):
             print(f"[bot] CallbackQuery answer skipped: {text}", flush=True)
             return
         raise
+
+
+# ─── Постраничный вывод длинных списков ──────────────────────
+
+def paginate(blocks: list, page: int, per_page: int) -> tuple:
+    """Возвращает (срез, номер страницы, всего страниц).
+
+    Номер страницы подрезается по границам: кнопка из старого сообщения
+    может указывать на страницу, которой в новых данных уже нет.
+    """
+    total_pages = max(1, (len(blocks) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    return blocks[start:start + per_page], page, total_pages
+
+
+def nav_row(callback_prefix: str, page: int, total_pages: int) -> list:
+    """Ряд кнопок листания. Пустой, если страница всего одна."""
+    from telegram import InlineKeyboardButton
+
+    if total_pages <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(
+            "◀️", callback_data=f"{callback_prefix}{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}",
+                                    callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton(
+            "▶️", callback_data=f"{callback_prefix}{page + 1}"))
+    return row
