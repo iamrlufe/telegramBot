@@ -125,11 +125,23 @@ config/
   example.servers.json     — пример структуры для новой инсталляции
 init.sql                   — схема PostgreSQL
 docker-compose.yml
+.env.example              — шаблон переменных окружения
 ```
 
 ## Быстрый запуск
 
-1. Создать `.env` в корне репозитория (рядом с `docker-compose.yml`):
+1. Создать `.env` в корне репозитория (рядом с `docker-compose.yml`) —
+   проще всего из готового шаблона:
+
+```bash
+cp .env.example .env
+```
+
+   Полный список переменных с комментариями лежит в
+   [.env.example](.env.example); он сверяется с кодом тестом
+   `tests/test_env_example.py`, поэтому не отстаёт. Ниже тот же набор
+   с пояснениями:
+
 
 ```env
 POSTGRES_DB=agentmonitor
