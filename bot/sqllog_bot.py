@@ -20,6 +20,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, read_backup_history, friendly_sql_error,
+    explain_engine_error,
 )
 from refresh import load_server
 from tg_utils import safe_edit_message
@@ -148,13 +149,39 @@ def format_backup_errors(data: dict, hours: int) -> str:
 def format_engine(rows: list, hours: int) -> str:
     if not rows:
         return (f"⚠️ Ошибки движка за {period_name(hours)}\n\n"
-                "Ничего серьёзного: нет записей severity ≥ 17, повреждений "
-                "и предупреждений о медленном вводе-выводе.")
+                "Записей нет. Проверялись четыре вида:\n"
+                "• severity 17+ — нехватка ресурсов и фатальные ошибки;\n"
+                "• коды 823/824/825 — сбои чтения страниц с диска;\n"
+                "• ввод-вывод дольше 15 секунд — тормоза хранилища;\n"
+                "• взаимоблокировки.\n\n"
+                "Пустой список — не всегда «всё хорошо»: ERRORLOG обнуляется "
+                "при перезапуске службы SQL и по sp_cycle_errorlog, "
+                "и тогда смотреть попросту не в чем.")
+
+    # Одна и та же ошибка повторяется десятками строк (особенно 825 и жалобы
+    # на ввод-вывод) — без схлопывания экран занимает одна проблема.
+    grouped = {}
+    for row in rows:
+        text = _short(row.get("t"), 300)
+        item = grouped.get(text)
+        if item is None:
+            grouped[text] = {"text": text, "last": row.get("d") or "", "count": 1}
+        else:
+            item["count"] += 1
+            item["last"] = max(item["last"], row.get("d") or "")
+    items = sorted(grouped.values(), key=lambda i: i["last"], reverse=True)
+
     lines = [f"⚠️ Ошибки движка за {period_name(hours)} — {len(rows)} записей\n"]
-    for row in rows[:SHOW_LIMIT]:
-        lines.append(f"{_when(row.get('d'))}  {_short(row.get('t'), 300)}")
-    if len(rows) > SHOW_LIMIT:
-        lines.append(f"\n… ещё {len(rows) - SHOW_LIMIT} записей")
+    for item in items[:SHOW_LIMIT]:
+        head = f"{_when(item['last'])}  {item['text']}"
+        if item["count"] > 1:
+            head += f"  · {item['count']} раз"
+        lines.append(head)
+        explanation = explain_engine_error(item["text"])
+        if explanation:
+            lines.append(f"   ↳ {explanation}")
+    if len(items) > SHOW_LIMIT:
+        lines.append(f"\n… ещё {len(items) - SHOW_LIMIT} видов записей")
     return "\n".join(lines)
 
 

@@ -345,3 +345,69 @@ def test_login_result_flags_truncation(monkeypatch):
     data = mssql_log.read_login_errors(SERVER, limit=5)
     assert data["truncated"] is True
     assert "предел выборки" in sqllog_bot.format_logins(data, 24)
+
+
+# ─── Расшифровка записей движка ──────────────────────────────
+
+def test_engine_error_824_explained():
+    """«Error: 824» само по себе дежурному ничего не говорит."""
+    text = mssql_log.explain_engine_error(
+        "Error: 824, Severity: 24, State: 2. SQL Server detected a "
+        "logical consistency-based I/O error: incorrect checksum")
+    assert "повреждени" in text and "CHECKDB" in text
+
+
+def test_engine_error_825_marked_as_early_warning():
+    """825 — предупреждение до 823/824, это важно различать."""
+    text = mssql_log.explain_engine_error("Error: 825, Severity: 10, State: 2.")
+    assert "повтор" in text
+
+
+def test_engine_slow_io_explained():
+    text = mssql_log.explain_engine_error(
+        "SQL Server has encountered 1 occurrence(s) of I/O requests taking "
+        "longer than 15 seconds to complete")
+    assert "хранилище" in text
+
+
+def test_engine_deadlock_points_at_application():
+    """Взаимоблокировка — проблема запросов, а не сервера."""
+    text = mssql_log.explain_engine_error("deadlock victim")
+    assert "приложения" in text
+
+
+def test_engine_specific_code_wins_over_severity():
+    """Правила идут сверху вниз: код конкретнее, чем severity."""
+    text = mssql_log.explain_engine_error("Error: 823, Severity: 24, State: 2.")
+    assert "страницу" in text and "фатальная" not in text
+
+
+def test_engine_output_carries_explanations():
+    rows = [{"d": "2026-08-27 03:10:00",
+             "t": "Error: 825, Severity: 10, State: 2. A read of the file "
+                  "succeeded after failing 3 times"}]
+    text = sqllog_bot.format_engine(rows, 24)
+    assert "↳" in text and "сыпаться" in text
+
+
+def test_engine_identical_records_collapsed():
+    """Одна проблема повторяется десятками строк и занимает весь экран."""
+    rows = [{"d": f"2026-08-27 03:{n:02d}:00",
+             "t": "Error: 825, Severity: 10, State: 2."} for n in range(5)]
+    text = sqllog_bot.format_engine(rows, 24)
+    assert "5 раз" in text
+
+
+def test_engine_empty_output_lists_what_was_checked():
+    """«Ничего серьёзного» не объясняло, что именно проверялось."""
+    text = sqllog_bot.format_engine([], 24)
+    for expected in ("823", "15 секунд", "взаимоблокировк", "sp_cycle_errorlog"):
+        assert expected in text
+
+
+def test_help_section_matches_current_behaviour():
+    """Справка в боте обязана описывать то, что раздел делает сейчас."""
+    from config_editor import HELP_SECTIONS
+    text = HELP_SECTIONS["sqllog"][1]
+    for expected in ("адрес не записан", "823", "825", "UNC", "предел"):
+        assert expected in text, f"в справке бота нет: {expected}"
