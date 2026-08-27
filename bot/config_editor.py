@@ -971,8 +971,11 @@ def _merge_backup_paths(existing: list, new_items: list) -> list:
 SIZE_CHECK_CYCLE = (None, True, False)
 
 
-def field_items(server: dict, field: str) -> list:
-    """Список путей поля в том виде, в каком он лежит в конфиге."""
+def field_items(server: dict, field: str, raw: bool = False) -> list:
+    """Список путей поля. По умолчанию — без повторов: дубли попадали в
+    конфиг при правке руками, и один каталог показывался (и опрашивался
+    монитором) дважды. raw=True возвращает как есть — чтобы увидеть, что
+    повторы в файле вообще были."""
     if field.startswith("backups_"):
         backup_type = field.split("_", 1)[1]
         value = (server.get("backups") or {}).get(backup_type)
@@ -980,7 +983,13 @@ def field_items(server: dict, field: str) -> list:
         value = server.get(field)
     if isinstance(value, (str, dict)):
         value = [value]
-    return list(value or [])
+    items = list(value or [])
+    return items if raw else dedupe_paths(items)
+
+
+def duplicate_paths_count(server: dict, field: str) -> int:
+    """Сколько повторов лежит в конфиге сверх уникальных путей."""
+    return len(field_items(server, field, raw=True)) - len(field_items(server, field))
 
 
 def path_button_label(path: str, limit: int = 24) -> str:
@@ -1035,7 +1044,8 @@ def path_details(field: str, item) -> list:
     return lines
 
 
-def paths_menu_text(server_name: str, field: str, items: list) -> str:
+def paths_menu_text(server_name: str, field: str, items: list,
+                    duplicates: int = 0) -> str:
     label = FIELD_DEFS[field]["label"]
     lines = [f"✏️ {server_name} · {label}", "━" * 20, ""]
     if not items:
@@ -1046,11 +1056,20 @@ def paths_menu_text(server_name: str, field: str, items: list) -> str:
         lines.append(f"{number}. {_path_str(item)}")
         lines += path_details(field, item)
         lines.append("")
+
+    if duplicates > 0:
+        lines.append(
+            f"⚠️ В servers.json те же пути записаны ещё {duplicates} раз(а) — "
+            f"монитор опрашивает их повторно. Кнопка «Убрать дубли» приведёт "
+            f"файл к этому списку."
+        )
+        lines.append("")
     lines.append("Нажми на путь, чтобы изменить его настройки.")
     return "\n".join(lines)
 
 
-def paths_menu_kb(server_name: str, field: str, items: list):
+def paths_menu_kb(server_name: str, field: str, items: list,
+                  duplicates: int = 0):
     buttons = [
         InlineKeyboardButton(
             f"{number}. {path_button_label(_path_str(item))}",
@@ -1062,6 +1081,11 @@ def paths_menu_kb(server_name: str, field: str, items: list):
     keyboard.append([
         InlineKeyboardButton("➕ Добавить пути", callback_data=f"cfg_padd:{field}")
     ])
+    if duplicates > 0:
+        keyboard.append([
+            InlineKeyboardButton(f"🧹 Убрать дубли ({duplicates})",
+                                 callback_data=f"cfg_pdedup:{field}")
+        ])
     if items:
         keyboard.append([
             InlineKeyboardButton("🧹 Очистить всё", callback_data=f"cfg_pclear:{field}")
@@ -1980,6 +2004,9 @@ Host — IP или hostname, уникальный.
    текстовым: несколько путей одним сообщением быстрее.
    Строка «🗓 расписание: нет» показывается всегда — видно, что
    путь проверяется по возрасту, а не по недельному дедлайну.
+   Повторы одного пути (регистр и слэши не в счёт) показываются
+   один раз; если они есть в servers.json, под списком
+   появляется предупреждение и кнопка 🧹 Убрать дубли.
 DB Size — на сервере есть MSSQL: собираются размеры баз и открывается
   кнопка 🗄 SQL-логи в карточке (см. раздел 🗄 SQL-логи).
 Exchange — это почтовый сервер: открывает кнопку 📧 Почта (входы в OWA,
@@ -2656,10 +2683,11 @@ async def show_paths_menu(query, context, field: str):
         return
     context.user_data.pop(STATE_KEY, None)
     items = field_items(server, field)
+    duplicates = duplicate_paths_count(server, field)
     await safe_edit_message(
         query,
-        paths_menu_text(server_name, field, items),
-        reply_markup=paths_menu_kb(server_name, field, items)
+        paths_menu_text(server_name, field, items, duplicates),
+        reply_markup=paths_menu_kb(server_name, field, items, duplicates)
     )
 
 
@@ -2927,6 +2955,29 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("cfg_padd:"):
         await ask_path_add(query, context, data.split(":", 1)[1])
+
+    elif data.startswith("cfg_pdedup:"):
+        field = data.split(":", 1)[1]
+        server_name = context.user_data.get(EDIT_SERVER_KEY)
+        server = load_server_or_none(server_name)
+        if not server:
+            await safe_edit_message(query, "❌ Сервер не выбран.", reply_markup=menu_kb())
+            return
+        removed = duplicate_paths_count(server, field)
+        try:
+            ok, result = await asyncio.to_thread(
+                update_path_items, server_name, field, field_items(server, field)
+            )
+        except Exception as e:
+            ok, result = False, f"ошибка записи: {str(e)[:120]}"
+        if not ok:
+            await safe_edit_message(query, f"❌ {result}", reply_markup=menu_kb())
+            return
+        audit.log_config_change(
+            query.from_user, "edit", server_name,
+            f"{FIELD_DEFS[field]['label']}: убрано повторов — {removed}"
+        )
+        await show_paths_menu(query, context, field)
 
     elif data.startswith("cfg_pclear:"):
         field = data.split(":", 1)[1]
@@ -3200,10 +3251,11 @@ async def handle_path_text(update, context, state: dict, text: str, send) -> boo
     context.user_data.pop(STATE_KEY, None)
     server = load_server_or_none(server_name)
     items = field_items(server, field) if server else []
+    duplicates = duplicate_paths_count(server, field) if server else 0
     await send(
         "✅ Сохранено. Мониторинг подхватит изменения в течение 5 минут.\n\n"
-        + paths_menu_text(server_name, field, items),
-        paths_menu_kb(server_name, field, items)
+        + paths_menu_text(server_name, field, items, duplicates),
+        paths_menu_kb(server_name, field, items, duplicates)
     )
     return True
 

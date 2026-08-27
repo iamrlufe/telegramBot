@@ -571,3 +571,32 @@ def test_pack_entry_drops_empty_settings():
     assert ce._pack_entry({"path": r"E:\B", "alert_hours": 40}) == {
         "path": r"E:\B", "alert_hours": 40,
     }
+
+
+def test_menu_hides_duplicates_from_the_config():
+    """Дубли лежали в servers.json, и список показывал один и тот же путь
+    дважды — чинить их только при записи было мало."""
+    server = {"backups": {"sql": [
+        r"E:\SQLBackup\base_one\FULL",
+        r"E:\SQLBackup\base_two\DIFF",
+        r"E:\SQLBackup\base_one\FULL",
+        r"e:\sqlbackup\base_two\diff\ ".strip(),
+    ]}}
+
+    assert len(ce.field_items(server, "backups_sql", raw=True)) == 4
+    items = ce.field_items(server, "backups_sql")
+    assert [ce._path_str(i) for i in items] == [
+        r"E:\SQLBackup\base_one\FULL", r"E:\SQLBackup\base_two\DIFF",
+    ]
+    assert ce.duplicate_paths_count(server, "backups_sql") == 2
+
+
+def test_menu_warns_about_duplicates_in_file():
+    text = ce.paths_menu_text("sql-01", "backups_sql", [r"E:\B1"], duplicates=2)
+    assert "ещё 2 раз(а)" in text
+    assert "Убрать дубли" in text
+
+
+def test_menu_says_nothing_when_there_are_no_duplicates():
+    text = ce.paths_menu_text("sql-01", "backups_sql", [r"E:\B1"])
+    assert "дубл" not in text.lower()
