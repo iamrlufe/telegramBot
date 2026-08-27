@@ -158,3 +158,12 @@ def test_capped_files_listed_first():
     text = sqllog_bot.format_files(rows, 24)
     assert text.index("Не смогут вырасти") < text.index("Крупнейшие файлы")
     assert "zup_log" in text
+
+
+def test_help_section_exists_and_fits():
+    """Раздел SQL уже упирался в лимит Telegram — состояние вынесено отдельно."""
+    from config_editor import HELP_SECTIONS
+    from tg_utils import split_message
+    text = HELP_SECTIONS["sqlhealth"][1]
+    assert "LOG_BACKUP" in text and "sysadmin" in text
+    assert len(split_message(text)) == 1
