@@ -20,7 +20,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, read_backup_history, friendly_sql_error,
-    explain_engine_error,
+    explain_engine_error, explain_backup_error, summarize_job_message,
 )
 from mssql_health import (
     read_log_files, read_checkdb, read_activity, read_file_space,
@@ -143,15 +143,20 @@ def format_backup_errors(data: dict, hours: int) -> str:
     if not engine and not jobs:
         lines.append("Ошибок копирования не найдено.")
     for row in engine[:SHOW_LIMIT]:
-        when = _when(row.get("d"))
-        lines.append(f"❌ {when}")
+        lines.append(f"❌ {_when(row.get('d'))}")
         lines.append(f"   {_short(row.get('t'), 300)}")
+        why = explain_backup_error(row.get("t") or "")
+        if why:
+            lines.append(f"   ↳ {why}")
     for row in jobs[:SHOW_LIMIT]:
-        when = _when(row.get("when"))
         step = row.get("stepname") or f"шаг {row.get('step')}"
-        lines.append(f"❌ {when}  джоб «{row.get('job')}», {step}")
-        if row.get("msg"):
-            lines.append(f"   {_short(row.get('msg'), 300)}")
+        lines.append(f"❌ {_when(row.get('when'))}  джоб «{row.get('job')}», {step}")
+        summary = summarize_job_message(row.get("msg") or "", limit=300)
+        if summary:
+            lines.append(f"   {summary}")
+        why = explain_backup_error(row.get("msg") or "")
+        if why:
+            lines.append(f"   ↳ {why}")
     for err in data.get("errors", []):
         lines.append(f"\n⚠️ {err}")
     return "\n".join(lines)
@@ -231,7 +236,7 @@ def format_jobs(data, hours: int) -> str:
             line += f"  ({row['took']})"
         lines.append(line)
         if row.get("status") == 0 and row.get("msg"):
-            lines.append(f"   {_short(row.get('msg'), 200)}")
+            lines.append(f"   {summarize_job_message(row.get('msg'), limit=200)}")
     return "\n".join(lines)
 
 

@@ -183,6 +183,75 @@ def decode_agent_duration(run_duration: int) -> str:
     return f"{ss} с"
 
 
+# ─── Суть сообщения джоба ────────────────────────────────────
+
+# Планы обслуживания (Maintenance Plan) выполняются через dtexec, и его
+# вывод начинается с полустраничной шапки: «Executed as user … Microsoft (R)
+# SQL Server Execute Package Utility … Started … Progress …». Настоящая
+# ошибка идёт дальше, после Description, а иногда только в самом конце.
+# Обрезка по первым N символам показывала ровно эту шапку и ничего больше.
+_JOB_NOISE = re.compile(
+    r"Executed as user:.*?(?=Description:|Error:|Ошибка|The step failed|$)",
+    re.IGNORECASE | re.DOTALL)
+_JOB_DESCRIPTION = re.compile(
+    r"Description:\s*(.+?)(?=\s+(?:End|Started:|Source:|Progress:)|$)",
+    re.IGNORECASE | re.DOTALL)
+
+# Причины, которые видно прямо в тексте шага. Дежурному нужно действие,
+# а не код возврата dtexec.
+BACKUP_ERROR_RULES = [
+    (r"operating system error 3\b|cannot find the path specified|"
+     r"не удается найти указанный путь|не удаётся найти указанный путь",
+     "путь не найден: каталога нет или служба SQL его не видит. Буквы "
+     "сетевых дисков (G:, Z:) службе недоступны — нужен UNC-путь "
+     "\\\\сервер\\шара"),
+    (r"operating system error 5\b|отказано в доступе|access is denied",
+     "отказано в доступе: у учётной записи службы SQL нет прав на запись "
+     "в этот каталог"),
+    (r"operating system error 112\b|недостаточно места|not enough space",
+     "на диске назначения кончилось место"),
+    (r"operating system error 53\b|network path was not found|"
+     r"не найден сетевой путь",
+     "сетевой путь недоступен: сервер или шара не отвечают"),
+    (r"cannot open backup device|не удается открыть устройство",
+     "устройство копирования недоступно — проверьте путь и права"),
+    (r"the media set has \d+ media famil|носитель",
+     "несовпадение набора носителей: файл занят другой копией"),
+    (r"timeout|время ожидания",
+     "операция не уложилась в таймаут"),
+]
+
+_BACKUP_COMPILED = [(re.compile(p, re.IGNORECASE | re.DOTALL), t)
+                    for p, t in BACKUP_ERROR_RULES]
+
+
+def explain_backup_error(text: str) -> str:
+    """Человеческая причина сбоя копирования. Пусто — если правила нет."""
+    for pattern, explanation in _BACKUP_COMPILED:
+        if pattern.search(text or ""):
+            return explanation
+    return ""
+
+
+def summarize_job_message(message: str, limit: int = 250) -> str:
+    """Вытаскивает суть из вывода шага джоба, отбрасывая шапку dtexec."""
+    text = " ".join((message or "").split())
+    if not text:
+        return ""
+
+    parts = _JOB_DESCRIPTION.findall(text)
+    if parts:
+        # Описаний бывает несколько (вложенные задачи плана) — берём самое
+        # длинное: короткие обычно повторяют «The package execution failed».
+        summary = max(parts, key=len).strip()
+    else:
+        summary = _JOB_NOISE.sub("", text).strip() or text
+
+    if len(summary) > limit:
+        summary = summary[:limit - 1] + "…"
+    return summary
+
+
 # ─── Расшифровка записей движка ──────────────────────────────
 
 # Строка ERRORLOG вида «Error: 824, Severity: 24, State: 2» дежурному не
@@ -398,7 +467,7 @@ def _agent_job_rows(server: dict, hours: int = 24, limit: int = 30,
     tsql = f"""SET NOCOUNT ON;
 SELECT TOP {limit} j.name AS job, h.step_id AS step, h.step_name AS stepname,
        h.run_status AS status, h.run_date AS rundate, h.run_time AS runtime,
-       h.run_duration AS duration, LEFT(h.message, 400) AS msg
+       h.run_duration AS duration, LEFT(h.message, 1500) AS msg
 FROM msdb.dbo.sysjobhistory h
 JOIN msdb.dbo.sysjobs j ON j.job_id = h.job_id
 WHERE {where}

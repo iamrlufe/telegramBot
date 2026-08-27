@@ -11,6 +11,7 @@ import pytest
 
 import alerts
 import backup_collector
+import mssql_log
 
 
 @pytest.fixture
@@ -90,21 +91,26 @@ def test_collector_builds_events_from_both_sources(monkeypatch):
         return {
             "engine": [{"d": "2026-08-27 00:00:00",
                         "t": "BackupDiskFile::CreateMedia: Backup device "
-                             "'G:\\\\pro_bak\\\\x.bak' failed to create."}],
+                             "'G:\\pro_bak\\x.bak' failed to create. "
+                             "Operating system error 3(The system cannot "
+                             "find the path specified.)."}],
             "jobs": [{"when": "2026-08-27 00:00:00", "job": "Ночной бэкап",
                       "step": 2, "stepname": "Backup zup_qb",
                       "msg": "failed with 1 errors"}],
             "errors": [],
         }
 
-    monkeypatch.setitem(__import__("sys").modules, "mssql_log",
-                        type("M", (), {"read_backup_errors": staticmethod(fake_read)}))
+    # Подменяем только чтение: разбор сообщения и расшифровку причины
+    # проверяем настоящие — ради них событие и собирается.
+    monkeypatch.setattr(mssql_log, "read_backup_errors", fake_read)
     monkeypatch.setattr(backup_collector, "check_backup_failure_alerts",
                         lambda name, events: captured.update(name=name, events=events))
 
     backup_collector.check_mssql_backup_failures(
         {"name": "sql-01.example.local", "host": "192.0.2.10"})
 
+    assert any("UNC" in (e.get("why") or "") for e in captured["events"]), \
+        "причина сбоя не расшифрована"
     keys = [e["key"] for e in captured["events"]]
     assert any(k.startswith("e|") for k in keys), "нет события из ERRORLOG"
     assert any(k.startswith("j|") for k in keys), "нет события из истории джоб"
@@ -117,11 +123,19 @@ def test_collector_reports_unavailable_source(monkeypatch, capsys):
         return {"engine": [], "jobs": [],
                 "errors": ["ERRORLOG: нет прав, нужна роль securityadmin"]}
 
-    monkeypatch.setitem(__import__("sys").modules, "mssql_log",
-                        type("M", (), {"read_backup_errors": staticmethod(fake_read)}))
+    # Подменяем только чтение: разбор сообщения и расшифровку причины
+    # проверяем настоящие — ради них событие и собирается.
+    monkeypatch.setattr(mssql_log, "read_backup_errors", fake_read)
     monkeypatch.setattr(backup_collector, "check_backup_failure_alerts",
                         lambda name, events: None)
 
     backup_collector.check_mssql_backup_failures(
         {"name": "sql-01.example.local", "host": "192.0.2.10"})
     assert "securityadmin" in capsys.readouterr().out
+
+
+def test_alert_carries_reason_line(state):
+    """Причина отдельной строкой: длинное сообщение шага не читают целиком."""
+    alerts.check_backup_failure_alerts("sql-01.example.local", [dict(
+        EVENT, key="j|new", why="путь не найден: каталога нет")])
+    assert "↳ путь не найден" in state[0]

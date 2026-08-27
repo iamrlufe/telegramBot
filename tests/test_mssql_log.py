@@ -490,3 +490,92 @@ def test_jobs_total_requested_only_when_empty(monkeypatch):
                                       "msg": ""}])
     mssql_log.read_agent_jobs(SERVER)
     assert not any("COUNT(*)" in s for s in scripts)
+
+
+# ─── Суть сообщения джоба и причина сбоя ─────────────────────
+
+# Реальный вывод шага плана обслуживания: полезное — в самом конце.
+MAINT_PLAN_MSG = (
+    "Executed as user: NT Service\\SQLSERVERAGENT. Microsoft (R) SQL Server "
+    "Execute Package Utility Version 15.0.4200.1 for 64-bit Copyright (C) "
+    "Microsoft Corporation. All rights reserved. Started: 0:10:00 "
+    "Progress: 2026-08-27 00:10:01.07 Source: {FA1D6D23-35E0-493A} "
+    "Executing query \"DECLARE @Guid UNIQUEIDENTIFIER\". : 100% complete "
+    "End Progress Error: 2026-08-27 00:10:05.11 Code: 0xC002F210 "
+    "Source: Back Up Database Task Execute SQL Task "
+    "Description: Failed to open the backup device. "
+    "Operating system error 3(The system cannot find the path specified.). "
+    "End Error The package execution failed. The step failed."
+)
+
+
+def test_job_summary_drops_dtexec_header():
+    """Обрезка по первым символам показывала только шапку dtexec."""
+    summary = summarize_job_message_wrapper()
+    assert "Execute Package Utility" not in summary
+    assert "Failed to open the backup device" in summary
+
+
+def summarize_job_message_wrapper():
+    return mssql_log.summarize_job_message(MAINT_PLAN_MSG, limit=250)
+
+
+def test_job_summary_respects_limit():
+    assert len(mssql_log.summarize_job_message(MAINT_PLAN_MSG, limit=80)) <= 80
+
+
+def test_job_summary_survives_plain_message():
+    """У обычного шага (не плана обслуживания) описания нет."""
+    summary = mssql_log.summarize_job_message(
+        "Executed as user: DOMAIN\\svc. The step failed.")
+    assert "The step failed" in summary
+
+
+def test_job_summary_empty_input():
+    assert mssql_log.summarize_job_message("") == ""
+    assert mssql_log.summarize_job_message(None) == ""
+
+
+def test_backup_error_path_not_found_explained():
+    """Ошибка ОС 3 у бэкапа — почти всегда буква сетевого диска."""
+    text = mssql_log.explain_backup_error(MAINT_PLAN_MSG)
+    assert "путь не найден" in text and "UNC" in text
+
+
+def test_backup_error_access_denied_explained():
+    text = mssql_log.explain_backup_error(
+        "Operating system error 5(Access is denied.)")
+    assert "прав" in text
+
+
+def test_backup_error_no_space_explained():
+    text = mssql_log.explain_backup_error(
+        "Operating system error 112(There is not enough space on the disk.)")
+    assert "место" in text
+
+
+def test_backup_error_russian_locale():
+    text = mssql_log.explain_backup_error(
+        "ошибка операционной системы 3(Системе не удается найти указанный путь.)")
+    assert "путь не найден" in text
+
+
+def test_unknown_backup_error_has_no_explanation():
+    assert mssql_log.explain_backup_error("Something odd happened") == ""
+
+
+def test_job_message_fetched_long_enough(monkeypatch):
+    """При LEFT(...,400) описание ошибки не попадало в выборку вовсе."""
+    scripts = _fake_ps(monkeypatch, [])
+    mssql_log._agent_job_rows(SERVER)
+    assert "LEFT(h.message, 1500)" in scripts[0]
+
+
+def test_backup_section_shows_summary_and_reason():
+    data = {"engine": [], "errors": [], "jobs": [{
+        "when": "2026-08-27 00:10:00", "job": "backupdaily.Subplan_1",
+        "step": 1, "stepname": "Subplan_1", "msg": MAINT_PLAN_MSG}]}
+    text = sqllog_bot.format_backup_errors(data, 24)
+    assert "Execute Package Utility" not in text
+    assert "Failed to open the backup device" in text
+    assert "↳" in text and "UNC" in text

@@ -315,7 +315,9 @@ def check_mssql_backup_failures(server: dict):
     отсутствие свежей копии и срабатывает через backup_alert_hours — то
     есть на сутки позже. SQL знает о сбое сразу и называет причину.
     """
-    from mssql_log import read_backup_errors
+    from mssql_log import (
+        read_backup_errors, summarize_job_message, explain_backup_error,
+    )
 
     name = server["name"]
     data = read_backup_errors(server, hours=BACKUP_FAIL_WINDOW_HOURS)
@@ -326,18 +328,23 @@ def check_mssql_backup_failures(server: dict):
         text = " ".join((row.get("t") or "").split())[:300]
         if text:
             events.append({"key": f"e|{when}|{text[:80]}", "when": when,
-                           "text": text})
+                           "text": text,
+                           "why": explain_backup_error(row.get("t") or "")})
 
     for row in data.get("jobs", []):
         when = row.get("when") or ""
         job = row.get("job") or ""
         step = row.get("stepname") or f"шаг {row.get('step')}"
-        message = " ".join((row.get("msg") or "").split())[:200]
+        # Вывод шага плана обслуживания начинается с шапки dtexec, а сама
+        # ошибка лежит дальше — обрезка по первым символам показывала шапку.
+        raw = row.get("msg") or ""
+        message = summarize_job_message(raw, limit=250)
         events.append({
             "key": f"j|{when}|{job}|{row.get('step')}",
             "when": when,
             "text": f"джоб «{job}», {step}: {message}" if message
                     else f"джоб «{job}», {step}",
+            "why": explain_backup_error(raw),
         })
 
     if events:

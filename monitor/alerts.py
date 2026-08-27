@@ -407,6 +407,10 @@ def check_backup_failure_alerts(server_name: str, events: list):
     for event in fresh[:BACKUP_FAIL_IN_MESSAGE]:
         when = (event.get("when") or "")[:16]
         lines.append(f"{when} — {event.get('text', '')}")
+        # Причина отдельной строкой: сообщение шага почти всегда длинное и
+        # техническое, а действие должно быть понятно без чтения целиком.
+        if event.get("why"):
+            lines.append(f"↳ {event['why']}")
     if len(fresh) > BACKUP_FAIL_IN_MESSAGE:
         lines.append(f"… и ещё {len(fresh) - BACKUP_FAIL_IN_MESSAGE}")
 
