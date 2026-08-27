@@ -264,7 +264,9 @@ def read_login_errors(server: dict, hours: int = 24,
              "OR LogText LIKE '%открыть базу данных%' "
              "OR LogText LIKE '%Error: 18456%')")
     rows = _run_sql(server, _errorlog_query(hours, where, limit), "d,t")
-    return group_login_failures(rows)
+    # Ровно limit строк почти всегда означает, что лог глубже выборки:
+    # иначе счётчик «60 шт.» выдавался бы за полное число отказов за сутки.
+    return {"rows": group_login_failures(rows), "truncated": len(rows) >= limit}
 
 
 def read_backup_errors(server: dict, hours: int = 24,

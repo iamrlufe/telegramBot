@@ -176,8 +176,9 @@ def test_read_login_errors_groups_result(monkeypatch):
         {"d": "2026-08-27 11:02:00",
          "t": "Login failed for user 'app'. State: 8. [CLIENT: 192.0.2.31]"},
     ])
-    rows = mssql_log.read_login_errors(SERVER)
-    assert len(rows) == 1 and rows[0]["count"] == 2
+    data = mssql_log.read_login_errors(SERVER)
+    assert len(data["rows"]) == 1 and data["rows"][0]["count"] == 2
+    assert data["truncated"] is False
 
 
 def test_read_agent_jobs_decodes_time(monkeypatch):
@@ -332,3 +333,15 @@ def test_help_section_documents_required_rights():
 def test_help_section_warns_about_log_reset():
     from config_editor import HELP_SECTIONS
     assert "sp_cycle_errorlog" in HELP_SECTIONS["sqllog"][1]
+
+
+def test_login_result_flags_truncation(monkeypatch):
+    """Ровно limit строк — счётчик врал бы, выдавая предел за полное число."""
+    _fake_ps(monkeypatch, [
+        {"d": f"2026-08-27 13:{n:02d}:00",
+         "t": f"Login failed for user 'u{n}'. State: 8. [CLIENT: 192.0.2.9]"}
+        for n in range(5)
+    ])
+    data = mssql_log.read_login_errors(SERVER, limit=5)
+    assert data["truncated"] is True
+    assert "предел выборки" in sqllog_bot.format_logins(data, 24)

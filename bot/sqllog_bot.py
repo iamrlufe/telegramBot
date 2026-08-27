@@ -91,13 +91,15 @@ def section_kb(server_name: str, hours: int, section: str) -> InlineKeyboardMark
 
 # ─── Форматирование ──────────────────────────────────────────
 
-def format_logins(rows: list, hours: int) -> str:
+def format_logins(data, hours: int) -> str:
+    rows = data.get("rows", []) if isinstance(data, dict) else data
+    truncated = data.get("truncated") if isinstance(data, dict) else False
     if not rows:
         return (f"🔐 Ошибки входа за {period_name(hours)}\n\nНет отказов входа. "
                 "Если ожидали увидеть записи — учтите, что ERRORLOG обнуляется "
                 "при перезапуске службы SQL.")
     total = sum(row.get("count", 1) for row in rows)
-    lines = [f"🔐 Ошибки входа за {period_name(hours)} — {total} шт.\n"]
+    lines = [f"🔐 Ошибки входа за {period_name(hours)} — {total} записей\n"]
     for row in rows[:SHOW_LIMIT]:
         when = _when(row.get("last"))
         user = row.get("user") or "неизвестный логин"
@@ -117,6 +119,9 @@ def format_logins(rows: list, hours: int) -> str:
         lines.append(f"       {detail}")
     if len(rows) > SHOW_LIMIT:
         lines.append(f"\n… ещё {len(rows) - SHOW_LIMIT} источников, показаны свежие")
+    if truncated:
+        lines.append("\n⚠️ Достигнут предел выборки: отказов за период больше, "
+                     "показаны самые свежие.")
     return "\n".join(lines)
 
 
