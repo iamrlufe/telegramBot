@@ -29,6 +29,7 @@ from ping_tools import load_targets, ping_custom, ping_target
 from refresh import refresh_server, load_server
 from dirdig import DIG_MAX_DEPTH, DIG_TOKENS, dig_kb
 from sqllog_bot import has_mssql, sql_token, sqllog_callback
+from winlog_bot import has_winlog, win_token, winlog_callback
 from remote_ops import get_top_dirs, restart_service, reboot_server
 from backup_bot import (
     cmd_backup_menu,
@@ -562,13 +563,22 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
     # заводить второй переключатель на тот же факт означало бы, что рано или
     # поздно они разойдутся. Сломанный конфиг не должен уносить всю карточку.
     try:
-        if has_mssql(load_server(server_name)):
-            rows.append([InlineKeyboardButton(
+        server = load_server(server_name)
+        logs_row = []
+        if has_mssql(server):
+            logs_row.append(InlineKeyboardButton(
                 "🗄 SQL-логи",
                 callback_data=f"sqllog_menu:{sql_token(server_name, 24)}",
-            )])
+            ))
+        if has_winlog(server):
+            logs_row.append(InlineKeyboardButton(
+                "📜 Логи Windows",
+                callback_data=f"winlog_menu:{win_token(server_name, 24)}",
+            ))
+        if logs_row:
+            rows.append(logs_row)
     except Exception as e:
-        print(f"[bot] SQL-логи: сервер {server_name} не прочитан: {e}", flush=True)
+        print(f"[bot] Логи: сервер {server_name} не прочитан: {e}", flush=True)
 
     return InlineKeyboardMarkup(rows)
 
@@ -604,6 +614,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("sqllog_"):
         await sqllog_callback(query, context)
+
+    elif query.data.startswith("winlog_"):
+        await winlog_callback(query, context)
 
     elif query.data.startswith("cfg_"):
         await config_callback(query, context)
