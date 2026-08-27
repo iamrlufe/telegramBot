@@ -25,7 +25,8 @@ from db import (
     get_servers_status, get_server_detail, get_disk_usage, get_server_disks,
     get_problems, build_report,
 )
-from ping_tools import load_targets, ping_custom, ping_target
+from net_tools import http_report, ports_report, ports_report_host
+from ping_tools import get_target, load_targets, ping_custom, ping_target
 from refresh import refresh_server, load_server
 from dirdig import DIG_MAX_DEPTH, DIG_TOKENS, dig_kb
 from sqllog_bot import has_mssql, sql_token, sqllog_callback
@@ -316,14 +317,33 @@ async def cmd_problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_long_message(update.message, await asyncio.to_thread(get_problems))
 
 
-def build_ping_keyboard():
+def build_ping_keyboard(with_actions: bool = False):
+    """with_actions — под карточкой пинга: проверить порты и HTTP того же
+    хоста, не набирая его заново. В меню выбора эти кнопки бессмысленны:
+    цель ещё не выбрана."""
+    keyboard = []
+    if with_actions:
+        keyboard.append([
+            InlineKeyboardButton("🔌 Порты", callback_data="ping_ports"),
+            InlineKeyboardButton("🌐 HTTP", callback_data="ping_http"),
+        ])
     buttons = [
         InlineKeyboardButton(f"📡 {target['name']}", callback_data=f"ping:{target['name']}")
         for target in load_targets()
     ]
-    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    keyboard += [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     keyboard.append([InlineKeyboardButton("✏️ Указать IP", callback_data="ping_custom")])
     return keyboard
+
+
+def remember_ping_target(context, label: str, host: str, from_config: bool):
+    """Цель последнего пинга — в user_data, а не в callback_data кнопки:
+    Telegram ограничивает callback 64 байтами, а hostname бывает длиннее."""
+    context.user_data["ping_target"] = {
+        "label": label,
+        "host": host,
+        "from_config": from_config,
+    }
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -333,7 +353,12 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         host = " ".join(context.args).strip()
         text = await asyncio.to_thread(ping_custom, host)
-        await update.message.reply_text(text)
+        remember_ping_target(context, host, host, from_config=False)
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(build_ping_keyboard(with_actions=True))
+        )
         return
 
     await update.message.reply_text(
@@ -526,7 +551,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.pop("awaiting_ping_host", False):
         result = await asyncio.to_thread(ping_custom, text)
-        await update.message.reply_text(result)
+        remember_ping_target(context, text, text, from_config=False)
+        await update.message.reply_text(
+            result,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(build_ping_keyboard(with_actions=True))
+        )
     elif text == "🖥 Серверы":
         await cmd_servers(update, context)
     elif text == "📊 Дашборд":
@@ -846,10 +876,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("ping:"):
         server_name = query.data.split(":", 1)[1]
         text = await asyncio.to_thread(ping_target, server_name)
+        try:
+            host = (await asyncio.to_thread(get_target, server_name))["host"]
+        except ValueError:
+            host = server_name
+        remember_ping_target(context, server_name, host, from_config=True)
         await safe_edit_message(
             query,
             text,
-            reply_markup=InlineKeyboardMarkup(build_ping_keyboard())
+            reply_markup=InlineKeyboardMarkup(build_ping_keyboard(with_actions=True)),
+            parse_mode="HTML"
+        )
+
+    elif query.data in ("ping_ports", "ping_http"):
+        target = context.user_data.get("ping_target")
+        if not target:
+            await safe_edit_message(
+                query,
+                "📡 Сначала выбери цель — сервер из списка или свой IP.",
+                reply_markup=InlineKeyboardMarkup(build_ping_keyboard())
+            )
+            return
+
+        label, host = target["label"], target["host"]
+        if query.data == "ping_ports":
+            await safe_edit_message(query, f"🔌 Проверяю порты {label}...")
+            if target["from_config"]:
+                text = await asyncio.to_thread(ports_report, label)
+            else:
+                text = await asyncio.to_thread(ports_report_host, host)
+        else:
+            await safe_edit_message(query, f"🌐 Запрашиваю {label}...")
+            text = await asyncio.to_thread(http_report, label, host)
+
+        await safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(build_ping_keyboard(with_actions=True)),
+            parse_mode="HTML"
         )
 
     elif query.data == "ping_custom":

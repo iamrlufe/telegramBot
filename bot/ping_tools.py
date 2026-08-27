@@ -1,3 +1,5 @@
+import html
+import ipaddress
 import json
 import re
 import subprocess
@@ -51,7 +53,58 @@ def ping_host(host: str, count: int = 4, timeout: int = 2) -> tuple:
         return False, "Таймаут ping (нет ответа за отведённое время)"
 
 
+RESOLVED_IP_RE = re.compile(r"^PING\s+\S+\s+\(([^)\s]+)\)", re.M)
+
+
+def resolved_address(output: str):
+    """IP, до которого реально дорезолвилось имя: ping печатает его в первой
+    строке — PING host (192.0.2.31) 56(84) bytes of data."""
+    match = RESOLVED_IP_RE.search(output)
+    return match.group(1) if match else None
+
+
+def is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def ping_quality(avg_ms, packet_loss):
+    if packet_loss is not None:
+        loss = float(packet_loss)
+        if loss >= 100:
+            return "❌ связи нет"
+        if loss > 0:
+            return f"⚠️ с потерями ({loss:g}%)"
+    if avg_ms is None:
+        return None
+    avg = float(avg_ms)
+    if avg < 10:
+        return "🟢 отличное"
+    if avg < 50:
+        return "🟢 хорошее"
+    if avg < 150:
+        return "🟡 нормальное"
+    return "🔴 медленное"
+
+
+def reply_table(replies: list) -> str:
+    """Моноширинная таблица ответов со столбиком относительной задержки."""
+    times = [float(time_ms) for _, time_ms in replies]
+    peak = max(times) or 1.0
+    rows = []
+    for (seq, time_ms), value in zip(replies, times):
+        bar = "\u2588" * max(1, round(value / peak * 8))
+        rows.append(f"#{seq:<3}{time_ms:>8} ms  {bar}")
+    return html.escape("\n".join(rows))
+
+
 def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
+    """Карточка пинга в HTML. Таблица ответов уходит в <pre>: обычный текст
+    Telegram рисует пропорциональным шрифтом, и колонки с миллисекундами
+    разъезжались."""
     packet_loss = None
     transmitted = None
     received = None
@@ -83,29 +136,54 @@ def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
         avg_ms = rtt_match.group(2)
         max_ms = rtt_match.group(3)
 
+    resolved_ip = resolved_address(output)
+
     icon = "🟢" if ok else "🔴"
-    msg = f"{icon} PING\n\n"
-    msg += f"Цель: {label}\n"
-    msg += f"Host: {host}\n"
-    msg += f"Статус: {'доступен' if ok else 'не отвечает'}\n"
+    esc_label = html.escape(label)
+    lines = [
+        f"{icon} <b>PING · {esc_label}</b>",
+        "━" * 20,
+        "",
+        f"🖥 Хост: {esc_label}",
+    ]
 
-    msg += "\nОтветы:\n"
-    if replies:
-        for seq, time_ms in replies:
-            msg += f"  #{seq}: {time_ms} ms\n"
+    # Пинг по IP: второй раз тот же адрес показывать незачем.
+    if is_ip(host):
+        lines.append(f"🌐 Адрес: {html.escape(host)}")
+    elif resolved_ip:
+        lines.append(f"🌐 IP: {html.escape(resolved_ip)}")
     else:
-        msg += "  нет ответов\n"
+        lines.append("🌐 IP: имя не разрешается (DNS)")
 
-    msg += "\nСтатистика:\n"
-    if transmitted is not None and received is not None:
-        msg += f"Пакеты: {received}/{transmitted}\n"
-    if packet_loss is not None:
-        msg += f"Потери: {packet_loss}%\n"
-    if min_ms is not None and max_ms is not None:
-        msg += f"Мин/ср/макс: {min_ms}/{avg_ms}/{max_ms} ms\n"
+    lines.append(f"{'✅' if ok else '❌'} Статус: {'доступен' if ok else 'не отвечает'}")
+    lines.append("")
+
     if avg_ms is not None:
-        msg += f"Среднее: {avg_ms} ms\n"
-    return msg
+        tail = ""
+        if min_ms is not None and max_ms is not None:
+            tail = f"  (мин {min_ms} / макс {max_ms})"
+        lines.append(f"⏱ Отклик: {avg_ms} ms{tail}")
+    if transmitted is not None and received is not None:
+        loss_tail = f", потерь {packet_loss}%" if packet_loss is not None else ""
+        lines.append(f"📦 Пакеты: {received} из {transmitted}{loss_tail}")
+    quality = ping_quality(avg_ms, packet_loss)
+    if quality:
+        lines.append(f"📶 Качество: {quality}")
+
+    if replies:
+        lines.append("")
+        lines.append("Ответы")
+        lines.append(f"<pre>{reply_table(replies)}</pre>")
+    else:
+        lines.append("")
+        lines.append("⚠️ Ответов нет")
+        if transmitted is None:
+            # ping не отработал вовсе: неверный хост, таймаут, нет прав
+            note = " ".join(output.split())[:200]
+            if note:
+                lines.append(html.escape(note))
+
+    return "\n".join(lines)
 
 
 def ping_target(name: str) -> str:

@@ -16,8 +16,10 @@ class FakeMessage:
     def __init__(self):
         self.replies = []
 
-    async def reply_text(self, text, reply_markup=None):
-        self.replies.append({"text": text, "markup": reply_markup})
+    async def reply_text(self, text, reply_markup=None, parse_mode=None):
+        self.replies.append(
+            {"text": text, "markup": reply_markup, "parse_mode": parse_mode}
+        )
 
 
 class FakeQuery:
@@ -26,10 +28,11 @@ class FakeQuery:
         self.edited = None
         self._raise = raise_error
 
-    async def edit_message_text(self, text, reply_markup=None):
+    async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
         if self._raise:
             raise self._raise
-        self.edited = {"text": text, "markup": reply_markup}
+        self.edited = {"text": text, "markup": reply_markup,
+                       "parse_mode": parse_mode}
 
 
 def _run(coro):
@@ -111,3 +114,14 @@ def test_not_modified_still_sends_remaining_parts():
 
     assert query.message.replies, "хвост сообщения потерялся"
     assert query.message.replies[-1]["markup"] == "КНОПКИ"
+
+
+def test_parse_mode_reaches_every_part():
+    """Карточка пинга уходит в HTML — режим разметки должен доехать и до
+    хвостовых частей, иначе теги в них покажутся как текст."""
+    text = _long_text(TELEGRAM_TEXT_LIMIT * 2)
+    query = FakeQuery()
+    _run(safe_edit_message(query, text, parse_mode="HTML"))
+
+    assert query.edited["parse_mode"] == "HTML"
+    assert all(part["parse_mode"] == "HTML" for part in query.message.replies)

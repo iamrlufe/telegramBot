@@ -88,7 +88,7 @@ def mute_expired(value, now: datetime = None) -> bool:
         return False
 
 
-async def safe_edit_message(query, text: str, reply_markup=None):
+async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None):
     """Длинный текст режется на части: Telegram отклоняет сообщения больше
     ~4096 символов, и карточка сервера с двумя десятками backup-путей
     упиралась в этот предел — пользователь видел «Произошла ошибка».
@@ -97,7 +97,8 @@ async def safe_edit_message(query, text: str, reply_markup=None):
     try:
         await query.edit_message_text(
             chunks[0],
-            reply_markup=reply_markup if len(chunks) == 1 else None
+            reply_markup=reply_markup if len(chunks) == 1 else None,
+            parse_mode=parse_mode
         )
     except BadRequest as e:
         if "Message is not modified" not in str(e):
@@ -108,7 +109,8 @@ async def safe_edit_message(query, text: str, reply_markup=None):
     for i, chunk in enumerate(chunks[1:], start=2):
         await query.message.reply_text(
             chunk,
-            reply_markup=reply_markup if i == len(chunks) else None
+            reply_markup=reply_markup if i == len(chunks) else None,
+            parse_mode=parse_mode
         )
 
 
