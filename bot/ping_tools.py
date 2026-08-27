@@ -21,13 +21,6 @@ def load_targets() -> list:
     ]
 
 
-def get_target(name: str) -> dict:
-    for target in load_targets():
-        if target["name"] == name:
-            return target
-    raise ValueError(f"Сервер {name} не найден")
-
-
 HOST_RE = re.compile(
     r"^(?!-)[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$"
 )
@@ -90,15 +83,34 @@ def ping_quality(avg_ms, packet_loss):
     return "🔴 медленное"
 
 
+# U+2007 — пробел шириной ровно в цифру. Им выравниваются числа в обычном
+# тексте: моноширинный <pre> Telegram рисует серой плашкой с заголовком
+# «копировать», отдельной от сообщения, и это выглядело чужеродно.
+FIGURE_SPACE = "\u2007"
+
+
+def pad_left(text: str, width: int) -> str:
+    return FIGURE_SPACE * max(0, width - len(text)) + text
+
+
+def pad_right(text: str, width: int) -> str:
+    return text + FIGURE_SPACE * max(0, width - len(text))
+
+
 def reply_table(replies: list) -> str:
-    """Моноширинная таблица ответов со столбиком относительной задержки."""
+    """Ответы списком: номер, время и столбик относительной задержки."""
     times = [float(time_ms) for _, time_ms in replies]
     peak = max(times) or 1.0
+    seq_width = max(len(seq) for seq, _ in replies)
+    ms_width = max(len(time_ms) for _, time_ms in replies)
     rows = []
     for (seq, time_ms), value in zip(replies, times):
-        bar = "\u2588" * max(1, round(value / peak * 8))
-        rows.append(f"#{seq:<3}{time_ms:>8} ms  {bar}")
-    return html.escape("\n".join(rows))
+        bar = "\u2587" * max(1, round(value / peak * 8))
+        rows.append(
+            f"#{pad_left(seq, seq_width)} · "
+            f"{pad_left(time_ms, ms_width)} ms  {bar}"
+        )
+    return "\n".join(rows)
 
 
 def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
@@ -147,11 +159,12 @@ def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
         f"🖥 Хост: {esc_label}",
     ]
 
-    # Пинг по IP: второй раз тот же адрес показывать незачем.
-    if is_ip(host):
-        lines.append(f"🌐 Адрес: {html.escape(host)}")
-    elif resolved_ip:
-        lines.append(f"🌐 IP: {html.escape(resolved_ip)}")
+    # Адрес в <code>: иначе Telegram делает из IP синюю ссылку, а по нажатию
+    # на моноширинный он копируется.
+    address = host if is_ip(host) else (resolved_ip or "")
+    if address:
+        label_word = "Адрес" if address == host else "IP"
+        lines.append(f"🌐 {label_word}: <code>{html.escape(address)}</code>")
     else:
         lines.append("🌐 IP: имя не разрешается (DNS)")
 
@@ -173,7 +186,7 @@ def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
     if replies:
         lines.append("")
         lines.append("Ответы")
-        lines.append(f"<pre>{reply_table(replies)}</pre>")
+        lines.append(reply_table(replies))
     else:
         lines.append("")
         lines.append("⚠️ Ответов нет")
@@ -186,15 +199,7 @@ def format_ping_result(label: str, host: str, ok: bool, output: str) -> str:
     return "\n".join(lines)
 
 
-def ping_target(name: str) -> str:
-    target = get_target(name)
-    ok, output = ping_host(target["host"])
-    return format_ping_result(target["name"], target["host"], ok, output)
-
-
-def ping_custom(host: str) -> str:
-    host = host.strip()
-    if not host:
-        return "Укажи IP или hostname"
+def ping_report(label: str, host: str) -> str:
+    """Пинг уже разрешённой цели: имя для заголовка, адрес для команды."""
     ok, output = ping_host(host)
-    return format_ping_result(host, host, ok, output)
+    return format_ping_result(label, host, ok, output)

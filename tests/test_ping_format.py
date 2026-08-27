@@ -23,25 +23,32 @@ def test_resolved_ip_shown_for_hostname():
     msg = format_ping_result(
         "srv-01.example.local", "srv-01.example.local", True, OK_OUTPUT
     )
-    assert "🌐 IP: 192.0.2.31" in msg
+    assert "🌐 IP: <code>192.0.2.31</code>" in msg
     assert "🖥 Хост: srv-01.example.local" in msg
 
 
 def test_ip_target_not_duplicated():
     msg = format_ping_result("192.0.2.31", "192.0.2.31", True, OK_OUTPUT)
-    assert "🌐 Адрес: 192.0.2.31" in msg
+    assert "🌐 Адрес: <code>192.0.2.31</code>" in msg
     assert "🌐 IP:" not in msg
 
 
-def test_replies_go_into_pre_block():
+def test_replies_listed_as_plain_text():
+    """Без <pre>: блок кода Telegram рисует серой плашкой с заголовком
+    «копировать» — она выбивалась из карточки. Числа ровняются пробелом
+    U+2007 шириной в цифру."""
     msg = format_ping_result(
         "srv-01.example.local", "srv-01.example.local", True, OK_OUTPUT
     )
-    body = msg.split("<pre>", 1)[1].split("</pre>", 1)[0]
+    assert "<pre>" not in msg
+    body = msg.split("Ответы\n", 1)[1]
     assert body.count("\n") == 3
-    assert "0.669 ms" in body
+    assert "#1 · 0.669 ms" in body
     # столбик длительности рисуется относительно самого долгого ответа
-    assert "█" in body
+    assert "▇" in body
+    longest = [line for line in body.splitlines() if "0.669" in line][0]
+    shortest = [line for line in body.splitlines() if "0.567" in line][0]
+    assert longest.count("▇") > shortest.count("▇")
 
 
 def test_stats_line():

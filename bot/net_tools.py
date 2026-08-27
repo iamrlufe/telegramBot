@@ -24,7 +24,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from ping_tools import SERVERS_FILE, is_valid_host
+from ping_tools import SERVERS_FILE, is_valid_host, pad_left, pad_right
 
 PORT_NAMES = {
     22: "SSH",
@@ -46,21 +46,31 @@ DEFAULT_PORTS = [22, 80, 443, 3389]
 
 MAX_PORTS = 8
 CONNECT_TIMEOUT = 2
+# Точечная перепроверка одного порта: медленная служба не успевает ответить
+# за 2 секунды и в общей сводке ложно выглядит отфильтрованной.
+RETRY_TIMEOUT = 5
 HTTP_TIMEOUT = 6
 
 
-def load_server_config(name: str) -> dict:
-    """Полная запись сервера. Порты выводятся из неё, а не задаются руками:
-    в конфиге уже сказано, что на сервере MSSQL, IIS или SSH."""
+def resolve_target(value: str) -> dict:
+    """Имя из конфига → его адрес и поля. Пользователь набирает `/ping
+    sql-01` руками, и раньше это уходило в ветку «неизвестный хост»:
+    проверялись 22/80/443/3389 вместо MSSQL и WinRM этого сервера."""
+    value = (value or "").strip()
     try:
         with open(SERVERS_FILE) as f:
             servers = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {}
+        servers = []
+
     for server in servers:
-        if server.get("name") == name:
-            return server
-    return {}
+        if server.get("name") == value or server.get("host") == value:
+            return {
+                "label": server.get("name") or value,
+                "host": server.get("host") or value,
+                "server": server,
+            }
+    return {"label": value, "host": value, "server": {}}
 
 
 def guess_ports(server: dict) -> list:
@@ -139,6 +149,20 @@ STATE_ICONS = {
 }
 
 
+def port_row(item: dict, port_width: int = 0, name_width: int = 0) -> str:
+    port = str(item["port"])
+    name = PORT_NAMES.get(item["port"], "")
+    if item["state"] == "open":
+        detail = f"{item['ms']:.0f} ms"
+    else:
+        detail = item.get("detail", "")
+    icon = STATE_ICONS.get(item["state"], "⚠️")
+    return (
+        f"{icon} {pad_left(port, port_width)}  "
+        f"{pad_right(name, name_width)}  {detail}".rstrip()
+    )
+
+
 def format_port_results(label: str, host: str, results: list) -> str:
     esc_label = html.escape(label)
     lines = [
@@ -150,50 +174,70 @@ def format_port_results(label: str, host: str, results: list) -> str:
     # У сервера из конфига имя и адрес разные — показываем оба; при ручном
     # вводе IP это одна и та же строка, дублировать нечего.
     if host and host != label:
-        lines.append(f"🌐 Адрес: {html.escape(host)}")
+        lines.append(f"🌐 Адрес: <code>{html.escape(host)}</code>")
     lines.append("")
 
     if not results:
         lines.append("⚠️ Нечего проверять: порты не определены")
         return "\n".join(lines)
 
-    rows = []
-    for item in results:
-        port = item["port"]
-        name = PORT_NAMES.get(port, "")
-        if item["state"] == "open":
-            detail = f"{item['ms']:.0f} ms"
-        else:
-            detail = item.get("detail", "")
-        rows.append(
-            f"{STATE_ICONS.get(item['state'], '⚠️')} "
-            f"{port:<5} {name:<10} {detail}".rstrip()
-        )
-    lines.append("<pre>" + html.escape("\n".join(rows)) + "</pre>")
+    port_width = max(len(str(item["port"])) for item in results)
+    name_width = max(len(PORT_NAMES.get(item["port"], "")) for item in results)
+    lines += [port_row(item, port_width, name_width) for item in results]
 
     opened = sum(1 for item in results if item["state"] == "open")
+    lines.append("")
     lines.append(f"Открыто {opened} из {len(results)}")
-    if opened < len(results):
-        lines.append(
-            "\n⏱ — ответа нет вовсе: чаще всего порт режет файрвол.\n"
-            "❌ — хост ответил «отказано»: служба не слушает порт."
-        )
+
+    states = {item["state"] for item in results}
+    if "filtered" in states:
+        lines.append("⏱ — ответа нет вовсе: чаще всего порт режет файрвол.")
+    if "closed" in states:
+        lines.append("❌ — хост ответил «отказано»: служба не слушает порт.")
     return "\n".join(lines)
 
 
-def ports_report(name: str) -> str:
-    """Порты сервера из конфига."""
-    server = load_server_config(name)
-    host = server.get("host") or name
-    return format_port_results(name, host, check_ports(host, guess_ports(server)))
+def ports_report(value: str) -> tuple:
+    """Сводка по портам цели. Второй элемент — порты, которые не открылись:
+    из них строится ряд кнопок точечной перепроверки."""
+    target = resolve_target(value)
+    label, host = target["label"], target["host"]
+    if not is_valid_host(host):
+        return "❌ Некорректный IP или hostname", []
+
+    ports = guess_ports(target["server"])
+    results = check_ports(host, ports)
+    closed = [item["port"] for item in results if item["state"] != "open"]
+    return format_port_results(label, host, results), closed
 
 
-def ports_report_host(host: str) -> str:
-    """Порты произвольного хоста (пинг по введённому IP)."""
-    host = host.strip()
+def single_port_report(value: str, port: int) -> str:
+    """Один порт с увеличенным таймаутом — ответ на «а вдруг просто медленно»."""
+    target = resolve_target(value)
+    label, host = target["label"], target["host"]
     if not is_valid_host(host):
         return "❌ Некорректный IP или hostname"
-    return format_port_results(host, host, check_ports(host, list(DEFAULT_PORTS)))
+    if not 1 <= port <= 65535:
+        return "❌ Порт должен быть числом от 1 до 65535"
+
+    item = probe_port(host, port, timeout=RETRY_TIMEOUT)
+    name = PORT_NAMES.get(port, "")
+    title = f"{port} · {name}" if name else str(port)
+    lines = [
+        f"🔌 <b>ПОРТ {html.escape(title)} · {html.escape(label)}</b>",
+        "━" * 20,
+        "",
+        port_row(item),
+        "",
+        f"Таймаут проверки — {RETRY_TIMEOUT} с (в общей сводке {CONNECT_TIMEOUT} с).",
+    ]
+    if item["state"] == "open":
+        lines.append("Порт открыт: служба слушает и соединение проходит.")
+    elif item["state"] == "closed":
+        lines.append("Хост ответил «отказано» — служба на этом порту не поднята.")
+    elif item["state"] == "filtered":
+        lines.append("Ответа нет и за 5 секунд — похоже на файрвол.")
+    return "\n".join(lines)
 
 
 # ─── HTTP ────────────────────────────────────────────────────
@@ -333,8 +377,9 @@ def format_http_result(label: str, host: str, probe: dict, cert: dict) -> str:
     return "\n".join(lines)
 
 
-def http_report(label: str, host: str) -> str:
-    host = (host or "").strip()
+def http_report(value: str) -> str:
+    target = resolve_target(value)
+    label, host = target["label"], target["host"]
     if not is_valid_host(host):
         return "❌ Некорректный IP или hostname"
     probe = http_probe(host)
