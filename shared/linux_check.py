@@ -97,7 +97,7 @@ echo '===MDSTAT==='
 cat /proc/mdstat 2>/dev/null
 true
 echo '===DF==='
-df -P -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null || df -P -B1
+df -P -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs -x efivarfs -x devpts -x proc -x sysfs -x cgroup -x cgroup2 -x debugfs -x tracefs -x configfs -x fusectl -x pstore -x bpf -x mqueue -x hugetlbfs -x securityfs -x ramfs 2>/dev/null || df -P -B1
 echo '===TOPCPU==='
 ps -eo pid,pcpu,rss,comm --no-headers --sort=-pcpu 2>/dev/null | head -n 5
 echo '===TOPMEM==='
@@ -358,6 +358,27 @@ def _parse_mdstat(lines: list) -> list:
     return arrays
 
 
+# Служебные точки монтирования ядра. Их отсекает и `df -x`, но список
+# файловых систем у разных ядер разный: на pangolin efivarfs пролезал в
+# отчёт как «🔴 /sys/firmware/efi/efivars 0% свободно» — это не диск, а
+# хранилище переменных UEFI размером в десятки килобайт, оно всегда полное.
+PSEUDO_MOUNT_PREFIXES = ("/sys", "/proc", "/dev", "/run")
+
+# Раздел меньше гигабайта не бывает осмысленной целью «кончается место»:
+# это загрузочные и служебные области, которые заполнены по проекту.
+MIN_DISK_BYTES = 1024 ** 3
+
+
+def _is_real_disk(fs: str, mountpoint: str, total_b: int) -> bool:
+    if fs.startswith("/dev/loop"):
+        return False
+    if total_b < MIN_DISK_BYTES:
+        return False
+    if mountpoint != "/" and mountpoint.startswith(PSEUDO_MOUNT_PREFIXES):
+        return False
+    return True
+
+
 def _parse_df(lines: list) -> list:
     disks = []
     for line in lines:
@@ -365,13 +386,11 @@ def _parse_df(lines: list) -> list:
         if len(parts) < 6 or parts[0] == "Filesystem":
             continue
         fs, total, used, avail, _, mountpoint = parts
-        if fs.startswith("/dev/loop"):
-            continue
         try:
             total_b, used_b, avail_b = int(total), int(used), int(avail)
         except ValueError:
             continue
-        if total_b <= 0:
+        if not _is_real_disk(fs, mountpoint, total_b):
             continue
         disks.append({
             "Name": mountpoint,

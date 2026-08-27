@@ -304,11 +304,31 @@ async def cmd_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+REPORT_MODE_BUTTONS = (
+    ("short", "🔎 Кратко"),
+    ("compact", "📋 Подробно"),
+    ("full", "📄 Полный"),
+)
+
+
+def build_report_keyboard(active: str = "short"):
+    """Короткий отчёт по умолчанию, привычный полный — в одно нажатие."""
+    return [[
+        InlineKeyboardButton(f"• {text}" if mode == active else text,
+                             callback_data=f"report:{mode}")
+        for mode, text in REPORT_MODE_BUTTONS
+    ]]
+
+
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text("⏳ Формирую отчёт...")
-    await reply_long_message(update.message, await asyncio.to_thread(build_report))
+    await reply_long_message(
+        update.message,
+        await asyncio.to_thread(build_report),
+        reply_markup=InlineKeyboardMarkup(build_report_keyboard())
+    )
 
 
 async def cmd_problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -927,6 +947,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
+    elif query.data.startswith("report:"):
+        mode = query.data.split(":", 1)[1]
+        await safe_edit_message(query, "⏳ Формирую отчёт...")
+        text = await asyncio.to_thread(build_report, mode=mode)
+        await safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(build_report_keyboard(mode))
+        )
+
     elif query.data == "ping_menu":
         await safe_edit_message(
             query,
@@ -1066,7 +1096,11 @@ async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        report = await asyncio.to_thread(build_report, "📊 ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ ПО ИНФРАСТРУКТУРЕ")
+        # Раз в неделю уместна полная строка по каждому серверу, а не только
+        # по вышедшим за пороги: это сводка за период, а не сигнал тревоги.
+        report = await asyncio.to_thread(
+            build_report, "📊 ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ ПО ИНФРАСТРУКТУРЕ", mode="compact"
+        )
         for chunk in split_message(report):
             await _send_text_to_notify(context, chunk)
     except Exception as e:

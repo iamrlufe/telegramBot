@@ -754,7 +754,25 @@ def get_problems() -> str:
 
 # ─── Отчёт ───────────────────────────────────────────────────
 
-def build_report(title: str = "📊 ОТЧЁТ ПО ИНФРАСТРУКТУРЕ") -> str:
+CPU_WARN, CPU_CRIT = 70, 90
+RAM_WARN, RAM_CRIT = 70, 90
+# Для дисков считается свободное место, поэтому пороги «меньше чем».
+DISK_WARN, DISK_CRIT = 20, 10
+
+REPORT_MODES = ("short", "compact", "full")
+
+
+def _load_icon(value: float, warn: float, crit: float) -> str:
+    return "🔴" if value >= crit else "🟠" if value >= warn else "🟢"
+
+
+def _free_icon(pct_free: float) -> str:
+    return "🔴" if pct_free < DISK_CRIT else "🟠" if pct_free < DISK_WARN else "🟢"
+
+
+def collect_report_data() -> tuple:
+    """Данные отчёта одним запросом на всех, чтобы три режима вывода
+    отличались только вёрсткой."""
     with get_conn() as conn:
         cur = conn.cursor()
 
@@ -782,62 +800,201 @@ def build_report(title: str = "📊 ОТЧЁТ ПО ИНФРАСТРУКТУРЕ
     for server, disk, free, used in disk_rows:
         disks_by_server[server].append((disk, float(free), float(used)))
 
-    all_servers = sorted(set(disks_by_server.keys()) | set(server_statuses.keys()))
-
-    critical = []
-    warning = []
-    msg = f"{title}\n\n"
-
-    for server in all_servers:
-        status_row = server_statuses.get(server)
+    servers = []
+    for name in sorted(set(disks_by_server) | set(server_statuses)):
+        status_row = server_statuses.get(name)
         status = status_row[0] if status_row else "unknown"
-        if status != "online":
-            msg += f"🔴 {server} ({status})\n\n"
+        item = {"name": name, "status": status, "cpu": None, "ram_pct": None,
+                "ram_free": None, "uptime": None, "disks": []}
+
+        if status_row:
+            cpu_load, ram_total, ram_free, uptime_seconds = status_row[1:]
+            if cpu_load is not None:
+                item["cpu"] = float(cpu_load)
+            if ram_total is not None and ram_free is not None and float(ram_total) > 0:
+                item["ram_free"] = float(ram_free)
+                item["ram_pct"] = round(
+                    (float(ram_total) - float(ram_free)) / float(ram_total) * 100, 1
+                )
+            item["uptime"] = uptime_seconds
+
+        for disk, free, used in disks_by_server.get(name, []):
+            total = free + used
+            item["disks"].append({
+                "name": disk,
+                "free_gb": free,
+                "pct_free": round((free / total) * 100, 1) if total > 0 else 0,
+            })
+        servers.append(item)
+
+    return servers, last_update
+
+
+def _server_alerts(server: dict) -> list:
+    """Что именно не в порядке — этим строки отчёта и отличаются от
+    сплошного перечисления всех метрик подряд."""
+    alerts = []
+    if server["cpu"] is not None and server["cpu"] >= CPU_WARN:
+        alerts.append((server["cpu"] >= CPU_CRIT, f"CPU {server['cpu']}%"))
+    if server["ram_pct"] is not None and server["ram_pct"] >= RAM_WARN:
+        alerts.append((server["ram_pct"] >= RAM_CRIT, f"RAM {server['ram_pct']}%"))
+    for disk in sorted(server["disks"], key=lambda d: d["pct_free"]):
+        if disk["pct_free"] < DISK_WARN:
+            alerts.append((disk["pct_free"] < DISK_CRIT,
+                           f"{disk['name']} {disk['pct_free']}%"))
+    return alerts
+
+
+def _report_header(title: str, servers: list) -> str:
+    return f"{title}\n{len(servers)} серверов\n"
+
+
+def _report_footer(last_update) -> str:
+    if not last_update:
+        return ""
+    t = last_update.replace(tzinfo=timezone.utc).astimezone(ALMATY)
+    return f"\n📅 Данные актуальны на: {t.strftime('%d.%m.%Y %H:%M')}"
+
+
+def _render_short(title: str, servers: list, last_update) -> str:
+    offline = [s for s in servers if s["status"] != "online"]
+    online = [s for s in servers if s["status"] == "online"]
+    troubled = [(s, _server_alerts(s)) for s in online]
+    troubled = [(s, a) for s, a in troubled if a]
+    healthy = [s for s in online if not _server_alerts(s)]
+
+    # Критичное выше предупреждений, дальше — по числу замечаний.
+    troubled.sort(key=lambda pair: (not any(crit for crit, _ in pair[1]),
+                                    -len(pair[1]), pair[0]["name"]))
+
+    lines = [_report_header(title, servers)]
+    if offline:
+        lines.append(f"🔴 НЕ НА СВЯЗИ ({len(offline)})")
+        lines += [f"🔴 {s['name']} ({s['status']})" for s in offline]
+        lines.append("")
+
+    if troubled:
+        lines.append(f"⚠️ ТРЕБУЮТ ВНИМАНИЯ ({len(troubled)})")
+        for server, alerts in troubled:
+            icon = "🔴" if any(crit for crit, _ in alerts) else "🟠"
+            detail = " · ".join(text for _, text in alerts[:4])
+            if len(alerts) > 4:
+                detail += f" · +{len(alerts) - 4}"
+            lines.append(f"{icon} {server['name']} · {detail}")
+        lines.append("")
+
+    if healthy:
+        lines.append(f"✅ В НОРМЕ ({len(healthy)})")
+        lines.append(" · ".join(s["name"] for s in healthy))
+        lines.append("")
+
+    if not troubled and not offline:
+        lines.append("Замечаний нет: CPU, память и диски в пределах порогов.")
+        lines.append("")
+
+    lines.append("Подробности по любому серверу — 🖥 Серверы")
+    return "\n".join(lines) + _report_footer(last_update)
+
+
+def _render_compact(title: str, servers: list, last_update) -> str:
+    """Каждый сервер одной строкой: CPU, память и худший диск."""
+    lines = [_report_header(title, servers)]
+    ordered = sorted(
+        servers,
+        key=lambda s: (s["status"] == "online", not _server_alerts(s), s["name"])
+    )
+    for server in ordered:
+        if server["status"] != "online":
+            lines.append(f"🔴 {server['name']} ({server['status']})")
             continue
 
-        msg += f"🖥 {server}\n"
-        cpu_load, ram_total, ram_free, uptime_seconds = status_row[1:]
-        if cpu_load is not None:
-            cpu_load = float(cpu_load)
-            cpu_icon = "🔴" if cpu_load >= 90 else "🟠" if cpu_load >= 70 else "🟢"
-            msg += f"   {cpu_icon} CPU: {cpu_load}%\n"
-        if ram_total is not None and ram_free is not None and float(ram_total) > 0:
-            ram_total = float(ram_total)
-            ram_free = float(ram_free)
-            ram_used_pct = round((ram_total - ram_free) / ram_total * 100, 1)
-            ram_icon = "🔴" if ram_used_pct >= 90 else "🟠" if ram_used_pct >= 70 else "🟢"
-            msg += f"   {ram_icon} RAM: {ram_used_pct}% занято ({ram_free} ГБ свободно)\n"
-        if uptime_seconds is not None:
-            msg += f"   ⏱ Uptime: {_format_duration(uptime_seconds)}\n"
+        alerts = _server_alerts(server)
+        icon = "🟢"
+        if alerts:
+            icon = "🔴" if any(crit for crit, _ in alerts) else "🟠"
 
-        for disk, free, used in disks_by_server.get(server, []):
-            total = free + used
-            pct = round((free / total) * 100, 1) if total > 0 else 0
-            if pct < 10:
-                icon = "🔴"
-                critical.append(f"🔴 {server} → {disk} ({pct}%)")
-            elif pct < 20:
-                icon = "🟠"
-                warning.append(f"🟠 {server} → {disk} ({pct}%)")
+        parts = []
+        if server["cpu"] is not None:
+            parts.append(f"CPU {server['cpu']}%")
+        if server["ram_pct"] is not None:
+            parts.append(f"RAM {server['ram_pct']}%")
+
+        disks = server["disks"]
+        if disks:
+            worst = min(disks, key=lambda d: d["pct_free"])
+            tail = f" (из {len(disks)})" if len(disks) > 1 else ""
+            if worst["pct_free"] < DISK_WARN:
+                parts.append(f"{worst['name']} {worst['pct_free']}%{tail}")
             else:
-                icon = "🟢"
-            msg += f"   {icon} {disk}: {pct}% свободно ({free} ГБ)\n"
-        msg += "\n"
+                parts.append(f"диски ок ({len(disks)})")
 
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        lines.append(f"{icon} {server['name']} · " + " · ".join(parts))
 
+    return "\n".join(lines) + "\n" + _report_footer(last_update)
+
+
+def _render_full(title: str, servers: list, last_update) -> str:
+    critical, warning = [], []
+    lines = [_report_header(title, servers)]
+
+    for server in servers:
+        if server["status"] != "online":
+            lines.append(f"🔴 {server['name']} ({server['status']})\n")
+            continue
+
+        lines.append(f"🖥 {server['name']}")
+        if server["cpu"] is not None:
+            icon = _load_icon(server["cpu"], CPU_WARN, CPU_CRIT)
+            lines.append(f"   {icon} CPU: {server['cpu']}%")
+            if server["cpu"] >= CPU_CRIT:
+                critical.append(f"🔴 {server['name']} → CPU {server['cpu']}%")
+            elif server["cpu"] >= CPU_WARN:
+                warning.append(f"🟠 {server['name']} → CPU {server['cpu']}%")
+        if server["ram_pct"] is not None:
+            icon = _load_icon(server["ram_pct"], RAM_WARN, RAM_CRIT)
+            lines.append(
+                f"   {icon} RAM: {server['ram_pct']}% занято "
+                f"({server['ram_free']} ГБ свободно)"
+            )
+            if server["ram_pct"] >= RAM_CRIT:
+                critical.append(f"🔴 {server['name']} → RAM {server['ram_pct']}%")
+            elif server["ram_pct"] >= RAM_WARN:
+                warning.append(f"🟠 {server['name']} → RAM {server['ram_pct']}%")
+        if server["uptime"] is not None:
+            lines.append(f"   ⏱ Uptime: {_format_duration(server['uptime'])}")
+
+        for disk in server["disks"]:
+            pct = disk["pct_free"]
+            icon = _free_icon(pct)
+            entry = f"{server['name']} → {disk['name']} ({pct}%)"
+            if pct < DISK_CRIT:
+                critical.append(f"🔴 {entry}")
+            elif pct < DISK_WARN:
+                warning.append(f"🟠 {entry}")
+            lines.append(
+                f"   {icon} {disk['name']}: {pct}% свободно ({disk['free_gb']} ГБ)"
+            )
+        lines.append("")
+
+    lines.append("━" * 20)
     if critical:
-        msg += "\n🚨 КРИТИЧЕСКИЕ ДИСКИ\n\n"
-        for item in critical:
-            msg += item + "\n"
-
+        lines.append("\n🚨 КРИТИЧНО\n")
+        lines += critical
     if warning:
-        msg += "\n🟠 ПРЕДУПРЕЖДЕНИЕ\n\n"
-        for item in warning:
-            msg += item + "\n"
+        lines.append("\n🟠 ПРЕДУПРЕЖДЕНИЕ\n")
+        lines += warning
 
-    if last_update:
-        t = last_update.replace(tzinfo=timezone.utc).astimezone(ALMATY)
-        msg += f"\n\n📅 Данные актуальны на: {t.strftime('%d.%m.%Y %H:%M')}"
+    return "\n".join(lines) + "\n" + _report_footer(last_update)
 
-    return msg
+
+def build_report(title: str = "📊 ОТЧЁТ ПО ИНФРАСТРУКТУРЕ",
+                 mode: str = "short") -> str:
+    """Три вида одного отчёта. По умолчанию короткий: полный перечень всех
+    метрик всех серверов занимал под сотню строк и два сообщения Telegram,
+    а читали в нём ровно то, что вышло за пороги."""
+    servers, last_update = collect_report_data()
+    if mode == "full":
+        return _render_full(title, servers, last_update)
+    if mode == "compact":
+        return _render_compact(title, servers, last_update)
+    return _render_short(title, servers, last_update)
