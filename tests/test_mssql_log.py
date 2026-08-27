@@ -263,8 +263,60 @@ def test_multiline_sql_message_flattened():
 
 
 def test_history_warns_when_sql_has_no_backups():
-    text = sqllog_bot.format_history([], 7)
+    text = sqllog_bot.format_history([], 24)
     assert "не записал" in text
+
+
+def test_history_period_matches_other_sections():
+    """«за 1 дн.» рядом с «за 24 часа» в остальных разделах путало."""
+    assert "24 часа" in sqllog_bot.format_history([], 24)
+    assert "7 дней" in sqllog_bot.format_history([], 24 * 7)
+
+
+# ─── Разбор: база, адрес, дата ───────────────────────────────
+
+def test_same_login_different_databases_not_merged():
+    """Один логин ломится в разные базы — это разные проблемы."""
+    rows = [
+        {"d": "2026-08-27 13:06:00",
+         "t": 'Cannot open database "buh_copy_arc" requested by the login. '
+              "The login failed. Login failed for user 'sa'."},
+        {"d": "2026-08-27 13:07:00",
+         "t": 'Cannot open database "other_db" requested by the login. '
+              "The login failed. Login failed for user 'sa'."},
+    ]
+    grouped = mssql_log.group_login_failures(rows)
+    assert len(grouped) == 2
+    assert {r["database"] for r in grouped} == {"buh_copy_arc", "other_db"}
+
+
+def test_state_taken_from_paired_error_line():
+    """SQL пишет отказ двумя строками: код состояния — в первой."""
+    rows = [
+        {"d": "2026-08-27 13:06:00", "t": "Error: 18456, Severity: 14, State: 38."},
+        {"d": "2026-08-27 13:06:00",
+         "t": "Login failed for user 'intGisUser2'. [CLIENT: 192.0.2.44]"},
+    ]
+    grouped = mssql_log.group_login_failures(rows)
+    assert len(grouped) == 1, "служебная строка не должна попадать в список"
+    assert grouped[0]["state"] == "38"
+    assert grouped[0]["reason"] == "нет доступа к базе"
+
+
+def test_missing_client_is_stated_explicitly():
+    """Ошибка 4060 пишется без [CLIENT] — молчание читалось бы как «локально»."""
+    rows = mssql_log.group_login_failures([
+        {"d": "2026-08-27 13:06:00",
+         "t": 'Cannot open database "buh_copy_arc" requested by the login. '
+              "The login failed. Login failed for user 'sa'."},
+    ])
+    text = sqllog_bot.format_logins(rows, 24)
+    assert "адрес не записан" in text
+
+
+def test_date_is_day_first():
+    """'08-27' читалось как 8 июля — показываем 27.08."""
+    assert sqllog_bot._when("2026-08-27 00:00:00") == "27.08 00:00"
 
 
 # ─── Справка в боте ──────────────────────────────────────────

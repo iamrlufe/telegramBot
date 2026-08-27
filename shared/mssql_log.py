@@ -95,18 +95,51 @@ def parse_login_failure(text: str) -> dict:
     }
 
 
-def group_login_failures(rows: list) -> list:
-    """Схлопывает повторы по (логин, источник, причина).
+_RE_ERROR_18456 = re.compile(r"Error:\s*18456.*State:\s*(\d+)", re.IGNORECASE)
 
-    Один сломанный сервис приложения даёт сотни одинаковых отказов в час и
-    вытесняет всё остальное — показываем такую серию одной строкой со счётчиком.
+
+def states_by_time(rows: list) -> dict:
+    """Собирает State из служебных строк «Error: 18456 … State: N».
+
+    SQL пишет отказ входа двумя строками с одной секундой: в первой код
+    состояния, во второй логин, база и адрес. Отдельно взятая вторая строка
+    причины не содержит — отсюда и «причина не указана» в первой версии.
+    """
+    found = {}
+    for row in rows:
+        m = _RE_ERROR_18456.search(row.get("t", "") or "")
+        if m:
+            found[row.get("d", "")] = m.group(1)
+    return found
+
+
+def group_login_failures(rows: list) -> list:
+    """Схлопывает повторы по (логин, источник, база, причина).
+
+    База обязана быть в ключе: один и тот же логин ломится в разные базы, и
+    без неё серии склеивались бы в одну строку с чужим именем базы.
+    Один сломанный сервис приложения даёт сотни одинаковых отказов в час,
+    поэтому такая серия показывается одной строкой со счётчиком.
     Порядок — по времени последней попытки, свежие сверху.
     """
+    states = states_by_time(rows)
     grouped = {}
     for row in rows:
-        parsed = parse_login_failure(row.get("t", ""))
-        key = (parsed["user"], parsed["client"], parsed["state"])
+        text = row.get("t", "") or ""
+        # Служебная строка с кодом уже разобрана в states_by_time; сама по себе
+        # она не несёт ни логина, ни базы и в списке была бы мусором.
+        if _RE_ERROR_18456.search(text) and "failed" not in text.lower() \
+                and "ошибка входа" not in text.lower():
+            continue
+
+        parsed = parse_login_failure(text)
         when = row.get("d", "")
+        if not parsed["state"]:
+            parsed["state"] = states.get(when, "")
+            if parsed["state"] and not parsed["reason"]:
+                parsed["reason"] = LOGIN_STATE_REASONS.get(parsed["state"], "")
+
+        key = (parsed["user"], parsed["client"], parsed["database"], parsed["state"])
         item = grouped.get(key)
         if item is None:
             parsed["count"] = 1
@@ -117,8 +150,6 @@ def group_login_failures(rows: list) -> list:
             item["count"] += 1
             item["last"] = max(item["last"], when)
             item["first"] = min(item["first"], when)
-            if not item["database"] and parsed["database"]:
-                item["database"] = parsed["database"]
     return sorted(grouped.values(), key=lambda i: i["last"], reverse=True)
 
 
@@ -226,9 +257,12 @@ ORDER BY LogDate DESC;"""
 def read_login_errors(server: dict, hours: int = 24,
                       limit: int = DEFAULT_LIMIT) -> list:
     """Отказы входа: кто, с какого адреса, на какую базу и почему."""
+    # Error: 18456 берём намеренно: в нём лежит State, без которого причина
+    # отказа остаётся неизвестной. Склейка со строкой логина — по времени.
     where = ("(LogText LIKE '%Login failed%' OR LogText LIKE '%Ошибка входа%' "
              "OR LogText LIKE '%Cannot open database%' "
-             "OR LogText LIKE '%открыть базу данных%')")
+             "OR LogText LIKE '%открыть базу данных%' "
+             "OR LogText LIKE '%Error: 18456%')")
     rows = _run_sql(server, _errorlog_query(hours, where, limit), "d,t")
     return group_login_failures(rows)
 

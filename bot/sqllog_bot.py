@@ -99,11 +99,13 @@ def format_logins(rows: list, hours: int) -> str:
     total = sum(row.get("count", 1) for row in rows)
     lines = [f"🔐 Ошибки входа за {period_name(hours)} — {total} шт.\n"]
     for row in rows[:SHOW_LIMIT]:
-        when = (row.get("last") or "")[11:16]
+        when = _when(row.get("last"))
         user = row.get("user") or "неизвестный логин"
         head = f"{when}  {user}"
-        if row.get("client"):
-            head += f"  ← {row['client']}"
+        # Адрес есть не в каждом сообщении: ошибка 4060 («Cannot open
+        # database») пишется без [CLIENT], и молчание тут выглядело бы как
+        # «вход был локальным».
+        head += f"  ← {row['client']}" if row.get("client") else "  ← адрес не записан"
         if row.get("database"):
             head += f"  → база {row['database']}"
         lines.append(head)
@@ -124,11 +126,11 @@ def format_backup_errors(data: dict, hours: int) -> str:
     if not engine and not jobs:
         lines.append("Ошибок копирования не найдено.")
     for row in engine[:SHOW_LIMIT]:
-        when = (row.get("d") or "")[5:16]
+        when = _when(row.get("d"))
         lines.append(f"❌ {when}")
         lines.append(f"   {_short(row.get('t'), 300)}")
     for row in jobs[:SHOW_LIMIT]:
-        when = (row.get("when") or "")[5:16]
+        when = _when(row.get("when"))
         step = row.get("stepname") or f"шаг {row.get('step')}"
         lines.append(f"❌ {when}  джоб «{row.get('job')}», {step}")
         if row.get("msg"):
@@ -145,7 +147,7 @@ def format_engine(rows: list, hours: int) -> str:
                 "и предупреждений о медленном вводе-выводе.")
     lines = [f"⚠️ Ошибки движка за {period_name(hours)} — {len(rows)} записей\n"]
     for row in rows[:SHOW_LIMIT]:
-        lines.append(f"{(row.get('d') or '')[5:16]}  {_short(row.get('t'), 300)}")
+        lines.append(f"{_when(row.get('d'))}  {_short(row.get('t'), 300)}")
     if len(rows) > SHOW_LIMIT:
         lines.append(f"\n… ещё {len(rows) - SHOW_LIMIT} записей")
     return "\n".join(lines)
@@ -162,7 +164,7 @@ def format_jobs(rows: list, hours: int) -> str:
     lines = [f"🕒 Джобы Agent за {period_name(hours)} — {len(rows)} запусков\n"]
     for row in rows[:SHOW_LIMIT]:
         status = JOB_STATUS.get(row.get("status"), "?")
-        line = f"{status}  {(row.get('when') or '')[5:16]}  {row.get('job')}"
+        line = f"{status}  {_when(row.get('when'))}  {row.get('job')}"
         if row.get("took"):
             line += f"  ({row['took']})"
         lines.append(line)
@@ -174,23 +176,35 @@ def format_jobs(rows: list, hours: int) -> str:
 BACKUP_TYPE = {"D": "Full", "I": "Diff", "L": "Log", "F": "File", "G": "FileDiff"}
 
 
-def format_history(rows: list, days: int) -> str:
+def format_history(rows: list, hours: int) -> str:
     if not rows:
-        return (f"📼 Копии из msdb за {days} дн.\n\nSQL не записал ни одной копии. "
+        return (f"📼 Копии из msdb за {period_name(hours)}\n\n"
+                "SQL не записал ни одной копии. "
                 "Если файлы на диске при этом появляются — их делает не SQL "
                 "(например, снапшот гипервизора), и RESTORE из них не гарантирован.")
-    lines = [f"📼 Копии из msdb за {days} дн. — {len(rows)} шт.\n"]
+    lines = [f"📼 Копии из msdb за {period_name(hours)} — {len(rows)} шт.\n"]
     for row in rows[:SHOW_LIMIT]:
         btype = BACKUP_TYPE.get(row.get("btype"), row.get("btype") or "?")
         size = row.get("size_gb")
         size_txt = f"{size} ГБ" if size not in (None, "") else "?"
-        lines.append(f"{(row.get('finished') or '')[5:16]}  {row.get('db')}  "
+        lines.append(f"{_when(row.get('finished'))}  {row.get('db')}  "
                      f"{btype}  {size_txt}")
         if row.get("device"):
             lines.append(f"   {_short(row.get('device'), 120)}")
     if len(rows) > SHOW_LIMIT:
         lines.append(f"\n… ещё {len(rows) - SHOW_LIMIT} записей")
     return "\n".join(lines)
+
+
+def _when(value) -> str:
+    """'2026-08-27 00:00:00' → '27.08 00:00'.
+
+    Срез ISO-строки давал '08-27 00:00': месяц-день читается как день-месяц
+    и сбивает с толку, а год для суточного окна не нужен.
+    """
+    if not isinstance(value, str) or len(value) < 16:
+        return value or ""
+    return f"{value[8:10]}.{value[5:7]} {value[11:16]}"
 
 
 def _short(text, limit: int) -> str:
@@ -242,9 +256,10 @@ async def sqllog_callback(query, context):
     try:
         server = await asyncio.to_thread(load_server, server_name)
         if section == "history":
+            # msdb фильтруется днями, а подпись периода — общая для всех разделов
             days = max(1, hours // 24)
             rows = await asyncio.to_thread(reader, server, days)
-            text = formatter(rows, days)
+            text = formatter(rows, hours)
         else:
             rows = await asyncio.to_thread(reader, server, hours)
             text = formatter(rows, hours)
