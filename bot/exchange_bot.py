@@ -43,9 +43,15 @@ def ex_token(server_name: str, hours: int) -> str:
 
 
 def has_exchange(server: dict) -> bool:
-    """Признак почтового сервера — служба MSExchange* в списке сервисов."""
+    """Почтовый сервер: явный флаг exchange или служба MSExchange* в сервисах.
+
+    Автоопределение по службам покрывает типовой случай, но следить за
+    службами Exchange в конфиге никто не обязан — поэтому есть и флаг.
+    """
     if server_type(server) != "windows":
         return False
+    if server.get("exchange"):
+        return True
     services = server.get("services") or []
     if isinstance(services, str):
         services = [services]

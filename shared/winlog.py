@@ -266,6 +266,19 @@ CERT_WARN_DAYS = 14
 # не отвечает на вопрос «а что вообще стоит и до какого числа».
 CERT_LIST_LIMIT = 25
 
+# Хранилища, где IIS держит сертификаты сайтов. Personal («My») — не
+# единственное: диспетчер IIS кладёт сертификаты веб-хостинга в WebHosting,
+# и сервер с полусотней сайтов почти всегда использует именно его. Читать
+# только My значило показывать пустой список при живых сертификатах.
+# Remote Desktop — сертификат RDP, он тоже истекает и тоже ломает работу.
+CERT_STORES = ("My", "WebHosting", "Remote Desktop")
+
+CERT_STORE_NAMES = {
+    "My": "Личные",
+    "WebHosting": "Веб-хостинг",
+    "Remote Desktop": "RDP",
+}
+
 
 def cert_level(days) -> str:
     """🟢 больше двух месяцев · 🟡 меньше · 🔴 две недели и меньше."""
@@ -289,6 +302,7 @@ def read_host_state(server: dict) -> dict:
     сервер месяцами ждёт перезагрузки после обновлений, истекает
     сертификат IIS/RDP, обновления не ставились полгода.
     """
+    stores_ps = ", ".join(f"'{name}'" for name in CERT_STORES)
     script = PS_OUT_B64_HELPER + f"""
     $ErrorActionPreference = 'SilentlyContinue'
     $reasons = @()
@@ -297,7 +311,8 @@ def read_host_state(server: dict) -> dict:
     $sm = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager' -Name PendingFileRenameOperations
     if ($sm.PendingFileRenameOperations) {{ $reasons += 'файлы ждут замены при перезагрузке' }}
     $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $certs = @(Get-ChildItem Cert:\\LocalMachine\\My | Sort-Object NotAfter | Select-Object -First {CERT_LIST_LIMIT} | ForEach-Object {{ @{{ subject = $_.Subject; until = $_.NotAfter.ToString('yyyy-MM-dd'); days = [int]($_.NotAfter - (Get-Date)).TotalDays; thumb = $_.Thumbprint }} }})
+    $all = @(foreach ($st in @({stores_ps})) {{ Get-ChildItem ('Cert:\\LocalMachine\\' + $st) -ErrorAction SilentlyContinue | ForEach-Object {{ @{{ subject = $_.Subject; until = $_.NotAfter.ToString('yyyy-MM-dd'); days = [int]($_.NotAfter - (Get-Date)).TotalDays; thumb = $_.Thumbprint; store = $st }} }} }})
+    $certs = @($all | Sort-Object {{ $_.until }} | Select-Object -First {CERT_LIST_LIMIT})
     $iis = @()
     if (Get-Module -ListAvailable -Name WebAdministration) {{
         Import-Module WebAdministration -ErrorAction SilentlyContinue
@@ -330,5 +345,7 @@ def read_host_state(server: dict) -> dict:
             bindings.setdefault(thumb, []).append(item.get("bind") or "")
     for cert in data["certs"]:
         cert["level"] = cert_level(cert.get("days"))
+        cert["store_name"] = CERT_STORE_NAMES.get(cert.get("store"),
+                                                  cert.get("store") or "")
         cert["iis"] = bindings.get((cert.get("thumb") or "").upper(), [])
     return data

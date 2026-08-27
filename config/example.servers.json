@@ -54,6 +54,7 @@
         "F:\\Veeam"
       ]
     },
+    "exchange": false,
     "onec_logs": [
       {
         "name": "ЛогиСервера1С",

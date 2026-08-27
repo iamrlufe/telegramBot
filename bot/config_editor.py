@@ -190,7 +190,7 @@ def validate_config(servers) -> None:
             if bah < 1 or bah > 720:
                 raise ValueError(f"Сервер «{name}»: backup_alert_hours должно быть от 1 до 720")
 
-        for flag in ("dbsize", "verify_backup", "backup_size_check",
+        for flag in ("dbsize", "exchange", "verify_backup", "backup_size_check",
                      "verify_ssl", "legacy_tls"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
@@ -354,6 +354,15 @@ FIELD_DEFS = {
                   "в карточке сервера.",
         "kind": "bool",
     },
+    "exchange": {
+        "label": "Exchange",
+        "prompt": "Это почтовый сервер Exchange? (да/нет)\n"
+                  "Открывает кнопку 📧 Почта в карточке: входы в OWA, "
+                  "неудачные пароли, мобильные клиенты.\n"
+                  "Если среди сервисов уже есть служба MSExchange*, "
+                  "раздел появится и без этого флага.",
+        "kind": "bool",
+    },
     "retention_days": {
         "label": "Ретеншн (дней)",
         "prompt": "Автоочистка: хранить бэкапы N дней (число, минимум 3).\n"
@@ -431,7 +440,8 @@ FIELD_DEFS = {
 WIZARD_ORDER = [
     "name", "host", "type", "username", "password", "services",
     "backups_sql", "backups_1c", "backups_veeam", "onec_logs",
-    "dbsize", "retention_days", "backup_alert_hours", "backup_size_check",
+    "dbsize", "exchange", "retention_days", "backup_alert_hours",
+    "backup_size_check",
     "verify_backup", "reg_file",
     "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
 ]
@@ -446,7 +456,8 @@ REQUIRED_FIELDS = {"name", "host"}
 # Пути бэкапов и пороги сюда НЕ входят: каталоги на Linux/NAS (Synology)
 # читаются по SSH, и задавать их из бота нужно так же, как на Windows.
 WINDOWS_ONLY_FIELDS = {
-    "onec_logs", "dbsize", "retention_days", "verify_backup", "reg_file",
+    "onec_logs", "dbsize", "exchange", "retention_days", "verify_backup",
+    "reg_file",
 }
 
 # Поля только для vmware: TLS до vCenter и пороги по снапшотам.
@@ -551,7 +562,7 @@ EDIT_FIELDS = [
     ["reg_file"],
     ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
-TOGGLE_FIELDS = ["dbsize", "verify_backup", "backup_size_check"]
+TOGGLE_FIELDS = ["dbsize", "exchange", "verify_backup", "backup_size_check"]
 
 # Флаги, отсутствие которых в конфиге означает «включено», а не «выключено».
 # Для них выключение пишется явным false — иначе ответ «нет» бесследно
@@ -984,6 +995,12 @@ def edit_fields_kb(server: dict):
             InlineKeyboardButton(
                 f"Verify: {'✅' if server.get('verify_backup') else '❌'}",
                 callback_data="cfg_toggle:verify_backup"
+            ),
+        ])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"Exchange: {'✅' if server.get('exchange') else '❌'}",
+                callback_data="cfg_toggle:exchange"
             ),
         ])
         keyboard.append([
@@ -1550,6 +1567,8 @@ Host — IP или hostname, уникальный.
 Журналы 1С — каталоги журнала регистрации, контроль размера.
 DB Size — на сервере есть MSSQL: собираются размеры баз и открывается
   кнопка 🗄 SQL-логи в карточке (см. раздел 🗄 SQL-логи).
+Exchange — это почтовый сервер: открывает кнопку 📧 Почта (входы в OWA,
+  неудачные пароли, мобильные клиенты).
 Ретеншн (дней) — автоудаление старых копий, минимум 3.
 Алерт бэкапа (часов) — через сколько часов без свежей копии слать алерт.
 Проверка размера — ловить подозрительно маленький бэкап.
@@ -1901,9 +1920,10 @@ HELP_SQLHEALTH = """🩺 СОСТОЯНИЕ БАЗ SQL
 
 HELP_EXCHANGE = """📧 ПОЧТА (EXCHANGE)
 
-Кнопка в карточке сервера, у которого среди сервисов есть служба
-MSExchange*. Отдельного флага в конфиге нет — так же определяются
-nginx, apache и docker.
+Кнопка в карточке сервера. Появляется, если в настройке сервера включён
+флаг Exchange либо среди сервисов уже есть служба MSExchange* —
+автоопределение работает само, флаг нужен, когда службы в конфиг не
+заводили.
 
 Данные читаются в момент нажатия, алертов отсюда не шлётся. Период
 переключается кнопкой: 24 часа / 7 дней. Входов в почту сотни в сутки,

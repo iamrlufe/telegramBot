@@ -234,7 +234,9 @@ def format_host_state(data: dict, hours: int) -> str:
             left = ("истёк" if isinstance(days, int) and days < 0
                     else f"{days} дн." if days is not None else "срок неизвестен")
             lines.append(f"{cert.get('level', '⚪')} {_short(_cert_name(cert), 60)}")
-            lines.append(f"      до {cert.get('until')} — осталось {left}")
+            store = cert.get("store_name")
+            tail = f" · {store}" if store else ""
+            lines.append(f"      до {cert.get('until')} — осталось {left}{tail}")
             if cert.get("iis"):
                 lines.append(f"      IIS: {', '.join(cert['iis'][:3])}")
     else:

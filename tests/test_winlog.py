@@ -315,7 +315,7 @@ def test_all_certificates_listed_not_only_expiring(monkeypatch):
     scripts = _fake_ps(monkeypatch, {})
     winlog.read_host_state(SERVER)
     assert "Where-Object { $_.NotAfter -lt" not in scripts[0]
-    assert "Sort-Object NotAfter" in scripts[0]
+    assert "Sort-Object { $_.until }" in scripts[0]
 
 
 def test_iis_binding_matched_by_thumbprint(monkeypatch):
@@ -394,3 +394,24 @@ def test_lockout_not_merged_with_failures():
          "host": "", "code": "0xC000006A", "eid": 4740},
     ]
     assert len(winlog.group_failed_logons(rows)) == 2
+
+
+def test_all_iis_certificate_stores_read(monkeypatch):
+    """IIS кладёт сертификаты веб-хостинга в WebHosting, а не в My —
+    чтение только Personal давало пустой список при живых сертификатах."""
+    scripts = _fake_ps(monkeypatch, {})
+    winlog.read_host_state(SERVER)
+    for store in ("My", "WebHosting", "Remote Desktop"):
+        assert f"'{store}'" in scripts[0], f"хранилище {store} не читается"
+
+
+def test_certificate_store_named_in_output(monkeypatch):
+    _fake_ps(monkeypatch, {
+        "reboot": [], "boot": "", "hotfix": [], "iis": [],
+        "certs": [{"subject": "CN=*.example.local", "until": "2027-01-16",
+                   "days": 300, "thumb": "AA", "store": "WebHosting"}],
+    })
+    data = winlog.read_host_state(SERVER)
+    assert data["certs"][0]["store_name"] == "Веб-хостинг"
+    text = winlog_bot.format_host_state(data, 24)
+    assert "Веб-хостинг" in text
