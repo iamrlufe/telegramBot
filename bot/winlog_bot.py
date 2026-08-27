@@ -171,9 +171,15 @@ def format_apps(rows: list, hours: int) -> str:
 def format_logons(rows: list, hours: int) -> str:
     if not rows:
         return (f"🔐 Неудачные входы за {period_name(hours)}\n\n"
-                "Отказов входа нет.\n\nЕсли ожидали увидеть записи, проверьте, "
-                "что учётная запись мониторинга состоит в группе Event Log "
-                "Readers: без неё журнал Security недоступен.")
+                "Отказов входа нет.\n\n"
+                "Если записи ожидались, дело обычно не в правах: при их "
+                "нехватке раздел вернул бы ошибку. Чаще всего выключен сам "
+                "аудит отказов — Windows пишет событие 4625, только если "
+                "включена политика «Аудит входа в систему» на отказ. "
+                "Проверить на сервере:\n"
+                "auditpol /get /subcategory:\"Вход в систему\"\n"
+                "Включить:\n"
+                "auditpol /set /subcategory:\"Вход в систему\" /failure:enable")
     total = sum(row.get("count", 1) for row in rows)
     lines = [f"🔐 Неудачные входы за {period_name(hours)} — {total} событий\n"]
     for row in rows[:SHOW_LIMIT]:

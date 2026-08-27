@@ -12,7 +12,6 @@ shared/winlog.py
 Устаревший Get-EventLog так не умеет и на боевом сервере читает минутами.
 """
 import re
-from datetime import datetime, timedelta
 
 from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
 
@@ -105,20 +104,34 @@ def friendly_winlog_error(error: str) -> str:
     return text.splitlines()[0][:300] if text else "неизвестная ошибка"
 
 
-def _since(hours: int) -> str:
-    return (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+# «Событий не найдено» — штатный ответ Get-WinEvent, он приходит именно
+# как ошибка. Всё остальное — настоящий сбой, и его надо показать.
+NO_EVENTS_PATTERNS = "No events were found|Не найдено ни одного события|не найдены"
 
 
-def _query(server: dict, filter_ps: str, projection: str,
+def _query(server: dict, hours: int, filter_body: str, projection: str,
            limit: int, timeout_sec: int = 90) -> list:
     """Общая обвязка: фильтр + проекция → base64(JSON).
 
-    Пустой журнал — не ошибка: Get-WinEvent в этом случае бросает исключение,
-    поэтому гасим его SilentlyContinue и возвращаем пустой список.
+    Начало периода вычисляется НА СЕРВЕРЕ ((Get-Date).AddHours(-N)) по двум
+    причинам. Во-первых, StartTime в -FilterHashtable обязан быть DateTime:
+    строка вызывает ошибку разбора, а не фильтрацию. Во-вторых, контейнер
+    живёт по UTC, а сервер — по местному времени, и окно уезжало на
+    несколько часов.
+
+    Ошибки не глушим: Get-WinEvent сообщает об отсутствии событий тоже
+    исключением, поэтому отличаем этот случай от настоящего сбоя. Иначе
+    нехватка прав и опечатка в фильтре выглядят как «всё чисто».
     """
     script = PS_OUT_B64_HELPER + f"""
-    $ErrorActionPreference = 'SilentlyContinue'
-    $events = Get-WinEvent -FilterHashtable {filter_ps} -MaxEvents {limit} -ErrorAction SilentlyContinue
+    $start = (Get-Date).AddHours(-{hours})
+    try {{
+        $events = Get-WinEvent -FilterHashtable @{{{filter_body}}} -MaxEvents {limit} -ErrorAction Stop
+    }} catch {{
+        if ($_.Exception.Message -match '{NO_EVENTS_PATTERNS}') {{ Out-B64 @(); return }}
+        Out-B64 @{{ winlog_error = $_.Exception.Message }}
+        return
+    }}
     if ($null -eq $events) {{ Out-B64 @(); return }}
     Out-B64 @($events | ForEach-Object {{ {projection} }})
     """
@@ -128,6 +141,8 @@ def _query(server: dict, filter_ps: str, projection: str,
                  read_timeout_sec=timeout_sec + 60)
     data = ps_json(raw) or []
     if isinstance(data, dict):
+        if data.get("winlog_error"):
+            raise Exception(data["winlog_error"])
         data = [data]
     return data
 
@@ -147,32 +162,29 @@ def _ids(values) -> str:
 
 def read_reboots(server: dict, hours: int = 24, limit: int = DEFAULT_LIMIT) -> list:
     """Перезагрузки, аварийные завершения и старт/стоп системы."""
-    flt = (f"@{{LogName='System'; StartTime='{_since(hours)}'; "
-           f"Id={_ids(REBOOT_IDS)}}}")
-    return _query(server, flt, _BASIC_PROJECTION, limit)
+    flt = f"LogName='System'; StartTime=$start; Id={_ids(REBOOT_IDS)}"
+    return _query(server, hours, flt, _BASIC_PROJECTION, limit)
 
 
 def read_service_failures(server: dict, hours: int = 24,
                           limit: int = DEFAULT_LIMIT) -> list:
     """Службы, которые падали или не смогли запуститься."""
-    flt = (f"@{{LogName='System'; StartTime='{_since(hours)}'; "
-           f"Id={_ids(SERVICE_IDS)}}}")
-    return _query(server, flt, _BASIC_PROJECTION, limit)
+    flt = f"LogName='System'; StartTime=$start; Id={_ids(SERVICE_IDS)}"
+    return _query(server, hours, flt, _BASIC_PROJECTION, limit)
 
 
 def read_disk_errors(server: dict, hours: int = 24,
                      limit: int = DEFAULT_LIMIT) -> list:
     """Ошибки дисков, контроллеров и файловой системы."""
-    flt = (f"@{{LogName='System'; StartTime='{_since(hours)}'; "
-           f"Id={_ids(DISK_IDS)}}}")
-    return _query(server, flt, _BASIC_PROJECTION, limit)
+    flt = f"LogName='System'; StartTime=$start; Id={_ids(DISK_IDS)}"
+    return _query(server, hours, flt, _BASIC_PROJECTION, limit)
 
 
 def read_app_errors(server: dict, hours: int = 24,
                     limit: int = DEFAULT_LIMIT) -> list:
     """Ошибки и критические события журнала приложений (уровни 1 и 2)."""
-    flt = f"@{{LogName='Application'; StartTime='{_since(hours)}'; Level=1,2}}"
-    return _query(server, flt, _BASIC_PROJECTION, limit)
+    flt = "LogName='Application'; StartTime=$start; Level=1,2"
+    return _query(server, hours, flt, _BASIC_PROJECTION, limit)
 
 
 # Для 4625 читаем EventData из XML, а не Properties[индекс]: порядок полей
@@ -193,8 +205,8 @@ _LOGON_PROJECTION = (
 def read_failed_logons(server: dict, hours: int = 24,
                        limit: int = DEFAULT_LIMIT) -> list:
     """Неудачные входы в Windows (4625): кто, откуда, каким способом, почему."""
-    flt = f"@{{LogName='Security'; StartTime='{_since(hours)}'; Id=4625}}"
-    rows = _query(server, flt, _LOGON_PROJECTION, limit)
+    flt = "LogName='Security'; StartTime=$start; Id=4625"
+    rows = _query(server, hours, flt, _LOGON_PROJECTION, limit)
     for row in rows:
         # SubStatus точнее Status: в 4625 общий Status почти всегда 0xC000006D,
         # а конкретная причина («нет такого пользователя», «пароль неверен»)

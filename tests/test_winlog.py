@@ -34,8 +34,41 @@ def test_reboot_filter_limits_ids_and_period(monkeypatch):
     scripts = _fake_ps(monkeypatch, [])
     winlog.read_reboots(SERVER, hours=24)
     assert "Id=6008,41,1074,1076,6005,6006" in scripts[0]
-    assert "StartTime=" in scripts[0]
+    assert "StartTime=$start" in scripts[0]
     assert "LogName='System'" in scripts[0]
+
+
+def test_start_time_is_datetime_not_string(monkeypatch):
+    """StartTime строкой ломает -FilterHashtable: нужен DateTime."""
+    scripts = _fake_ps(monkeypatch, [])
+    winlog.read_reboots(SERVER, hours=24)
+    assert "$start = (Get-Date).AddHours(-24)" in scripts[0]
+    assert "StartTime='" not in scripts[0]
+
+
+def test_period_computed_on_server(monkeypatch):
+    """Контейнер живёт по UTC, сервер — по местному: окно уезжало."""
+    scripts = _fake_ps(monkeypatch, [])
+    winlog.read_disk_errors(SERVER, hours=168)
+    assert "(Get-Date).AddHours(-168)" in scripts[0]
+
+
+def test_errors_are_not_swallowed(monkeypatch):
+    """Нехватка прав не должна выглядеть как «событий нет»."""
+    def run_ps(host, script, username=None, password=None, **kwargs):
+        payload = {"winlog_error": "Attempted to perform an unauthorized operation"}
+        return base64.b64encode(json.dumps(payload).encode()).decode("ascii")
+
+    monkeypatch.setattr(winlog, "run_ps", run_ps)
+    with pytest.raises(Exception, match="unauthorized"):
+        winlog.read_reboots(SERVER)
+
+
+def test_no_events_returns_empty_not_error(monkeypatch):
+    """«No events were found» — штатный ответ, а не сбой."""
+    scripts = _fake_ps(monkeypatch, [])
+    assert winlog.read_reboots(SERVER) == []
+    assert "No events were found" in scripts[0]
 
 
 def test_uses_filterhashtable_not_get_eventlog(monkeypatch):
@@ -136,9 +169,11 @@ def test_logon_output_shows_source_and_reason():
     assert "неверный пароль" in text and "RDP" in text
 
 
-def test_empty_logons_mention_event_log_readers():
-    """Пустой Security чаще означает нехватку прав, а не отсутствие атак."""
-    assert "Event Log Readers" in winlog_bot.format_logons([], 24)
+def test_empty_logons_point_at_audit_policy():
+    """Права тут ни при чём: при их нехватке раздел вернёт ошибку.
+    Пустота почти всегда значит выключенный аудит отказов."""
+    text = winlog_bot.format_logons([], 24)
+    assert "auditpol" in text and "аудит" in text.lower()
 
 
 # ─── Вывод событий ───────────────────────────────────────────

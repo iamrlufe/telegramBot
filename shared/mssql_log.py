@@ -17,7 +17,6 @@ SQL Agent и история копий из msdb.
 group_login_failures, decode_agent_datetime) — они покрыты тестами без сети.
 """
 import re
-from datetime import datetime, timedelta
 
 from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
 
@@ -354,10 +353,6 @@ def _run_sql(server: dict, tsql: str, columns: str,
 run_query = _run_sql
 
 
-def _since(hours: int) -> str:
-    return (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _errorlog_query(hours: int, where: str, limit: int) -> str:
     """xp_readerrorlog нельзя фильтровать напрямую — собираем в переменную.
 
@@ -366,14 +361,16 @@ def _errorlog_query(hours: int, where: str, limit: int) -> str:
     Архивные файлы читаем в TRY/CATCH: у сервера их может не быть,
     и тогда весь батч упал бы целиком.
     """
-    since = _since(hours)
     files = ARCHIVE_FILES_LONG if hours > LONG_PERIOD_HOURS else ARCHIVE_FILES_24H
     inserts = "\n".join(
         f"BEGIN TRY INSERT INTO @log EXEC xp_readerrorlog {n}, 1, NULL, NULL, "
-        f"'{since}', NULL, N'desc'; END TRY BEGIN CATCH END CATCH;"
+        f"@since, NULL, N'desc'; END TRY BEGIN CATCH END CATCH;"
         for n in files
     )
+    # Границу периода считает сам SQL: контейнер живёт по UTC, сервер — по
+    # местному времени, и окно уезжало на несколько часов.
     return f"""SET NOCOUNT ON;
+DECLARE @since DATETIME = DATEADD(hour, -{hours}, GETDATE());
 DECLARE @log TABLE (LogDate DATETIME, ProcessInfo NVARCHAR(64), LogText NVARCHAR(MAX));
 {inserts}
 SELECT TOP {limit} CONVERT(VARCHAR(19), LogDate, 120) AS d, LogText AS t
@@ -448,12 +445,8 @@ def _agent_job_rows(server: dict, hours: int = 24, limit: int = 30,
     msdb.dbo.agent_datetime: функция недокументированная, вызывается на
     каждой строке и падает на мусорных значениях.
     """
-    since = datetime.now() - timedelta(hours=hours)
-    since_date = int(since.strftime("%Y%m%d"))
-    since_time = int(since.strftime("%H%M%S"))
     conditions = [
-        f"(h.run_date > {since_date} OR "
-        f"(h.run_date = {since_date} AND h.run_time >= {since_time}))",
+        "(h.run_date > @sd OR (h.run_date = @sd AND h.run_time >= @st))",
     ]
     if failed_only:
         conditions.append("h.run_status = 0")
@@ -465,6 +458,9 @@ def _agent_job_rows(server: dict, hours: int = 24, limit: int = 30,
                           "OR j.name LIKE '%копи%' OR h.message LIKE '%BACKUP%')")
     where = " AND ".join(conditions)
     tsql = f"""SET NOCOUNT ON;
+DECLARE @since DATETIME = DATEADD(hour, -{hours}, GETDATE());
+DECLARE @sd INT = CONVERT(INT, CONVERT(VARCHAR(8), @since, 112));
+DECLARE @st INT = DATEPART(hour, @since) * 10000 + DATEPART(minute, @since) * 100 + DATEPART(second, @since);
 SELECT TOP {limit} j.name AS job, h.step_id AS step, h.step_name AS stepname,
        h.run_status AS status, h.run_date AS rundate, h.run_time AS runtime,
        h.run_duration AS duration, LEFT(h.message, 1500) AS msg
