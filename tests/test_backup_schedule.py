@@ -195,3 +195,51 @@ def test_empty_directory_alerts_even_when_weekly(collector_io):
     )
     assert len(sent) == 1
     assert "БЭКАП НЕ СОЗДАЁТСЯ" in sent[0]
+
+
+# ─── Пропуск замечается в тот же день ────────────────────────
+
+def test_weekly_missed_right_after_the_deadline():
+    """Полная копия по субботам 16:00. Задание не отработало: последняя копия
+    прошлой субботы. Раньше это молчало ещё неделю — до следующей субботы."""
+    newest = _almaty(2026, 8, 22, 16, 30)                    # прошлая суббота
+    now = _almaty(2026, 8, 29, 16, 5)                        # суббота, 16:05
+    assert weekly_backup_missed(newest, "sat", 16, now) is True
+
+
+def test_weekly_not_missed_when_copy_made_today():
+    """Копия закончилась незадолго до срока — это копия за эту неделю."""
+    newest = _almaty(2026, 8, 29, 15, 50)
+    now = _almaty(2026, 8, 29, 16, 5)
+    assert weekly_backup_missed(newest, "sat", 16, now) is False
+
+
+def test_weekly_not_missed_when_job_finished_after_the_deadline():
+    """Задание стартует в 16:00 и идёт час: файл появился в 17:10."""
+    newest = _almaty(2026, 8, 29, 17, 10)
+    now = _almaty(2026, 8, 29, 17, 30)
+    assert weekly_backup_missed(newest, "sat", 16, now) is False
+
+
+def test_weekly_grace_covers_the_evening_before():
+    """Копия ночью накануне срока засчитывается — на то и допуск."""
+    newest = _almaty(2026, 8, 28, 23, 40)
+    now = _almaty(2026, 8, 29, 16, 5)
+    assert weekly_backup_missed(newest, "sat", 16, now) is False
+
+    # а позапрошлый вечер уже за пределами допуска
+    assert weekly_backup_missed(_almaty(2026, 8, 27, 23, 40), "sat", 16, now) is True
+
+
+def test_weekly_quiet_between_deadlines():
+    """Между субботами тревоги нет: копия этой недели уже сделана."""
+    newest = _almaty(2026, 8, 29, 16, 30)
+    now = _almaty(2026, 9, 2, 11, 0)                          # среда
+    assert weekly_backup_missed(newest, "sat", 16, now) is False
+
+
+def test_weekly_grace_is_configurable():
+    newest = _almaty(2026, 8, 28, 23, 40)                     # накануне вечером
+    now = _almaty(2026, 8, 29, 16, 5)
+    assert weekly_backup_missed(newest, "sat", 16, now, grace_hours=2) is True
+    assert weekly_backup_missed(newest, "sat", 16, now, grace_hours=24) is False

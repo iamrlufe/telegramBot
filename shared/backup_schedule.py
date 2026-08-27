@@ -16,12 +16,26 @@ schedule_by_hour, делается не каждый день (например,
 путь остаются проблемой при любом расписании.
 """
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 ALMATY = ZoneInfo("Asia/Almaty")
 
 DEFAULT_SERVERS_FILE = "/app/config/servers.json"
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Насколько раньше дедлайна копия ещё считается «за эту неделю». Нужно,
+# потому что задание нередко отрабатывает накануне вечером или заканчивается
+# незадолго до срока: без допуска такая копия выглядела бы пропущенной.
+WEEKLY_GRACE_HOURS = _int_env("BACKUP_WEEKLY_GRACE_HOURS", 24)
 
 # mon..sun -> datetime.weekday() (Пн=0 .. Вс=6), как и weekly_report() в bot.py
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -132,17 +146,26 @@ def most_recent_weekly_deadline(weekday: str, by_hour: int, now: datetime) -> da
 
 
 def weekly_backup_missed(newest_file, weekday: str, by_hour: int,
-                         now: datetime = None) -> bool:
-    """True, если к текущему недельному дедлайну не появилось файла свежее
-    предыдущего дедлайна (то есть копия за эту неделю не была сделана).
+                         now: datetime = None, grace_hours: int = None) -> bool:
+    """True, если к прошедшему недельному дедлайну копии за эту неделю нет.
+
+    Сравнение идёт с самим дедлайном (минус допуск WEEKLY_GRACE_HOURS), а не
+    с предыдущим: раньше копия, сделанная неделю назад, засчитывалась как
+    свежая, и пропуск субботнего задания замечался только через неделю —
+    к следующей субботе. Теперь тревога приходит в тот же день.
+
+    Допуск нужен для копии, законченной незадолго до срока или накануне
+    вечером. Обратная сторона: дедлайн должен указывать время, к которому
+    копия уже готова, а не момент старта задания, иначе долгий job поднимет
+    тревогу за час до собственного завершения.
 
     newest_file — naive UTC (как из PowerShell) или aware; now — время Алматы."""
     if newest_file is None:
         return True
     now = now or datetime.now(ALMATY)
+    grace = WEEKLY_GRACE_HOURS if grace_hours is None else grace_hours
     deadline = most_recent_weekly_deadline(weekday, by_hour, now)
-    prior_deadline = deadline - timedelta(days=7)
-    return _as_almaty(newest_file) < prior_deadline
+    return _as_almaty(newest_file) < deadline - timedelta(hours=grace)
 
 
 def weekly_age_text(newest_file, weekday: str, by_hour: int,
