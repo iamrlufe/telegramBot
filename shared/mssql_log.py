@@ -53,7 +53,7 @@ LOGIN_STATE_REASONS = {
 # Локаль сервера бывает и русской: ищем оба варианта, кавычки тоже разные.
 _RE_USER = re.compile(r"""for user '([^']*)'|пользовател\w*\s+["'«]([^"'»]+)["'»]""",
                       re.IGNORECASE)
-_RE_CLIENT = re.compile(r"\[CLIENT:\s*([^\]]+)\]", re.IGNORECASE)
+_RE_CLIENT = re.compile(r"\[(?:CLIENT|КЛИЕНТ):\s*([^\]]+)\]", re.IGNORECASE)
 _RE_STATE = re.compile(r"State:\s*(\d+)|Состояние:\s*(\d+)", re.IGNORECASE)
 _RE_DB = re.compile(
     r"""(?:database|баз\w+\s+данных)[,\s]*["'«\[]([^"'»\]]+)["'»\]]""",
@@ -69,9 +69,11 @@ def parse_login_failure(text: str) -> dict:
 
     m = _RE_CLIENT.search(text)
     client = m.group(1).strip() if m else ""
-    # SQL пишет <local machine> для входа с самого сервера — оставляем как есть,
-    # но без угловых скобок: в Telegram с parse_mode они ломают разметку.
+    # Угловые скобки ломают разметку Telegram, а «local machine» само по себе
+    # не читается как ответ на вопрос «откуда» — переводим.
     client = client.strip("<>")
+    if client.lower() in ("local machine", "локальный компьютер"):
+        client = "локально, с самого сервера"
 
     m = _RE_STATE.search(text)
     state = next((g for g in m.groups() if g), "") if m else ""
@@ -95,7 +97,8 @@ def parse_login_failure(text: str) -> dict:
     }
 
 
-_RE_ERROR_18456 = re.compile(r"Error:\s*18456.*State:\s*(\d+)", re.IGNORECASE)
+_RE_ERROR_18456 = re.compile(
+    r"(?:Error|Ошибка):\s*18456.*?(?:State|состояние):\s*(\d+)", re.IGNORECASE)
 
 
 def states_by_time(rows: list) -> dict:
@@ -312,7 +315,8 @@ def read_login_errors(server: dict, hours: int = 24,
     where = ("(LogText LIKE '%Login failed%' OR LogText LIKE '%Ошибка входа%' "
              "OR LogText LIKE '%Cannot open database%' "
              "OR LogText LIKE '%открыть базу данных%' "
-             "OR LogText LIKE '%Error: 18456%')")
+             "OR LogText LIKE '%Error: 18456%' "
+             "OR LogText LIKE '%Ошибка: 18456%')")
     rows = _run_sql(server, _errorlog_query(hours, where, limit), "d,t")
     # Ровно limit строк почти всегда означает, что лог глубже выборки:
     # иначе счётчик «60 шт.» выдавался бы за полное число отказов за сутки.
@@ -336,7 +340,7 @@ def read_backup_errors(server: dict, hours: int = 24,
     except Exception as e:
         result["errors"].append(f"ERRORLOG: {friendly_sql_error(e)}")
     try:
-        result["jobs"] = read_agent_jobs(server, hours=hours, limit=limit,
+        result["jobs"] = _agent_job_rows(server, hours=hours, limit=limit,
                                          failed_only=True, backup_only=True)
     except Exception as e:
         result["errors"].append(f"Джобы: {friendly_sql_error(e)}")
@@ -359,16 +363,23 @@ def read_engine_errors(server: dict, hours: int = 24,
     return _run_sql(server, _errorlog_query(hours, where, limit), "d,t")
 
 
-def read_agent_jobs(server: dict, hours: int = 24, limit: int = 30,
+def _agent_job_rows(server: dict, hours: int = 24, limit: int = 30,
                     failed_only: bool = False, backup_only: bool = False) -> list:
     """История запусков джоб SQL Agent.
 
     step_id = 0 — итоговая запись по джобу; для сводки берём именно её,
     а для разбора ошибки бэкапа — конкретные упавшие шаги.
+
+    Фильтр по времени идёт по числовым run_date/run_time, а не через
+    msdb.dbo.agent_datetime: функция недокументированная, вызывается на
+    каждой строке и падает на мусорных значениях.
     """
-    since = _since(hours)
+    since = datetime.now() - timedelta(hours=hours)
+    since_date = int(since.strftime("%Y%m%d"))
+    since_time = int(since.strftime("%H%M%S"))
     conditions = [
-        f"msdb.dbo.agent_datetime(h.run_date, h.run_time) > '{since}'",
+        f"(h.run_date > {since_date} OR "
+        f"(h.run_date = {since_date} AND h.run_time >= {since_time}))",
     ]
     if failed_only:
         conditions.append("h.run_status = 0")
@@ -393,6 +404,36 @@ ORDER BY h.instance_id DESC;"""
         row["when"] = decode_agent_datetime(row.get("rundate"), row.get("runtime"))
         row["took"] = decode_agent_duration(row.get("duration"))
     return rows
+
+
+def count_agent_jobs(server: dict) -> int:
+    """Сколько джоб вообще видно этой учётной записи.
+
+    Ключевая диагностика для пустой истории: без роли SQLAgentReaderRole
+    в msdb учётная запись видит только собственные джобы — чужие просто
+    не попадают в выборку, и SQL при этом не возвращает ошибки. Пустой
+    список тогда означает «нет прав», а вовсе не «Agent не работает».
+    """
+    rows = _run_sql(server, "SET NOCOUNT ON;\nSELECT COUNT(*) AS n "
+                            "FROM msdb.dbo.sysjobs;", "n")
+    if not rows:
+        return 0
+    try:
+        return int(rows[0].get("n") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_agent_jobs(server: dict, hours: int = 24, limit: int = 30) -> dict:
+    """Сводка запусков + сколько джоб видно, чтобы объяснить пустой список."""
+    rows = _agent_job_rows(server, hours=hours, limit=limit)
+    total = 0
+    if not rows:
+        try:
+            total = count_agent_jobs(server)
+        except Exception:
+            total = -1        # прав нет даже на список джоб
+    return {"rows": rows, "jobs_total": total}
 
 
 def read_backup_history(server: dict, days: int = 7, limit: int = 30) -> list:

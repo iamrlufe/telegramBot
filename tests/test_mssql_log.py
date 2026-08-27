@@ -70,11 +70,12 @@ def test_login_failure_database_extracted():
 
 
 def test_login_failure_local_client_without_brackets():
-    """<local machine> ломает разметку Telegram — скобки снимаем."""
+    """<local machine> ломает разметку Telegram и не читается как источник."""
     row = mssql_log.parse_login_failure(
         "Login failed for user 'svc'. [CLIENT: <local machine>]"
     )
-    assert row["client"] == "local machine"
+    assert "<" not in row["client"]
+    assert row["client"] == "локально, с самого сервера"
 
 
 def test_group_login_failures_collapses_series():
@@ -185,9 +186,17 @@ def test_read_agent_jobs_decodes_time(monkeypatch):
     _fake_ps(monkeypatch, [{"job": "Ежедневный бэкап", "step": 0,
                             "stepname": None, "status": 1, "rundate": 20260827,
                             "runtime": 31500, "duration": 132, "msg": "ok"}])
-    rows = mssql_log.read_agent_jobs(SERVER)
+    rows = mssql_log.read_agent_jobs(SERVER)["rows"]
     assert rows[0]["when"] == "2026-08-27 03:15:00"
     assert rows[0]["took"] == "1 мин 32 с"
+
+
+def test_agent_jobs_filter_avoids_agent_datetime(monkeypatch):
+    """agent_datetime недокументирована и падает на мусорных значениях."""
+    scripts = _fake_ps(monkeypatch, [])
+    mssql_log._agent_job_rows(SERVER, hours=24)
+    assert "agent_datetime" not in scripts[0]
+    assert "h.run_date" in scripts[0]
 
 
 def test_backup_errors_survive_missing_permission(monkeypatch):
@@ -411,3 +420,73 @@ def test_help_section_matches_current_behaviour():
     text = HELP_SECTIONS["sqllog"][1]
     for expected in ("адрес не записан", "823", "825", "UNC", "предел"):
         assert expected in text, f"в справке бота нет: {expected}"
+
+
+# ─── Русская локаль сервера ──────────────────────────────────
+
+def test_client_parsed_from_russian_log():
+    """SQL на русской локали пишет [КЛИЕНТ: …] — адрес терялся целиком."""
+    row = mssql_log.parse_login_failure(
+        'Login failed for user \'sa\'. Причина: не удалось открыть явно '
+        'указанную базу данных "copy_obn". [КЛИЕНТ: 192.0.2.55]'
+    )
+    assert row["client"] == "192.0.2.55"
+    assert row["database"] == "copy_obn"
+
+
+def test_local_machine_client_translated():
+    """<local machine> не читается как ответ на вопрос «откуда»."""
+    row = mssql_log.parse_login_failure(
+        "Login failed for user 'sa'. [КЛИЕНТ: <local machine>]")
+    assert row["client"] == "локально, с самого сервера"
+
+
+def test_state_from_russian_error_line():
+    """Служебная строка тоже русская: «Ошибка: 18456 … состояние: 38»."""
+    rows = [
+        {"d": "2026-08-27 13:26:42",
+         "t": "Ошибка: 18456, серьезность: 14, состояние: 38."},
+        {"d": "2026-08-27 13:26:42",
+         "t": 'Login failed for user \'sa\'. Причина: не удалось открыть явно '
+              'указанную базу данных "kuRoman". [КЛИЕНТ: <local machine>]'},
+    ]
+    grouped = mssql_log.group_login_failures(rows)
+    assert len(grouped) == 1
+    assert grouped[0]["state"] == "38"
+    assert grouped[0]["reason"] == "нет доступа к базе"
+    assert grouped[0]["database"] == "kuRoman"
+
+
+def test_russian_error_line_included_in_query():
+    q = mssql_log._errorlog_query(24, "1=1", 40)
+    # сам фильтр строится в read_login_errors — проверяем его отдельно
+    import inspect
+    src = inspect.getsource(mssql_log.read_login_errors)
+    assert "Ошибка: 18456" in src
+
+
+# ─── Пустая история джоб ─────────────────────────────────────
+
+def test_empty_jobs_blames_permissions_not_service(monkeypatch):
+    """Без SQLAgentReaderRole чужие джобы не видны, и ошибки при этом нет."""
+    data = {"rows": [], "jobs_total": 0}
+    text = sqllog_bot.format_jobs(data, 24)
+    assert "SQLAgentReaderRole" in text
+    assert "Agent запущена" not in text
+
+
+def test_empty_jobs_when_jobs_are_visible():
+    """Джобы видны, но не запускались — совсем другой вывод."""
+    text = sqllog_bot.format_jobs({"rows": [], "jobs_total": 7}, 24)
+    assert "Джоб видно: 7" in text
+    assert "расписание" in text
+
+
+def test_jobs_total_requested_only_when_empty(monkeypatch):
+    """Лишний запрос на каждый показ истории не нужен."""
+    scripts = _fake_ps(monkeypatch, [{"job": "J", "step": 0, "stepname": None,
+                                      "status": 1, "rundate": 20260827,
+                                      "runtime": 31500, "duration": 1,
+                                      "msg": ""}])
+    mssql_log.read_agent_jobs(SERVER)
+    assert not any("COUNT(*)" in s for s in scripts)

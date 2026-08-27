@@ -189,10 +189,29 @@ JOB_STATUS = {0: "❌ упал", 1: "✅ успех", 2: "🔁 повтор",
               3: "⏹ отменён", 4: "⏳ выполняется"}
 
 
-def format_jobs(rows: list, hours: int) -> str:
+def format_jobs(data, hours: int) -> str:
+    rows = data.get("rows", []) if isinstance(data, dict) else data
+    total = data.get("jobs_total", 0) if isinstance(data, dict) else 0
+
     if not rows:
-        return (f"🕒 Джобы Agent за {period_name(hours)}\n\nЗапусков не было. "
-                "Стоит проверить, что служба SQL Server Agent запущена.")
+        head = f"🕒 Джобы Agent за {period_name(hours)}\n\nЗапусков не найдено.\n\n"
+        if total > 0:
+            return head + (f"Джоб видно: {total}. Значит Agent доступен, но за "
+                           "период ни один джоб не отработал — проверьте их "
+                           "расписание, а также что копии делает именно Agent, "
+                           "а не сторонний планировщик или Veeam.")
+        if total == 0:
+            # Самая частая причина, и она не выглядит как ошибка: без роли
+            # SQLAgentReaderRole учётная запись видит только собственные джобы,
+            # а чужие молча не попадают в выборку.
+            return head + ("Не видно ни одного джоба. Скорее всего учётной "
+                           "записи мониторинга не выдана роль SQLAgentReaderRole "
+                           "в базе msdb: без неё чужие джобы не видны, и SQL "
+                           "не возвращает ошибку — список просто пуст. "
+                           "Второй вариант: джобов на сервере действительно нет.")
+        return head + ("Список джоб недоступен — учётной записи не хватает прав "
+                       "в базе msdb (нужна роль SQLAgentReaderRole).")
+
     lines = [f"🕒 Джобы Agent за {period_name(hours)} — {len(rows)} запусков\n"]
     for row in rows[:SHOW_LIMIT]:
         status = JOB_STATUS.get(row.get("status"), "?")
