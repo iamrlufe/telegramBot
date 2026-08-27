@@ -2,6 +2,7 @@
 import pytest
 
 from config_editor import (
+    apply_field,
     build_wizard_order,
     HELP_SECTIONS,
     _merge_backup_paths,
@@ -387,3 +388,84 @@ def test_existing_loose_backup_is_tightened(tmp_path, monkeypatch):
     _cfg.save_config([{"name": "a", "host": "h2"}])
 
     assert _os.stat(backup).st_mode & 0o777 == 0o600
+
+
+# ─── Пороги журналов 1С ──────────────────────────────────────
+
+def test_onec_log_thresholds_parsed():
+    ok, value, err = parse_field_value(
+        "onec_logs", r"C:\1cv8\srvinfo\reg_1541=100/150"
+    )
+    assert ok and err is None
+    assert value == [{"path": r"C:\1cv8\srvinfo\reg_1541",
+                      "warn_gb": 100.0, "crit_gb": 150.0}]
+
+
+def test_onec_log_path_without_thresholds_stays_string():
+    ok, value, _ = parse_field_value("onec_logs", r"C:\1cv8\srvinfo\reg_1541")
+    assert ok
+    assert value == [r"C:\1cv8\srvinfo\reg_1541"]
+
+
+def test_onec_log_single_threshold_is_warning():
+    ok, value, _ = parse_field_value("onec_logs", r"D:\logs=40")
+    assert ok
+    assert value == [{"path": r"D:\logs", "warn_gb": 40.0}]
+
+
+def test_onec_log_thresholds_validated():
+    ok, _, err = parse_field_value("onec_logs", r"D:\logs=150/100")
+    assert not ok and "меньше критичного" in err
+
+    ok, _, err = parse_field_value("onec_logs", r"D:\logs=много")
+    assert not ok and "числами" in err
+
+    ok, _, err = parse_field_value("onec_logs", r"D:\logs=0")
+    assert not ok and "больше нуля" in err
+
+
+def test_onec_log_thresholds_kept_when_path_reentered():
+    """Пути вводятся списком целиком; пороги и название прежнего пути
+    незачем набирать заново при правке соседнего."""
+    server = {"onec_logs": [
+        {"path": r"D:\logs", "name": "ЖурналБазы", "warn_gb": 100, "crit_gb": 150},
+    ]}
+    ok, value, _ = parse_field_value("onec_logs", r"D:\logs, E:\logs2")
+    assert ok
+    apply_field(server, "onec_logs", value)
+
+    assert server["onec_logs"][0] == {
+        "path": r"D:\logs", "name": "ЖурналБазы", "warn_gb": 100, "crit_gb": 150,
+    }
+    assert server["onec_logs"][1] == r"E:\logs2"
+
+
+def test_onec_log_thresholds_can_be_reset():
+    server = {"onec_logs": [{"path": r"D:\logs", "warn_gb": 100, "crit_gb": 150}]}
+    ok, value, _ = parse_field_value("onec_logs", r"D:\logs=-")
+    assert ok
+    apply_field(server, "onec_logs", value)
+    assert server["onec_logs"] == [r"D:\logs"]
+
+
+def test_onec_log_thresholds_shown_in_summary():
+    server = {"onec_logs": [
+        {"path": r"D:\logs", "warn_gb": 100, "crit_gb": 150.5},
+        {"path": r"E:\logs2", "warn_gb": 40},
+        r"F:\logs3",
+    ]}
+    text = display_value(server, "onec_logs")
+    assert r"D:\logs (100/150.5 ГБ)" in text
+    assert r"E:\logs2 (предупреждение 40 ГБ)" in text
+    assert r"F:\logs3" in text
+
+
+def test_onec_log_config_validation():
+    bad = [{"name": "srv", "host": "192.0.2.10",
+            "onec_logs": [{"path": r"D:\logs", "warn_gb": 150, "crit_gb": 100}]}]
+    with pytest.raises(ValueError, match="меньше критичного"):
+        validate_config(bad)
+
+    no_path = [{"name": "srv", "host": "192.0.2.10", "onec_logs": [{"warn_gb": 5}]}]
+    with pytest.raises(ValueError, match="нужен путь"):
+        validate_config(no_path)

@@ -170,8 +170,37 @@ def validate_config(servers) -> None:
                                 f"должно быть от 0 до 23"
                             )
 
-        if "onec_logs" in server and not isinstance(server["onec_logs"], list):
-            raise ValueError(f"Сервер «{name}»: onec_logs должно быть списком")
+        if "onec_logs" in server:
+            if not isinstance(server["onec_logs"], list):
+                raise ValueError(f"Сервер «{name}»: onec_logs должно быть списком")
+            for entry in server["onec_logs"]:
+                if isinstance(entry, str):
+                    continue
+                if not isinstance(entry, dict) or not entry.get("path"):
+                    raise ValueError(
+                        f"Сервер «{name}»: в onec_logs нужен путь (path)"
+                    )
+                limits = {}
+                for field in ("warn_gb", "crit_gb"):
+                    if entry.get(field) is None:
+                        continue
+                    try:
+                        limits[field] = float(entry[field])
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Сервер «{name}»: onec_logs.{field} "
+                            f"({entry['path']}) должно быть числом"
+                        )
+                    if limits[field] <= 0:
+                        raise ValueError(
+                            f"Сервер «{name}»: onec_logs.{field} "
+                            f"({entry['path']}) должно быть больше нуля"
+                        )
+                if len(limits) == 2 and limits["warn_gb"] >= limits["crit_gb"]:
+                    raise ValueError(
+                        f"Сервер «{name}»: у {entry['path']} порог "
+                        f"предупреждения должен быть меньше критичного"
+                    )
 
         rd = server.get("retention_days")
         if rd is not None:
@@ -345,8 +374,17 @@ FIELD_DEFS = {
     "onec_logs": {
         "label": "Журналы 1С",
         "prompt": "Пути к журналам регистрации 1С, через запятую.\n"
-                  "Например: C:\\Program Files\\1cv8\\srvinfo\\reg_1541",
-        "kind": "paths",
+                  "Например: C:\\Program Files\\1cv8\\srvinfo\\reg_1541\n\n"
+                  "Свои пороги размера для пути — через «=» в гигабайтах, "
+                  "предупреждение/критично:\n"
+                  "C:\\1cv8\\srvinfo\\reg_1541=100/150\n"
+                  "Один порог (=100) задаёт только предупреждение. "
+                  "Без порогов действуют общие: 5 и 10 ГБ.\n"
+                  "Вернуть путь к общим порогам: C:\\1cv8\\srvinfo\\reg_1541=-\n\n"
+                  "Список задаётся целиком: пути, которых нет в сообщении, "
+                  "удаляются. Пороги и названия уже известных путей "
+                  "сохраняются, если не задать новые.",
+        "kind": "onec_paths",
     },
     "dbsize": {
         "label": "DB Size",
@@ -677,6 +715,52 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
             items.append(path_part if len(entry) == 1 else entry)
         return True, items, None
 
+    if kind == "onec_paths":
+        raw_items = [item.strip() for item in text.replace(";", ",").split(",")]
+        raw_items = [item for item in raw_items if item]
+        if not raw_items:
+            return True, None, None
+
+        items = []
+        for raw in raw_items:
+            # Путь содержит «\» и «:», но не «=», поэтому режем по последнему.
+            if "=" not in raw:
+                items.append(raw)
+                continue
+
+            path_part, limits = raw.rsplit("=", 1)
+            path_part, limits = path_part.strip(), limits.strip()
+            if not path_part:
+                return False, None, f"Не указан путь перед «=» в «{raw}»"
+            if limits in SKIP_INPUTS:
+                # Явный сброс к общим порогам: словарь без warn_gb/crit_gb
+                items.append({"path": path_part, "warn_gb": None, "crit_gb": None})
+                continue
+
+            parts = [p.strip() for p in limits.split("/")]
+            if len(parts) > 2:
+                return False, None, (
+                    f"Пороги для «{path_part}» задаются как "
+                    f"предупреждение/критично, например 100/150"
+                )
+            try:
+                values = [float(p.replace(",", ".")) for p in parts]
+            except ValueError:
+                return False, None, f"Пороги для «{path_part}» должны быть числами"
+            if any(v <= 0 for v in values):
+                return False, None, f"Пороги для «{path_part}» должны быть больше нуля"
+            if len(values) == 2 and values[0] >= values[1]:
+                return False, None, (
+                    f"Для «{path_part}» предупреждение должно быть меньше "
+                    f"критичного порога"
+                )
+
+            entry = {"path": path_part, "warn_gb": values[0]}
+            if len(values) == 2:
+                entry["crit_gb"] = values[1]
+            items.append(entry)
+        return True, items, None
+
     if kind == "bool":
         low = text.lower()
         if low in TRUE_WORDS:
@@ -765,6 +849,35 @@ PRESERVED_PATH_KEYS = ("schedule_weekday", "schedule_by_hour", "size_check",
                        "ignore_logs")
 
 
+def _merge_onec_logs(existing: list, new_items: list) -> list:
+    """Список журналов задаётся целиком, но название журнала и пороги уже
+    известного пути переносятся: `name` мастер не спрашивает, а пороги
+    незачем повторять при правке соседнего пути."""
+    old_by_path = {}
+    for item in existing or []:
+        path = _path_str(item)
+        if path:
+            old_by_path[path] = dict(item) if isinstance(item, dict) else {}
+
+    merged = []
+    for item in new_items:
+        path = _path_str(item)
+        if not path:
+            continue
+        entry = old_by_path.get(path, {})
+        entry.pop("path", None)
+        if isinstance(item, dict):
+            for field in ("warn_gb", "crit_gb"):
+                if field not in item:
+                    continue
+                if item[field] is None:
+                    entry.pop(field, None)   # «=-» — вернуть общие пороги
+                else:
+                    entry[field] = item[field]
+        merged.append({"path": path, **entry} if entry else path)
+    return merged
+
+
 def _merge_backup_paths(existing: list, new_items: list) -> list:
     """Дозаписывает/обновляет пути по совпадению path, не стирая остальные.
     Иначе правка одного пути (например, добавление alert_hours) сносила бы
@@ -822,10 +935,19 @@ def apply_field(server: dict, key: str, value):
             server.pop("backups", None)
         return
 
+    if key == "onec_logs" and value:
+        value = _merge_onec_logs(server.get("onec_logs") or [], value)
+
     if value is None:
         server.pop(key, None)
     else:
         server[key] = value
+
+
+def _gb(value) -> str:
+    """100.0 ГБ читается хуже, чем 100."""
+    number = float(value)
+    return str(int(number)) if number == int(number) else str(number)
 
 
 def display_value(server: dict, key: str) -> str:
@@ -846,7 +968,20 @@ def display_value(server: dict, key: str) -> str:
     if key == "onec_logs":
         parts = []
         for item in value:
-            parts.append(item if isinstance(item, str) else (item.get("path") or "?"))
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            text = item.get("path") or "?"
+            warn, crit = item.get("warn_gb"), item.get("crit_gb")
+            if warn is not None and crit is not None:
+                text += f" ({_gb(warn)}/{_gb(crit)} ГБ)"
+            elif warn is not None:
+                text += f" (предупреждение {_gb(warn)} ГБ)"
+            elif crit is not None:
+                text += f" (критично {_gb(crit)} ГБ)"
+            if item.get("name"):
+                text += f" [{item['name']}]"
+            parts.append(text)
         return ", ".join(parts)
     if key.startswith("backups_"):
         parts = []
@@ -1592,6 +1727,10 @@ Host — IP или hostname, уникальный.
   и следим именно за ним, а не за мёртвой 32-битной службой.
 Бэкапы sql / 1c / veeam — каталоги с копиями (см. раздел 💾 Бэкапы).
 Журналы 1С — каталоги журнала регистрации, контроль размера.
+   Свои пороги для пути: путь=100/150 (ГБ, предупреждение/критично),
+   путь=100 — только предупреждение, путь=- — вернуть общие
+   пороги (5 и 10 ГБ). Пути задаются списком целиком, но
+   пороги и название известного пути сохраняются.
 DB Size — на сервере есть MSSQL: собираются размеры баз и открывается
   кнопка 🗄 SQL-логи в карточке (см. раздел 🗄 SQL-логи).
 Exchange — это почтовый сервер: открывает кнопку 📧 Почта (входы в OWA,
