@@ -140,3 +140,28 @@ def test_alert_carries_reason_line(state):
     alerts.check_backup_failure_alerts("sql-01.example.local", [dict(
         EVENT, key="j|new", why="путь не найден: каталога нет")])
     assert "↳ путь не найден" in state[0]
+
+
+def test_collector_explains_truncated_job_message(monkeypatch):
+    """Шапка dtexec уезжала в алерт как причина — вместо неё подсказка."""
+    captured = {}
+    header = ("Executed as user: NT Service\\SQLSERVERAGENT. Microsoft (R) "
+              "SQL Server Execute Package Utility Version 15.0.4200.8 for "
+              "64-bit Copyright (C) Microsoft Corporation. All rights "
+              "reserved. Started: 0:10:00 Progress: 2026-08-28 00:10:01.61 "
+              "Source: {FA1D6D23-35E0-493A} Executing query \"DECLARE @Guid")
+
+    monkeypatch.setattr(mssql_log, "read_backup_errors", lambda server, hours=24: {
+        "engine": [], "errors": [],
+        "jobs": [{"when": "2026-08-28 00:10:00", "job": "backupdaily.Subplan_1",
+                  "step": 1, "stepname": "Subplan_1", "msg": header}]})
+    monkeypatch.setattr(backup_collector, "check_backup_failure_alerts",
+                        lambda name, events: captured.update(events=events))
+
+    backup_collector.check_mssql_backup_failures(
+        {"name": "sql-01.example.local", "host": "192.0.2.10"})
+
+    event = captured["events"][0]
+    assert "Execute Package Utility" not in event["text"]
+    assert "Executing query" not in event["text"]
+    assert event["why"] == mssql_log.JOB_MESSAGE_TRUNCATED

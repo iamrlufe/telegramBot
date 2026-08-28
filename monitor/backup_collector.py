@@ -320,6 +320,7 @@ def check_mssql_backup_failures(server: dict):
     """
     from mssql_log import (
         read_backup_errors, summarize_job_message, explain_backup_error,
+        JOB_MESSAGE_TRUNCATED,
     )
 
     name = server["name"]
@@ -347,7 +348,10 @@ def check_mssql_backup_failures(server: dict):
             "when": when,
             "text": f"джоб «{job}», {step}: {message}" if message
                     else f"джоб «{job}», {step}",
-            "why": explain_backup_error(raw),
+            # Причина есть в тексте — объясняем её. Если в истории осталась
+            # одна шапка dtexec, вместо молчания говорим, где смотреть.
+            "why": (explain_backup_error(raw)
+                    or (JOB_MESSAGE_TRUNCATED if raw and not message else "")),
         })
 
     if events:

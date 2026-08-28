@@ -21,6 +21,7 @@ from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, read_backup_history, friendly_sql_error,
     explain_engine_error, explain_backup_error, summarize_job_message,
+    JOB_MESSAGE_TRUNCATED,
 )
 from mssql_health import (
     read_log_files, read_checkdb, read_activity, read_file_space,
@@ -151,10 +152,12 @@ def format_backup_errors(data: dict, hours: int) -> str:
     for row in jobs[:SHOW_LIMIT]:
         step = row.get("stepname") or f"шаг {row.get('step')}"
         lines.append(f"❌ {_when(row.get('when'))}  джоб «{row.get('job')}», {step}")
-        summary = summarize_job_message(row.get("msg") or "", limit=300)
+        raw = row.get("msg") or ""
+        summary = summarize_job_message(raw, limit=300)
         if summary:
             lines.append(f"   {summary}")
-        why = explain_backup_error(row.get("msg") or "")
+        why = (explain_backup_error(raw)
+               or (JOB_MESSAGE_TRUNCATED if raw and not summary else ""))
         if why:
             lines.append(f"   ↳ {why}")
     for err in data.get("errors", []):
@@ -236,7 +239,11 @@ def format_jobs(data, hours: int) -> str:
             line += f"  ({row['took']})"
         lines.append(line)
         if row.get("status") == 0 and row.get("msg"):
-            lines.append(f"   {summarize_job_message(row.get('msg'), limit=200)}")
+            # Пустая суть означает обрезанное Agent-ом сообщение: пустая
+            # строка вместо неё выглядела бы как «джоб упал молча».
+            summary = summarize_job_message(row.get("msg"), limit=200)
+            lines.append(f"   {summary}" if summary
+                         else "   текст шага не сохранился — только шапка dtexec")
     return "\n".join(lines)
 
 

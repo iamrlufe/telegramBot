@@ -579,3 +579,48 @@ def test_backup_section_shows_summary_and_reason():
     assert "Execute Package Utility" not in text
     assert "Failed to open the backup device" in text
     assert "↳" in text and "UNC" in text
+
+
+# Реальный случай: план обслуживания длинный, и SQL Agent сохранил в истории
+# только первые ~1024 символа — до самой ошибки текст не дошёл.
+TRUNCATED_PLAN_MSG = (
+    "Executed as user: NT Service\\SQLSERVERAGENT. Microsoft (R) SQL Server "
+    "Execute Package Utility Version 15.0.4200.8 for 64-bit Copyright (C) "
+    "Microsoft Corporation. All rights reserved. Started: 0:10:00 "
+    "Progress: 2026-08-28 00:10:01.61 Source: {FA1D6D23-35E0-493A-975D-6A51856A34ED} "
+    "Executing query \"DECLARE @Guid"
+)
+
+
+def test_job_summary_empty_when_only_dtexec_header():
+    """Шапка dtexec — не причина сбоя, и выдавать её за причину нельзя."""
+    assert mssql_log.summarize_job_message(TRUNCATED_PLAN_MSG) == ""
+
+
+def test_job_summary_keeps_tail_when_no_description():
+    """Без Description полезное в конце — обрезаем начало, а не хвост."""
+    text = ("Executed as user: DOMAIN\\svc. " + "x" * 400
+            + " The step failed.")
+    summary = mssql_log.summarize_job_message(text, limit=100)
+    assert summary.startswith("…")
+    assert "The step failed" in summary
+    assert len(summary) <= 100
+
+
+def test_backup_section_explains_truncated_message():
+    """Вместо шапки дежурный получает, где искать причину."""
+    data = {"engine": [], "errors": [], "jobs": [{
+        "when": "2026-08-28 00:10:00", "job": "backupdaily.Subplan_1",
+        "step": 1, "stepname": "Subplan_1", "msg": TRUNCATED_PLAN_MSG}]}
+    text = sqllog_bot.format_backup_errors(data, 24)
+    assert "Execute Package Utility" not in text
+    assert "Executing query" not in text
+    assert mssql_log.JOB_MESSAGE_TRUNCATED in text
+
+
+def test_jobs_section_notes_missing_step_text():
+    """В списке джоб пустая строка выглядела как «упал молча»."""
+    text = sqllog_bot.format_jobs({"rows": [{
+        "when": "2026-08-28 00:10:00", "job": "backupdaily", "status": 0,
+        "msg": TRUNCATED_PLAN_MSG}], "jobs_total": 5}, 24)
+    assert "шапка dtexec" in text

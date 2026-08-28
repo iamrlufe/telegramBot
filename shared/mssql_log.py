@@ -189,12 +189,41 @@ def decode_agent_duration(run_duration: int) -> str:
 # SQL Server Execute Package Utility … Started … Progress …». Настоящая
 # ошибка идёт дальше, после Description, а иногда только в самом конце.
 # Обрезка по первым N символам показывала ровно эту шапку и ничего больше.
-_JOB_NOISE = re.compile(
-    r"Executed as user:.*?(?=Description:|Error:|Ошибка|The step failed|$)",
-    re.IGNORECASE | re.DOTALL)
 _JOB_DESCRIPTION = re.compile(
     r"Description:\s*(.+?)(?=\s+(?:End|Started:|Source:|Progress:)|$)",
     re.IGNORECASE | re.DOTALL)
+
+# Шапка и протокол выполнения dtexec целиком: баннер утилиты, время старта,
+# строки Progress и Executing query. SQL Agent пишет в историю только первые
+# ~1024 символа шага, и у длинных планов обслуживания в них не остаётся
+# ничего кроме этой шапки — раньше она и уезжала в алерт как «причина».
+_JOB_NOISE_PARTS = [
+    r"Executed as user:\s*[^.]*\.",
+    r"Microsoft \(R\)[^.]*?Utility",
+    r"(?:Version\s+)?[\d.]{3,}\s+for\s+(?:32|64)-bit",
+    r"Copyright \(C\)[^.]*\.",
+    r"All rights reserved\.",
+    r"Started:\s*[\d:.]+",
+    r"(?:End\s+)?Progress:?\s*(?:\d{4}-\d{2}-\d{2}\s+[\d:.]+)?",
+    r"Source:\s*\{[^}]*\}",
+    r"Executing query\s*\"[^\"]*\"?",
+    r":\s*\d+% complete",
+]
+_JOB_NOISE = re.compile("|".join(_JOB_NOISE_PARTS), re.IGNORECASE)
+
+# Осмысленный остаток отличается от мусора наличием букв: точки, двоеточия
+# и обрывки кавычек после вычистки шапки смысла не несут.
+_JOB_MEANINGFUL = re.compile(r"[A-Za-zА-Яа-я]{3,}")
+
+# Что сказать, когда в истории осталась одна шапка. Дежурному нужно знать,
+# что причина существует, но лежит не здесь.
+JOB_MESSAGE_TRUNCATED = (
+    "SQL Agent сохранил только шапку dtexec — сама ошибка в историю не "
+    "поместилась. Причину смотрите в журнале плана обслуживания "
+    "(Management → Maintenance Plans → View History) или включите в шаге "
+    "джоба «Include step output in history»"
+)
+
 
 # Причины, которые видно прямо в тексте шага. Дежурному нужно действие,
 # а не код возврата dtexec.
@@ -233,7 +262,11 @@ def explain_backup_error(text: str) -> str:
 
 
 def summarize_job_message(message: str, limit: int = 250) -> str:
-    """Вытаскивает суть из вывода шага джоба, отбрасывая шапку dtexec."""
+    """Вытаскивает суть из вывода шага джоба, отбрасывая шапку dtexec.
+
+    Пусто — если сути в сообщении нет: SQL Agent обрезал его на шапке.
+    Тогда честнее промолчать, чем выдавать баннер утилиты за причину.
+    """
     text = " ".join((message or "").split())
     if not text:
         return ""
@@ -243,11 +276,17 @@ def summarize_job_message(message: str, limit: int = 250) -> str:
         # Описаний бывает несколько (вложенные задачи плана) — берём самое
         # длинное: короткие обычно повторяют «The package execution failed».
         summary = max(parts, key=len).strip()
-    else:
-        summary = _JOB_NOISE.sub("", text).strip() or text
+        if len(summary) > limit:
+            summary = summary[:limit - 1] + "…"
+        return summary
 
+    summary = " ".join(_JOB_NOISE.sub(" ", text).split()).strip(" .:;,\"'…")
+    if not _JOB_MEANINGFUL.search(summary):
+        return ""
+    # Без Description полезное лежит в конце (Error … The step failed),
+    # поэтому при переполнении отрезаем начало, а не хвост.
     if len(summary) > limit:
-        summary = summary[:limit - 1] + "…"
+        summary = "…" + summary[-(limit - 1):]
     return summary
 
 
