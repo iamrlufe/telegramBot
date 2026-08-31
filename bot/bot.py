@@ -1196,10 +1196,29 @@ async def _send_document_to_notify(context: ContextTypes.DEFAULT_TYPE, path: str
                                             filename=name, caption=caption)
 
 
-async def scheduled_backup_charts(context: ContextTypes.DEFAULT_TYPE):
-    """Утром и вечером уходят только графики бэкапов: свежесть по серверам и
-    общий объём за 30 дней. Текстовый отчёт по расписанию не шлётся — он
-    длинный и читается редко, для него есть кнопка 📋 Отчёт и /report."""
+async def _send_dashboard_to_notify(context: ContextTypes.DEFAULT_TYPE):
+    """Собрать дашборд и отправить файлом в рассылку, убрав за собой."""
+    path = await asyncio.to_thread(build_dashboard_html)
+    try:
+        await _send_document_to_notify(context, path, DASHBOARD_CAPTION)
+    finally:
+        _drop_dashboard_file(path)
+
+
+async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Утром и вечером: дашборд-файл и два графика бэкапов — свежесть по
+    серверам и общий объём за 30 дней. Текстовый отчёт по расписанию не
+    шлётся: он длинный и читается редко, для него есть кнопка 📋 Отчёт
+    и /report.
+
+    Дашборд и графики отправляются независимо: сбой одного не должен
+    отменять второе — рассылка идёт дважды в сутки, и молчание в ней
+    заметят не сразу."""
+    try:
+        await _send_dashboard_to_notify(context)
+    except Exception as e:
+        print(f"[bot] Ошибка планового дашборда: {e}", flush=True)
+
     try:
         async def send_photo(path, caption):
             await _send_photo_to_notify(context, path, caption)
@@ -1236,15 +1255,8 @@ async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"[bot] Ошибка еженедельного дайджеста бэкапов: {e}", flush=True)
 
-    # Дашборд-файл в дополнение к текстовому дайджесту
-    try:
-        path = await asyncio.to_thread(build_dashboard_html)
-        try:
-            await _send_document_to_notify(context, path, DASHBOARD_CAPTION)
-        finally:
-            _drop_dashboard_file(path)
-    except Exception as e:
-        print(f"[bot] Ошибка дашборда в еженедельном отчёте: {e}", flush=True)
+    # Дашборд сюда не дублируется: он приходит утром и вечером каждый день,
+    # в том числе за час до этого отчёта
 
 
 # ─── Глобальный обработчик ошибок ────────────────────────────
@@ -1298,11 +1310,11 @@ def main():
     app.add_error_handler(on_error)
 
     app.job_queue.run_daily(
-        scheduled_backup_charts,
+        scheduled_digest,
         time(hour=8, minute=0, tzinfo=ALMATY)
     )
     app.job_queue.run_daily(
-        scheduled_backup_charts,
+        scheduled_digest,
         time(hour=18, minute=0, tzinfo=ALMATY)
     )
     app.job_queue.run_daily(
