@@ -20,7 +20,8 @@ from telegram.ext import (
     filters
 )
 
-from charts import build_server_chart, build_dashboard_chart, build_top_dirs_chart, period_label
+from charts import build_server_chart, build_top_dirs_chart, period_label
+from dashboard_html import build_dashboard_html
 from db import (
     get_servers_status, get_server_detail, get_disk_usage, get_server_disks,
     get_problems, build_report, format_problems_for_server,
@@ -101,7 +102,7 @@ MENU_LABELS = {label for row in KEYBOARD for label in row}
 BOT_COMMANDS = [
     BotCommand("start", "Меню и клавиатура"),
     BotCommand("servers", "Статус серверов"),
-    BotCommand("dashboard", "Дашборд-график"),
+    BotCommand("dashboard", "Дашборд-файл"),
     BotCommand("report", "Текстовый отчёт"),
     BotCommand("problems", "Текущие проблемы"),
     BotCommand("ping", "Пинг: /ping [хост]"),
@@ -451,27 +452,44 @@ async def send_ping_card(message, context, value: str):
     )
 
 
+DASHBOARD_CAPTION = (
+    "📊 Дашборд · вся инфраструктура за 24 часа\n"
+    "Откройте файл: карточки разворачиваются по тапу, есть фильтр и тёмная тема."
+)
+
+
+def _drop_dashboard_file(path: str):
+    """Файл лежит в своём временном каталоге — имя видно в Telegram, поэтому
+    убирать надо и каталог."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    try:
+        os.rmdir(os.path.dirname(path))
+    except OSError:
+        pass
+
+
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text("📊 Собираю дашборд...")
     try:
-        path = await asyncio.to_thread(build_dashboard_chart)
+        path = await asyncio.to_thread(build_dashboard_html)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Не удалось построить дашборд: {e}")
         return
 
     try:
-        with open(path, "rb") as image:
-            await update.message.reply_photo(
-                photo=image,
-                caption="📊 Дашборд · вся инфраструктура за 24 часа"
+        with open(path, "rb") as report:
+            await update.message.reply_document(
+                document=report,
+                filename=os.path.basename(path),
+                caption=DASHBOARD_CAPTION,
             )
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        _drop_dashboard_file(path)
 
 
 async def send_server_chart(message, server_name: str, hours: int = 24):
@@ -1162,6 +1180,22 @@ async def _send_photo_to_notify(context: ContextTypes.DEFAULT_TYPE, path: str, c
             await context.bot.send_photo(chat_id=ALLOWED_USER_ID, photo=image, caption=caption)
 
 
+async def _send_document_to_notify(context: ContextTypes.DEFAULT_TYPE, path: str, caption: str):
+    """Как и с фото: сначала в группу, при отказе — в личку владельцу."""
+    name = os.path.basename(path)
+    try:
+        with open(path, "rb") as report:
+            await context.bot.send_document(chat_id=NOTIFY_ID, document=report,
+                                            filename=name, caption=caption)
+    except Exception as e:
+        if NOTIFY_ID == ALLOWED_USER_ID:
+            raise
+        print(f"[bot] Не удалось отправить файл в группу {NOTIFY_ID}: {e}", flush=True)
+        with open(path, "rb") as report:
+            await context.bot.send_document(chat_id=ALLOWED_USER_ID, document=report,
+                                            filename=name, caption=caption)
+
+
 async def scheduled_backup_charts(context: ContextTypes.DEFAULT_TYPE):
     """Утром и вечером уходят только графики бэкапов: свежесть по серверам и
     общий объём за 30 дней. Текстовый отчёт по расписанию не шлётся — он
@@ -1202,18 +1236,13 @@ async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"[bot] Ошибка еженедельного дайджеста бэкапов: {e}", flush=True)
 
-    # Картинка-дашборд в дополнение к текстовому дайджесту
+    # Дашборд-файл в дополнение к текстовому дайджесту
     try:
-        path = await asyncio.to_thread(build_dashboard_chart)
+        path = await asyncio.to_thread(build_dashboard_html)
         try:
-            await _send_photo_to_notify(
-                context, path, "📊 Дашборд · вся инфраструктура за 24 часа"
-            )
+            await _send_document_to_notify(context, path, DASHBOARD_CAPTION)
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            _drop_dashboard_file(path)
     except Exception as e:
         print(f"[bot] Ошибка дашборда в еженедельном отчёте: {e}", flush=True)
 
