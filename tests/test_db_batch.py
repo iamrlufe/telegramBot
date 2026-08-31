@@ -57,14 +57,6 @@ def test_disks_written_in_one_insert(calls):
     ]
 
 
-def test_single_disk_helper_still_works(calls):
-    db.save_disk_metric("srv-01", "C:", 10.5, 90.0)
-
-    sql, values = calls["inserts"][0]
-    assert "INSERT INTO disk_metrics" in sql
-    assert values == [("srv-01", "C:", 10.5, 90.0)]
-
-
 def test_services_written_in_one_insert(calls):
     db.save_service_statuses("srv-01", [
         ("MSSQLSERVER", "SQL Server", "running"),

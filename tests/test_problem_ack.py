@@ -200,3 +200,46 @@ def test_new_problem_on_acked_server_still_shows(ack_file, two_disks):
 
     keys = {p["key"] for p in bot_db.collect_problems()}
     assert keys == {"disk:srv-01:D", "disk:srv-01:E"}
+
+
+# ─── Кеш сводки ──────────────────────────────────────────────
+
+def test_summary_is_not_recomputed_on_every_press(ack_file, two_disks, monkeypatch):
+    """Пять тяжёлых запросов на каждое нажатие кнопки — при том что данные
+    обновляются раз в пять минут."""
+    calls = []
+    original = bot_db.collect_problems
+    monkeypatch.setattr(bot_db, "collect_problems",
+                        lambda: calls.append(1) or original())
+    bot_db.invalidate_problems_cache()
+
+    first = bot_db.get_problems()
+    second = bot_db.get_problems()
+
+    assert len(calls) == 1
+    assert first == second
+
+
+def test_ack_makes_the_summary_fresh_immediately(ack_file, two_disks, monkeypatch):
+    """Иначе принятые замечания вернулись бы на экран из кеша."""
+    bot_db.invalidate_problems_cache()
+    _text, servers = bot_db.get_problems()
+
+    bot_db.ack_server_problems(servers[0])
+    _text, servers = bot_db.get_problems()
+
+    assert servers == [] or all(
+        "disk:srv-01:C" != item["key"] for s in servers for item in s["items"]
+    )
+
+
+def test_cache_can_be_bypassed(ack_file, two_disks, monkeypatch):
+    calls = []
+    original = bot_db.collect_problems
+    monkeypatch.setattr(bot_db, "collect_problems",
+                        lambda: calls.append(1) or original())
+    bot_db.invalidate_problems_cache()
+
+    bot_db.get_problems()
+    bot_db.get_problems(force=True)
+    assert len(calls) == 2

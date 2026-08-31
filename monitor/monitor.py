@@ -14,6 +14,7 @@ from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
 from backup_maintenance import run_backup_maintenance
 from db import (
+    ensure_time_indexes,
     save_disk_metrics,
     save_server_status,
     save_service_statuses,
@@ -49,19 +50,44 @@ from alerts import (
     ALMATY,
 )
 
-INTERVAL = 300
-PING_INTERVAL = 30
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        print(f"[monitor] Некорректный {name}, использую {default}", flush=True)
+        return default
+
+
+# Основной цикл опроса серверов.
+INTERVAL = _int_env("CHECK_INTERVAL_SECONDS", 300)
+
+# Через сколько минут застывшего пульса процесс убивает себя сам.
+# Docker не перезапускает контейнер за то, что healthcheck стал unhealthy —
+# он лишь показывает состояние. Зависший монитор молчал бы вечно, а молчащий
+# монитор хуже шумного: с restart: unless-stopped выход поднимает его заново.
+# 0 — выключить самоубийство (например, при отладке).
+STALL_EXIT_MINUTES = _int_env("MONITOR_STALL_EXIT_MINUTES", 30)
 RETRY_DELAY = 30       # пауза перед повторной попыткой WinRM (сек)
 RETRY_COUNT = 2        # количество попыток WinRM перед алертом офлайн
-PING_FAIL_THRESHOLD = 15  # сколько подряд неудачных пингов = сервер упал
 MAX_PARALLEL_CHECKS = 5   # сколько серверов опрашиваем одновременно
 
 # Пинг — чистое ожидание ответа, поэтому потоков берём больше, чем на полный
 # опрос: недоступный хост стоит до 4 секунд, и в один поток цикл из десятка
-# серверов переставал укладываться в PING_INTERVAL. А значит, и порог
-# PING_FAIL_THRESHOLD переставал означать обещанные 7,5 минут — падение
-# замечалось позже, чем задумано.
+# серверов переставал укладываться в интервал.
 MAX_PARALLEL_PINGS = 16
+
+# Как часто пингуем, когда всё в порядке.
+PING_INTERVAL = _int_env("PING_INTERVAL_SECONDS", 30)
+
+# Как часто, когда кто-то не отвечает. Пока сервер лежит, важны обе границы:
+# быстрее объявить падение и не проспать момент, когда он поднялся. Пинг
+# дешёвый и идёт во все хосты разом, поэтому учащение почти ничего не стоит.
+PING_DOWN_INTERVAL = _int_env("PING_DOWN_INTERVAL_SECONDS", 10)
+
+# Сколько секунд подряд хост должен молчать, чтобы это считалось падением.
+# Раньше порог считался в попытках (15 штук) и молча зависел от интервала:
+# опрос замедлялся — и «7,5 минут» превращались в десять. Время честнее.
+PING_FAIL_SECONDS = _int_env("PING_FAIL_SECONDS", 120)
 
 SERVERS_FILE = "/app/config/servers.json"
 
@@ -74,15 +100,11 @@ RAM_STATE_FILE = "/app/data/ram_alert_state.json"
 HEARTBEAT_FILE = "/app/data/heartbeat"
 SELF_REPORT_STATE_FILE = "/app/data/self_report_state.json"
 
-RETAIN_DAYS = 30
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        print(f"[monitor] Некорректный {name}, использую {default}", flush=True)
-        return default
+# Сколько дней держим историю. Отдельный, более короткий срок — у таблиц,
+# из которых читается только последняя запись (службы и топ процессов):
+# история там не используется нигде, а места занимала больше половины базы.
+RETAIN_DAYS = _int_env("RETAIN_DAYS", 30)
+SNAPSHOT_RETAIN_DAYS = _int_env("SNAPSHOT_RETAIN_DAYS", 3)
 
 
 # Как часто обходить каталоги бэкапов. Копия появляется раз в сутки, а обход
@@ -101,9 +123,11 @@ SELF_REPORT_HOUR = os.getenv("SELF_REPORT_HOUR", "9").strip()
 # Итог последнего цикла для самоотчёта: {"online", "offline", "total"}
 _last_cycle_tally: dict = {}
 
-# Счётчики неудачных пингов — хранятся в памяти
-# { server_name: int }
-_ping_fail_counts: dict = {}
+# Пинг-состояние в памяти: с какого момента (monotonic) хост молчит и по кому
+# уже отправлен алерт. Монотонные часы, а не системные: перевод времени на
+# хосте не должен ни поднимать ложную тревогу, ни прятать настоящую.
+_ping_fail_since: dict = {}   # { server_name: monotonic первого промаха }
+_ping_down: set = set()       # { server_name } — падение уже объявлено
 _ping_lock = threading.Lock()
 
 
@@ -208,11 +232,15 @@ def maybe_cleanup():
     except FileNotFoundError:
         pass
 
-    print(f"[monitor] Очистка данных старше {RETAIN_DAYS} дней...", flush=True)
+    print(
+        f"[monitor] Очистка: история {RETAIN_DAYS} дней, "
+        f"службы и процессы {SNAPSHOT_RETAIN_DAYS}...",
+        flush=True
+    )
     (
         deleted_metrics, deleted_status, deleted_services, deleted_processes,
         deleted_backups, deleted_db_sizes, deleted_onec_logs
-    ) = cleanup_old_data(RETAIN_DAYS)
+    ) = cleanup_old_data(RETAIN_DAYS, SNAPSHOT_RETAIN_DAYS)
     print(
         f"[monitor] Удалено: {deleted_metrics} метрик, "
         f"{deleted_status} статусов, {deleted_services} сервисов, "
@@ -240,44 +268,60 @@ def run_ping_cycle():
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PINGS, len(servers))) as pool:
         alive_flags = list(pool.map(lambda s: ping_host(s["host"]), servers))
 
+    now = time.monotonic()
+
     for server, is_alive in zip(servers, alive_flags):
         name = server["name"]
         host = server["host"]
 
         # Решение принимаем под блокировкой, медленный I/O (БД, Telegram) — вне её
-        action = None
         with _ping_lock:
             if is_alive:
-                was_down = _ping_fail_counts.get(name, 0) >= PING_FAIL_THRESHOLD
-                _ping_fail_counts[name] = 0
-                if was_down:
-                    action = "recovered"
+                action = "recovered" if name in _ping_down else None
+                _ping_fail_since.pop(name, None)
+                _ping_down.discard(name)
+                silent_for = 0
             else:
-                count = _ping_fail_counts.get(name, 0) + 1
-                _ping_fail_counts[name] = count
-                if count == PING_FAIL_THRESHOLD:
-                    action = "down"
-                elif count > PING_FAIL_THRESHOLD:
+                since = _ping_fail_since.setdefault(name, now)
+                silent_for = now - since
+                if name in _ping_down:
                     action = "still_down"
+                elif silent_for >= PING_FAIL_SECONDS:
+                    _ping_down.add(name)
+                    action = "down"
                 else:
-                    action = f"fail_{count}"
+                    action = "failing"
 
         if action == "recovered":
             print(f"[ping] ВОССТАНОВЛЕН {name} ({host})", flush=True)
             save_server_status(name, "online", error="Ping восстановлен")
             alert_server_online(server)
         elif action == "down":
-            print(f"[ping] DOWN {name} ({host}) — порог достигнут", flush=True)
+            print(f"[ping] DOWN {name} ({host}) — молчит {round(silent_for)} сек",
+                  flush=True)
             save_server_status(name, "ping_down", error="Ping не отвечает")
             alert_server_down(server)
         elif action == "still_down":
             print(f"[ping] Всё ещё недоступен {name} ({host})", flush=True)
-        elif action:
-            count = action.split("_", 1)[1]
+        elif action == "failing":
             print(
-                f"[ping] НЕТ ОТВЕТА {name} ({host}) — {count}/{PING_FAIL_THRESHOLD}",
+                f"[ping] НЕТ ОТВЕТА {name} ({host}) — "
+                f"{round(silent_for)}/{PING_FAIL_SECONDS} сек",
                 flush=True
             )
+
+
+def ping_interval() -> int:
+    """Пауза до следующего круга пингов.
+
+    Пока хоть один хост молчит, круг идёт чаще: это одновременно ускоряет
+    объявление падения и, главное, ловит момент, когда сервер поднялся, —
+    ждать общие полминуты, когда человек стоит рядом с сервером и ждёт
+    подтверждения, незачем.
+    """
+    with _ping_lock:
+        troubled = bool(_ping_fail_since)
+    return PING_DOWN_INTERVAL if troubled else PING_INTERVAL
 
 
 def ping_loop():
@@ -286,7 +330,7 @@ def ping_loop():
             run_ping_cycle()
         except Exception as e:
             print(f"[ping] Ошибка цикла: {e}", flush=True)
-        time.sleep(PING_INTERVAL)
+        time.sleep(ping_interval())
 
 
 def process_server(server: dict, final: bool = True):
@@ -610,11 +654,54 @@ def maintenance_loop():
         time.sleep(INTERVAL)
 
 
+def heartbeat_age_seconds():
+    """Сколько секунд назад обновлялся пульс. None — файла нет или он битый."""
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            written = datetime.fromisoformat(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return (datetime.now(timezone.utc) - written).total_seconds()
+
+
+def watchdog_loop():
+    """Сторож зависшего цикла.
+
+    Пульс теперь обновляется по ходу цикла — после каждого сервера, — поэтому
+    его застой означает не «долго работает», а «встало намертво»: обычно это
+    сетевой вызов, повисший без таймаута. Лечится только перезапуском, и
+    сделать его должен сам процесс: снаружи никто не следит.
+    """
+    if STALL_EXIT_MINUTES <= 0:
+        return
+    limit = STALL_EXIT_MINUTES * 60
+    while True:
+        time.sleep(60)
+        age = heartbeat_age_seconds()
+        if age is not None and age > limit:
+            print(
+                f"[monitor] Пульс не обновлялся {round(age / 60)} мин — "
+                f"цикл завис, выхожу для перезапуска контейнера",
+                flush=True
+            )
+            traceback.print_stack()
+            os._exit(1)
+
+
 def main():
     print("[monitor] AgentMonitor запущен", flush=True)
     print(f"[monitor] Интервал: {INTERVAL} сек, retry: {RETRY_COUNT}x{RETRY_DELAY}сек", flush=True)
-    print(f"[monitor] Ping-мониторинг: каждые {PING_INTERVAL} сек, порог: {PING_FAIL_THRESHOLD} неудач", flush=True)
-    print(f"[monitor] Хранение данных: {RETAIN_DAYS} дней", flush=True)
+    print(
+        f"[monitor] Ping-мониторинг: каждые {PING_INTERVAL} сек "
+        f"(упавшие — каждые {PING_DOWN_INTERVAL}), "
+        f"падение при молчании {PING_FAIL_SECONDS} сек",
+        flush=True
+    )
+    print(
+        f"[monitor] Хранение данных: {RETAIN_DAYS} дней "
+        f"(службы и процессы — {SNAPSHOT_RETAIN_DAYS})",
+        flush=True
+    )
 
     os.makedirs("/app/data", exist_ok=True)
     for path in [
@@ -631,9 +718,15 @@ def main():
                 f.write("{}")
             print(f"[monitor] Создан файл состояния: {path}", flush=True)
 
+    try:
+        ensure_time_indexes()
+    except Exception as e:
+        print(f"[monitor] Проверка индексов не удалась: {e}", flush=True)
+
     touch_heartbeat()
     threading.Thread(target=ping_loop, daemon=True).start()
     threading.Thread(target=maintenance_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
     while True:
         # Последний рубеж: любая неучтённая ошибка в цикле не должна

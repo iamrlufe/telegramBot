@@ -35,8 +35,17 @@ def quiet(monkeypatch):
                         lambda: calls.__setitem__("heartbeat", calls["heartbeat"] + 1))
     monkeypatch.setattr(monitor.time, "sleep",
                         lambda sec: calls["sleep"].append(sec))
-    monitor._ping_fail_counts.clear()
+    monitor._ping_fail_since.clear()
+    monitor._ping_down.clear()
     return calls
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Управляемые монотонные часы: пороги теперь во времени, а не в попытках."""
+    box = {"t": 1000.0}
+    monkeypatch.setattr(monitor.time, "monotonic", lambda: box["t"])
+    return box
 
 
 # ─── Пинг ────────────────────────────────────────────────────
@@ -53,8 +62,8 @@ def test_all_hosts_are_pinged_in_one_cycle(quiet, monkeypatch):
 
 def test_ping_cycle_does_not_wait_hosts_one_by_one(quiet, monkeypatch):
     """Недоступный хост стоит несколько секунд. Пока пинг шёл по очереди,
-    цикл из десятка серверов переставал укладываться в PING_INTERVAL, и
-    порог PING_FAIL_THRESHOLD переставал означать обещанные минуты."""
+    цикл из десятка серверов переставал укладываться в свой интервал, и
+    падение замечалось позже обещанного."""
     import threading
     started = threading.Barrier(len(SERVERS), timeout=5)
 
@@ -67,28 +76,67 @@ def test_ping_cycle_does_not_wait_hosts_one_by_one(quiet, monkeypatch):
     monitor.run_ping_cycle()  # threading.BrokenBarrierError, если последовательно
 
 
-def test_down_alert_after_threshold(quiet, monkeypatch):
+def test_down_alert_after_silence_time(quiet, clock, monkeypatch):
+    """Порог считается временем молчания, а не числом попыток: раньше он
+    молча зависел от интервала опроса, и обещанные минуты превращались
+    в другие, стоило циклу замедлиться."""
     monkeypatch.setattr(monitor, "ping_host", lambda host: False)
 
-    for _ in range(monitor.PING_FAIL_THRESHOLD):
-        monitor.run_ping_cycle()
+    monitor.run_ping_cycle()
+    clock["t"] += monitor.PING_FAIL_SECONDS - 1
+    monitor.run_ping_cycle()
+    assert quiet["down"] == [], "до порога тревоги быть не должно"
 
+    clock["t"] += 1
+    monitor.run_ping_cycle()
     assert quiet["down"] == [s["name"] for s in SERVERS]
 
-    # дальше молчим, а не шлём алерт каждые полминуты
+    # дальше молчим, а не шлём алерт каждые десять секунд
+    clock["t"] += 600
     monitor.run_ping_cycle()
     assert len(quiet["down"]) == len(SERVERS)
 
 
-def test_recovery_alert_after_down(quiet, monkeypatch):
+def test_recovery_alert_after_down(quiet, clock, monkeypatch):
     monkeypatch.setattr(monitor, "ping_host", lambda host: False)
-    for _ in range(monitor.PING_FAIL_THRESHOLD):
-        monitor.run_ping_cycle()
+    monitor.run_ping_cycle()
+    clock["t"] += monitor.PING_FAIL_SECONDS
+    monitor.run_ping_cycle()
 
     monkeypatch.setattr(monitor, "ping_host", lambda host: True)
     monitor.run_ping_cycle()
 
     assert quiet["online"] == [s["name"] for s in SERVERS]
+
+
+def test_short_blip_does_not_raise_alarm(quiet, clock, monkeypatch):
+    """Пара потерянных пакетов — не падение сервера."""
+    monkeypatch.setattr(monitor, "ping_host", lambda host: False)
+    monitor.run_ping_cycle()
+    clock["t"] += 20
+    monitor.run_ping_cycle()
+
+    monkeypatch.setattr(monitor, "ping_host", lambda host: True)
+    monitor.run_ping_cycle()
+
+    assert quiet["down"] == [] and quiet["online"] == [], \
+        "молчание короче порога не должно порождать ни тревоги, ни отбоя"
+    assert not monitor._ping_fail_since, "счётчик молчания должен обнулиться"
+
+
+def test_troubled_hosts_are_pinged_more_often(quiet, clock, monkeypatch):
+    """Пока сервер лежит, ждать общие полминуты незачем: человек у стойки
+    хочет увидеть подтверждение, что машина поднялась."""
+    assert monitor.ping_interval() == monitor.PING_INTERVAL
+
+    monkeypatch.setattr(monitor, "ping_host", lambda host: False)
+    monitor.run_ping_cycle()
+    assert monitor.ping_interval() == monitor.PING_DOWN_INTERVAL
+    assert monitor.PING_DOWN_INTERVAL < monitor.PING_INTERVAL
+
+    monkeypatch.setattr(monitor, "ping_host", lambda host: True)
+    monitor.run_ping_cycle()
+    assert monitor.ping_interval() == monitor.PING_INTERVAL
 
 
 def test_empty_server_list_is_not_an_error(quiet, monkeypatch):
@@ -199,3 +247,30 @@ def test_backup_cycle_is_skipped_between_scans(monkeypatch):
     assert monitor.maybe_run_backup_cycle() is True
     assert monitor.maybe_run_backup_cycle() is False
     assert len(runs) == 1
+
+
+# ─── Сторож зависшего цикла ──────────────────────────────────
+
+def test_heartbeat_age_is_read_back(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    path = tmp_path / "heartbeat"
+    monkeypatch.setattr(monitor, "HEARTBEAT_FILE", str(path))
+
+    monitor.touch_heartbeat()
+    assert monitor.heartbeat_age_seconds() < 5
+
+    stale = datetime.now(timezone.utc) - timedelta(minutes=45)
+    path.write_text(stale.isoformat())
+    assert monitor.heartbeat_age_seconds() > 40 * 60
+
+
+def test_missing_or_broken_heartbeat_is_not_a_stall(tmp_path, monkeypatch):
+    """Битый файл не повод убивать процесс: сторож должен молчать, а не
+    устраивать перезапуск на ровном месте."""
+    path = tmp_path / "heartbeat"
+    monkeypatch.setattr(monitor, "HEARTBEAT_FILE", str(path))
+    assert monitor.heartbeat_age_seconds() is None
+
+    path.write_text("не время")
+    assert monitor.heartbeat_age_seconds() is None

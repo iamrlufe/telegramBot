@@ -11,6 +11,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 30s
@@ -30,9 +35,16 @@ services:
     volumes:
       - ./config:/app/config:ro
       - monitor_data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
-      # heartbeat обновляется каждый цикл (5 мин); если файл старше 20 минут —
-      # цикл завис и контейнер считается нездоровым
+      # heartbeat обновляется по ходу цикла — после каждого сервера; если файл
+      # старше 20 минут, цикл завис. Сам монитор при этом выходит через
+      # MONITOR_STALL_EXIT_MINUTES и поднимается заново: docker на unhealthy
+      # не реагирует, он только показывает состояние
       test: ["CMD-SHELL", "find /app/data/heartbeat -mmin -20 | grep -q ."]
       interval: 60s
       timeout: 5s
@@ -52,6 +64,11 @@ services:
       # rw: бот редактирует servers.json через раздел ⚙️ Настройка
       - ./config:/app/config
       - monitor_data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import psycopg2, os; psycopg2.connect(host=os.getenv('POSTGRES_HOST'), dbname=os.getenv('POSTGRES_DB'), user=os.getenv('POSTGRES_USER'), password=os.getenv('POSTGRES_PASSWORD')).close()\""]
       interval: 60s

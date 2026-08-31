@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 
 import psycopg2
 from collections import defaultdict
@@ -51,6 +53,17 @@ ONEC_LOG_WARN_GB = 5
 ONEC_LOG_CRIT_GB = 10
 ONEC_LOG_STALE_MINUTES = 30
 SERVER_BUTTONS_PER_PAGE = 8
+
+# Записи старше недели в сводке проблем ничего не значат: свежесть каждой
+# категории проверяется своими порогами в минутах и часах. Ограничение нужно
+# запросам: DISTINCT ON без него читает таблицу целиком, а это вся история
+# за месяц на каждое нажатие 🚨 Проблемы.
+PROBLEM_HISTORY_DAYS = 7
+
+# Сводка пересчитывалась на каждое нажатие кнопки — пять тяжёлых запросов
+# ради данных, которые обновляются раз в пять минут. Ходьба «сводка →
+# сервер → назад» стоила пятнадцати.
+PROBLEMS_CACHE_SECONDS = _int_env("PROBLEMS_CACHE_SECONDS", 45)
 SERVERS_FILE = "/app/config/servers.json"
 
 
@@ -536,8 +549,9 @@ def collect_problems() -> list:
                    server_name, status, error, checked_at,
                    cpu_load, ram_total, ram_free
             FROM server_status
+            WHERE checked_at >= NOW() - make_interval(days => %s)
             ORDER BY server_name, checked_at DESC
-        """)
+        """, (PROBLEM_HISTORY_DAYS,))
         status_rows = cur.fetchall()
 
         cur.execute("""
@@ -555,12 +569,13 @@ def collect_problems() -> list:
                 SELECT DISTINCT ON (server_name, service_name)
                        service_name, display_name, status, server_name, checked_at
                 FROM service_status
+                WHERE checked_at >= NOW() - make_interval(days => %s)
                 ORDER BY server_name, service_name, checked_at DESC
             ) latest
             WHERE LOWER(status) != 'running'
               AND checked_at >= NOW() - INTERVAL '30 minutes'
             ORDER BY server_name, service_name
-        """)
+        """, (PROBLEM_HISTORY_DAYS,))
 
         backup_rows = _fetch_optional(cur, """
             SELECT server_name, backup_type, backup_path, file_count,
@@ -570,10 +585,11 @@ def collect_problems() -> list:
                        server_name, backup_type, backup_path, file_count,
                        newest_file, disk_total_gb, disk_free_gb, created_at
                 FROM backup_metrics
+                WHERE created_at >= NOW() - make_interval(days => %s)
                 ORDER BY server_name, backup_type, backup_path, created_at DESC
             ) latest
             ORDER BY server_name, backup_type, backup_path
-        """)
+        """, (PROBLEM_HISTORY_DAYS,))
 
         onec_log_rows = _fetch_optional(cur, """
             SELECT server_name, log_name, log_path, total_size_gb,
@@ -583,10 +599,11 @@ def collect_problems() -> list:
                        server_name, log_name, log_path, total_size_gb,
                        file_count, status, error, created_at
                 FROM onec_log_metrics
+                WHERE created_at >= NOW() - make_interval(days => %s)
                 ORDER BY server_name, log_path, created_at DESC
             ) latest
             ORDER BY server_name, log_name, log_path
-        """)
+        """, (PROBLEM_HISTORY_DAYS,))
 
         verify_rows = _fetch_optional(cur, """
             SELECT server_name, backup_path, file_path, status, error, created_at
@@ -911,15 +928,44 @@ def ack_server_problems(server: dict) -> int:
     keys = {item["key"] for item in server["items"] if item.get("key")}
     for key in sorted(keys):
         ack_key_forever(key)
+    # Иначе следующий экран показал бы только что принятые замечания из кеша
+    invalidate_problems_cache()
     return len(keys)
 
 
-def get_problems() -> tuple:
+# Готовая сводка и момент её сборки (monotonic). Общая на процесс: у бота
+# один и тот же ответ для всех, кто нажал 🚨 Проблемы.
+_problems_cache = {"at": 0.0, "value": None}
+_problems_lock = threading.Lock()
+
+
+def invalidate_problems_cache():
+    """Сбрасывает кеш — после «Принял», когда ответ обязан измениться сразу."""
+    with _problems_lock:
+        _problems_cache["value"] = None
+
+
+def get_problems(force: bool = False) -> tuple:
     """Сводка по категориям и серверы для кнопок. Плоский список строк
     разрастался до трёх десятков почти одинаковых строк — по пути на каждую
-    базу, — и главное в нём терялось."""
+    базу, — и главное в нём терялось.
+
+    Результат живёт PROBLEMS_CACHE_SECONDS: данные обновляются раз в пять
+    минут, а ходьба «сводка → сервер → назад» пересчитывала их каждый раз
+    заново — пять запросов на нажатие.
+    """
+    now = time.monotonic()
+    if not force and PROBLEMS_CACHE_SECONDS > 0:
+        with _problems_lock:
+            cached = _problems_cache["value"]
+            if cached and now - _problems_cache["at"] < PROBLEMS_CACHE_SECONDS:
+                return cached
+
     problems = collect_problems()
-    return format_problems_summary(problems), problems_by_server(problems)
+    value = (format_problems_summary(problems), problems_by_server(problems))
+    with _problems_lock:
+        _problems_cache.update(at=time.monotonic(), value=value)
+    return value
 
 
 # ─── Отчёт ───────────────────────────────────────────────────

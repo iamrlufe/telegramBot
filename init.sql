@@ -127,6 +127,30 @@ CREATE INDEX IF NOT EXISTS idx_database_sizes_server_db_collected
 CREATE INDEX IF NOT EXISTS idx_onec_log_server_path_created
     ON onec_log_metrics (server_name, log_path, created_at DESC);
 
+-- Индексы по времени: ежедневная очистка и выборки «за последний час»
+-- фильтруют только по дате, а все индексы выше начинаются с server_name
+-- и для этого не годятся — без них читалась вся таблица.
+CREATE INDEX IF NOT EXISTS idx_disk_metrics_created
+    ON disk_metrics (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_server_status_checked
+    ON server_status (checked_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_service_status_checked
+    ON service_status (checked_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_process_metrics_created
+    ON process_metrics (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_backup_metrics_created
+    ON backup_metrics (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_database_sizes_collected
+    ON database_sizes (collected_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_onec_log_metrics_created
+    ON onec_log_metrics (created_at DESC);
+
 -- Аудит изменений конфигурации серверов из бота (кто/когда/что).
 -- Не входит в автоочистку истории — записей мало, нужны для расследований.
 CREATE TABLE IF NOT EXISTS config_audit (
