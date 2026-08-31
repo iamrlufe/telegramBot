@@ -12,6 +12,8 @@ from server_check import check_server, server_type
 from service_details import save_details_from_info
 from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
+from log_collector import maybe_run_log_cycle
+from log_store import forget_server as forget_log_events
 from backup_maintenance import run_backup_maintenance
 from db import (
     ensure_time_indexes,
@@ -611,6 +613,7 @@ def run_cycle():
         try:
             purge_server_state(name)
             purge_disk_health(name)
+            forget_log_events(name)
         except Exception as e:
             print(f"[monitor] Не удалось очистить состояние {name}: {e}", flush=True)
 
@@ -637,6 +640,14 @@ def run_cycle():
         maybe_run_backup_cycle()
     except Exception as e:
         print(f"[monitor] Ошибка сбора метрик бэкапов: {e}", flush=True)
+
+    # Сводка журналов Windows и SQL для дашборда — свой, более редкий шаг.
+    # Тот же отдельный try: чтение Event Log по WinRM отваливается по правам
+    # и таймаутам чаще остального, и ронять цикл из-за этого нельзя.
+    try:
+        maybe_run_log_cycle(servers, on_progress=touch_heartbeat)
+    except Exception as e:
+        print(f"[monitor] Ошибка сбора журналов: {e}", flush=True)
 
     # Ретеншн и RESTORE VERIFYONLY — в своём потоке (maintenance_loop), не здесь:
     # VERIFY может идти до 2 часов, и раньше это останавливало весь цикл

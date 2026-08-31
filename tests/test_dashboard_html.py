@@ -223,3 +223,137 @@ def test_dark_theme_declared_for_both_scopes(scope):
     """Системная тема и ручное переключение кнопкой ◐ — два разных
     селектора, и оба обязаны быть в файле."""
     assert scope in _render([_server("a.example.local")])
+
+
+# ─── Вкладки: журналы и бэкапы ───────────────────────────────
+
+def _log_group(server, source, events, error="", level=None):
+    from datetime import datetime, timezone
+    return {
+        "server": server, "source": source, "events": events,
+        "categories": [{"key": e["category"], "icon": "•", "label": e["category"],
+                        "count": e.get("count", 1), "level": e["level"]} for e in events],
+        "total": sum(e.get("count", 1) for e in events),
+        "level": level or ("crit" if any(e["level"] == "crit" for e in events)
+                           else "warn" if events or error else "ok"),
+        "error": error,
+        "collected_at": datetime.now(timezone.utc),
+    }
+
+
+def _log_event(category, level="warn", title="Событие", detail="", event_at="2026-09-01 04:12:00",
+               event_id="6008", count=1):
+    return {"category": category, "level": level, "title": title, "detail": detail,
+            "event_at": event_at, "event_id": event_id, "count": count}
+
+
+def _backup_server(name, state, counts, items):
+    return {"name": name, "state": state, "counts": counts, "items": items,
+            "size_gb": sum(i["size_gb"] for i in items)}
+
+
+def _backup_item(state, path="E:\\Backups", btype="SQL", files=10, age_h=2.0,
+                 size_gb=1.0, free_pct=50.0, missing=False, error=""):
+    return {"type": btype, "path": path, "state": state, "files": files, "age_h": age_h,
+            "size_gb": size_gb, "free_pct": free_pct, "missing": missing, "error": error}
+
+
+def _full(servers=(), logs=None, backups=None):
+    data = _data(list(servers) or [_server("a.example.local")])
+    data["logs"] = logs or {"win": [], "sql": []}
+    data["backups"] = backups or {"servers": [], "totals": {}, "size_gb": 0}
+    return dh.render_dashboard(data)
+
+
+def test_tabs_are_pure_css_too():
+    """Вкладки переключаются тем же radio + :checked, что и фильтр: скриптов
+    в файле нет вообще."""
+    page = _full()
+
+    assert 'id="v-srv" checked' in page
+    assert '#v-win:checked~.wrap .pane-win' in page
+    assert "<script" not in page
+
+
+def test_log_tab_shows_events_and_counters():
+    page = _full(logs={"win": [_log_group("term-01.example.local", "win", [
+        _log_event("service", "crit", "Служба не запустилась", "TermService", count=3)])],
+        "sql": []})
+
+    assert "term-01.example.local" in page
+    assert "Служба не запустилась" in page
+    assert "код 6008" in page
+    assert "3 за сутки" in page
+
+
+def test_log_collection_failure_is_visible():
+    """«В журналах чисто» и «журнал не прочитан» не должны выглядеть одинаково."""
+    page = _full(logs={"win": [_log_group("app-02.example.local", "win", [],
+                                          error="нет прав на чтение журнала")],
+                       "sql": []})
+
+    assert "сбор не удался" in page
+    assert "нет прав на чтение журнала" in page
+
+
+def test_log_event_text_is_escaped():
+    page = _full(logs={"win": [_log_group("a.example.local", "win", [
+        _log_event("app", "warn", "<script>alert(1)</script>", "<b>x</b>")])], "sql": []})
+
+    assert "<script>alert(1)" not in page
+    assert "&lt;script&gt;" in page
+
+
+def test_empty_log_tab_explains_itself():
+    """Пустая вкладка должна объяснять, что сбор ещё не отработал."""
+    page = _full()
+
+    assert "Сводка журналов ещё не собрана" in page
+
+
+def test_backup_tab_summarises_then_details():
+    """Сводка сверху, разбор по серверу — внутри."""
+    page = _full(backups={
+        "servers": [_backup_server("sql-01.example.local", "crit",
+                                   {"crit": 1, "warn": 0, "ok": 1},
+                                   [_backup_item("crit", path="E:\\Backups\\DIFF", age_h=51.0),
+                                    _backup_item("ok", path="E:\\Backups\\daily")])],
+        "totals": {"crit": 1, "warn": 0, "ok": 1}, "size_gb": 2.0})
+
+    assert "устарели" in page and "свежие" in page
+    assert "E:\\Backups\\DIFF" in page
+    assert "sql-01.example.local" in page
+
+
+def test_backup_path_without_metrics_is_named_as_such():
+    """Путь, по которому сбор ни разу не отработал, — самая опасная ситуация,
+    и выглядеть как «просто нет копий» он не должен."""
+    page = _full(backups={
+        "servers": [_backup_server("nas-01.example.local", "crit", {"crit": 1, "warn": 0, "ok": 0},
+                                   [_backup_item("crit", missing=True, files=None, age_h=None,
+                                                 size_gb=0, free_pct=None)])],
+        "totals": {"crit": 1}, "size_gb": 0})
+
+    assert "сбор ни разу не отработал" in page
+    assert "нет копий" in page
+
+
+def test_server_card_carries_log_badges():
+    """Бейдж в карточке отвечает «есть ли что-то в журналах у этого сервера»."""
+    server = _server("term-01.example.local", state="warn")
+    server["logs"] = {
+        "win": [_log_group("term-01.example.local", "win",
+                           [_log_event("logon", "crit", "41 отказов входа", count=41)])],
+        "sql": [],
+    }
+
+    page = _full([server])
+
+    assert "📜 Windows" in page
+    assert "41" in page
+
+
+def test_server_without_logs_gets_no_badges():
+    page = _full([_server("a.example.local")])
+
+    assert '<div class="badges">' not in page

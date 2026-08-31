@@ -165,3 +165,35 @@ CREATE TABLE IF NOT EXISTS config_audit (
 
 CREATE INDEX IF NOT EXISTS idx_config_audit_created
     ON config_audit (created_at DESC);
+
+-- Сводка журналов Windows и SQL для дашборда. Хранится СНИМКОМ: монитор
+-- каждый раз читает журналы за последние сутки и заменяет записи сервера
+-- целиком. Поэтому здесь нет ни дублей, ни роста со временем — и в
+-- автоочистку истории эти таблицы не входят.
+CREATE TABLE IF NOT EXISTS log_events (
+    id           SERIAL PRIMARY KEY,
+    server_name  TEXT NOT NULL,
+    source       TEXT NOT NULL,      -- win | sql
+    category     TEXT NOT NULL,      -- reboot|service|disk|app|logon | login|backup|engine|job
+    level        TEXT NOT NULL,      -- crit | warn
+    event_at     TEXT,               -- время по часам самого сервера, как его отдал журнал
+    event_id     TEXT,               -- код события: 6008, 18456, …
+    title        TEXT NOT NULL,
+    detail       TEXT,
+    event_count  INTEGER NOT NULL DEFAULT 1,   -- сколько одинаковых записей схлопнуто
+    collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_events_server
+    ON log_events (server_name, source);
+
+-- Когда журналы читались в последний раз и чем это кончилось. Нужна, чтобы
+-- отличить «в журналах чисто» от «до сервера не достучались»: снимок при
+-- неудаче остаётся прошлый и обязан быть подписан как несвежий.
+CREATE TABLE IF NOT EXISTS log_scans (
+    server_name  TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    error        TEXT,
+    PRIMARY KEY (server_name, source)
+);

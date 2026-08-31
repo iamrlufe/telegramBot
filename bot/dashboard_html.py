@@ -30,6 +30,12 @@ from db import (
     is_pseudo_disk, get_problems,
 )
 from ping_tools import load_targets
+from log_store import read_snapshot
+from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
+from backup_bot_db import (
+    get_latest_backup_metrics, classify_backup_row, load_schedule_map,
+    BACKUP_STATUS_MISSING,
+)
 
 ALMATY = ZoneInfo("Asia/Almaty")
 
@@ -173,11 +179,144 @@ def collect_dashboard_data(hours: int = 24) -> dict:
             "problems": items,
         })
 
+    logs = collect_logs()
+    for server in servers:
+        server["logs"] = {
+            source: [row for row in logs[source] if row["server"] == server["name"]]
+            for source in ("win", "sql")
+        }
+
     return {
         "servers": servers,
+        "logs": logs,
+        "backups": collect_backups(),
         "hours": hours,
         "generated_at": datetime.now(ALMATY).strftime("%d.%m.%Y %H:%M"),
     }
+
+
+def _log_group(events: list, scan: dict, source: str) -> dict:
+    """Один сервер одного источника: счётчики по категориям плюс записи."""
+    return {
+        "categories": count_by_category(events, source),
+        "events": sorted(events, key=lambda e: e["event_at"], reverse=True),
+        "total": sum(e.get("count", 1) for e in events),
+        # Неудачный сбор — тоже повод для жёлтого: «в журналах чисто» и
+        # «журнал не прочитан» выглядели одинаково зелёными.
+        "level": ("crit" if any(e["level"] == "crit" for e in events)
+                  else "warn" if events or (scan or {}).get("error") else "ok"),
+        "error": (scan or {}).get("error", ""),
+        "collected_at": (scan or {}).get("collected_at"),
+    }
+
+
+def collect_logs() -> dict:
+    """Сводка журналов из базы, разложенная по серверам.
+
+    Читается готовое: журналы собирает монитор раз в LOG_SCAN_MINUTES.
+    Живьём их тянуть нельзя — на десятке серверов это под сотню удалённых
+    вызовов и минуты ожидания при каждой плановой рассылке.
+    """
+    try:
+        events, scans = read_snapshot()
+    except Exception as e:
+        print(f"[dashboard] Сводка журналов недоступна: {e}", flush=True)
+        return {"win": [], "sql": []}
+
+    names = {name for name, _source in scans} | {e["server"] for e in events}
+    result = {"win": [], "sql": []}
+    for source in ("win", "sql"):
+        for name in sorted(names):
+            scan = scans.get((name, source))
+            own = [e for e in events if e["server"] == name and e["source"] == source]
+            if not scan and not own:
+                continue
+            group = _log_group(own, scan, source)
+            group["server"] = name
+            result[source].append(group)
+        result[source].sort(
+            key=lambda g: (0 if g["level"] == "crit" else 1 if g["level"] == "warn" else 2,
+                           -g["total"], g["server"].lower())
+        )
+    return result
+
+
+BACKUP_STATES = {
+    "crit": {"color": STATUS_CRIT,  "icon": "✕", "label": "устарела",   "rank": 0},
+    "warn": {"color": STATUS_WARN,  "icon": "!", "label": "на грани",   "rank": 1},
+    "ok":   {"color": STATUS_GOOD,  "icon": "✓", "label": "свежая",     "rank": 2},
+}
+
+
+def collect_backups() -> dict:
+    """Здоровье бэкапов по всем серверам — та же классификация, что в разделе
+    💾 Бэкапы: classify_backup_row общий, иначе дашборд и бот расходились бы
+    в оценке одного и того же пути."""
+    try:
+        rows = get_latest_backup_metrics(include_missing=True)
+        schedule_map = load_schedule_map()
+    except Exception as e:
+        print(f"[dashboard] Метрики бэкапов недоступны: {e}", flush=True)
+        return {"servers": [], "totals": {"crit": 0, "warn": 0, "ok": 0}, "size_gb": 0.0}
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    by_server = defaultdict(list)
+    totals = {"crit": 0, "warn": 0, "ok": 0}
+    size_gb = 0.0
+
+    for row in rows:
+        state = classify_backup_row(row, now_utc, schedule_map)
+        totals[state] = totals.get(state, 0) + 1
+        size_gb += float(row.get("total_size_gb") or 0)
+        newest = row.get("newest_file")
+        age_h = None
+        if newest:
+            if getattr(newest, "tzinfo", None):
+                newest = newest.astimezone(timezone.utc).replace(tzinfo=None)
+            age_h = (now_utc - newest).total_seconds() / 3600
+        free_pct = None
+        total_disk = float(row.get("disk_total_gb") or 0)
+        if total_disk > 0 and row.get("disk_free_gb") is not None:
+            free_pct = float(row["disk_free_gb"]) / total_disk * 100
+        by_server[row["server_name"]].append({
+            "type": (row.get("backup_type") or "").upper(),
+            "path": row.get("backup_path") or "",
+            "state": state,
+            "files": row.get("file_count"),
+            "age_h": age_h,
+            "size_gb": float(row.get("total_size_gb") or 0),
+            "free_pct": free_pct,
+            "missing": row.get("status") == BACKUP_STATUS_MISSING,
+            "error": (row.get("error") or "").splitlines()[0][:200] if row.get("error") else "",
+        })
+
+    servers = []
+    for name, items in by_server.items():
+        items.sort(key=lambda i: (BACKUP_STATES[i["state"]]["rank"], i["path"]))
+        worst = items[0]["state"] if items else "ok"
+        servers.append({
+            "name": name, "items": items, "state": worst,
+            "size_gb": sum(i["size_gb"] for i in items),
+            "counts": {key: sum(1 for i in items if i["state"] == key)
+                       for key in ("crit", "warn", "ok")},
+        })
+    servers.sort(key=lambda s: (BACKUP_STATES[s["state"]]["rank"],
+                                -s["counts"]["crit"], s["name"].lower()))
+    return {"servers": servers, "totals": totals, "size_gb": size_gb}
+
+
+# Насколько старой должна быть сводка журналов, чтобы это стоило подписать.
+# Монитор читает их раз в час, поэтому «час с небольшим» — норма.
+LOG_STALE_MINUTES = 150
+
+
+def _size_text(gb: float) -> str:
+    gb = float(gb or 0)
+    if gb >= 1024:
+        return f"{gb / 1024:.2f} ТБ"
+    if gb >= 1:
+        return f"{gb:.1f} ГБ"
+    return f"{gb * 1024:.0f} МБ" if gb else "—"
 
 
 # ─── Отрисовка ───────────────────────────────────────────────
@@ -260,6 +399,33 @@ def _tint(color: str, alpha: str) -> str:
     return f"{color}{alpha}"
 
 
+SOURCE_TITLES = {"win": "📜 Windows", "sql": "🗄 SQL"}
+
+
+def _log_badges(server: dict) -> str:
+    """Строка «что в журналах» внутри карточки сервера: сколько и чего за
+    сутки. Разбор по записям — на вкладках, здесь только повод туда пойти."""
+    parts = []
+    for source in ("win", "sql"):
+        groups = (server.get("logs") or {}).get(source) or []
+        if not groups:
+            continue
+        group = groups[0]
+        if group.get("error") and not group["events"]:
+            parts.append(
+                f'<span class="lb" style="--c:{STATUS_WARN}">{SOURCE_TITLES[source]}: '
+                f'<b>сбор не удался</b></span>')
+            continue
+        hot = [c for c in group["categories"] if c["count"]]
+        if not hot:
+            continue
+        color = STATUS_CRIT if group["level"] == "crit" else STATUS_WARN
+        listed = " · ".join(f'<b>{c["count"]}</b> {c["label"]}' for c in hot[:2])
+        parts.append(f'<span class="lb" style="--c:{color}">'
+                     f'{SOURCE_TITLES[source]}: {listed}</span>')
+    return f'<div class="badges">{"".join(parts)}</div>' if parts else ""
+
+
 def _card(server: dict) -> str:
     state = STATUSES[server["state"]]
     name = html.escape(server["name"])
@@ -296,6 +462,7 @@ def _card(server: dict) -> str:
         f'</div><div class="desc">{" · ".join(meta)}</div></div>',
         '</summary>',
         '<div class="more">',
+        _log_badges(server),
     ]
 
     if server["problems"]:
@@ -456,9 +623,204 @@ details[open] .chev{transform:rotate(90deg)}
 .kv{display:flex;gap:8px;padding:3px 0;font-size:12.5px;color:var(--ink-2)}
 .kv b{margin-left:auto;font-weight:600;color:var(--ink)}
 footer{margin-top:18px;text-align:center;font-size:11.5px;line-height:1.6;color:var(--ink-3)}
+
+/* ─── Вкладки: те же radio + :checked, что у фильтра ─────────── */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:14px;overflow-x:auto}
+.tabs label{flex:none;cursor:pointer;font-size:13.5px;color:var(--ink-3);padding:9px 9px;
+  border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;
+  -webkit-user-select:none;user-select:none}
+#v-srv:checked~.wrap label[for="v-srv"],
+#v-win:checked~.wrap label[for="v-win"],
+#v-sql:checked~.wrap label[for="v-sql"],
+#v-bak:checked~.wrap label[for="v-bak"]{color:var(--ink);font-weight:600;border-bottom-color:var(--ink)}
+.pane{display:none}
+#v-srv:checked~.wrap .pane-srv,
+#v-win:checked~.wrap .pane-win,
+#v-sql:checked~.wrap .pane-sql,
+#v-bak:checked~.wrap .pane-bak{display:block}
+.tabs .badge{display:inline-block;min-width:17px;margin-left:5px;padding:0 5px;border-radius:999px;
+  background:var(--bg);color:#fff;font-size:10.5px;font-weight:700;line-height:17px;text-align:center}
+.hint{font-size:11.5px;color:var(--ink-3);margin:-4px 2px 12px}
+/* ─── Карточка журналов и бэкапов ────────────────────────────── */
+.logcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);margin-bottom:10px;overflow:hidden}
+.logcard>summary{display:block;list-style:none;cursor:pointer;padding:12px 13px}
+.logcard>summary::-webkit-details-marker{display:none}
+.loghead{display:flex;align-items:center;gap:7px}
+.loghead .name{font-weight:650;font-size:14.5px;letter-spacing:-.01em;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.loghead .tag{margin-left:auto;flex:none;font-size:11.5px;font-weight:600;padding:4px 9px;
+  border-radius:999px;color:var(--c);background:var(--cbg)}
+.dotc{flex:none;width:8px;height:8px;border-radius:50%;background:var(--c)}
+.cats{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0 0 19px}
+.cat{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:4px 9px;
+  border-radius:8px;background:var(--panel-2);color:var(--ink-2)}
+.cat b{font-weight:700;color:var(--c);font-variant-numeric:tabular-nums}
+.cat.zero{opacity:.45}
+.rows{padding:0 13px 12px;border-top:1px solid var(--line)}
+.lrow{display:flex;gap:9px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.lrow:last-child{border-bottom:0}
+.lrow .t{flex:none;width:82px;color:var(--ink-3);font-variant-numeric:tabular-nums;font-size:11.5px}
+.lrow .m{min-width:0}
+.lrow .m b{display:block;font-weight:600}
+.lrow .m span{display:block;color:var(--ink-3);font-size:11.5px;word-break:break-word}
+.lrow .m i{font-style:normal;color:var(--ink-3);font-size:11px}
+.stale{margin:8px 0 0 19px;font-size:11.5px;color:var(--warn)}
+.badges{display:flex;flex-wrap:wrap;gap:6px;margin:11px 0 4px}
+.lb{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-size:11.5px;
+  padding:4px 9px;border-radius:8px;background:var(--panel-2);color:var(--ink-2)}
+.lb b{color:var(--c);font-weight:700}
+.bpath{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--ink-3);
+  word-break:break-all}
 @media (max-width:430px){.kpis{grid-template-columns:repeat(2,1fr)}}
 @media (prefers-reduced-motion:reduce){.ring .value{transition:none}}
 """
+
+def _when(event_at: str) -> str:
+    """2026-09-01 04:12:33 → 01.09 04:12. Секунды в списке не нужны, а дата
+    нужна: сводка за сутки перешагивает полночь."""
+    text = (event_at or "").strip()
+    if len(text) < 16:
+        return text or "—"
+    return f"{text[8:10]}.{text[5:7]} {text[11:16]}"
+
+
+def _age_since(collected_at) -> str:
+    if not collected_at:
+        return ""
+    delta = datetime.now(timezone.utc) - collected_at
+    return _age_text(max(0.0, delta.total_seconds() / 60))
+
+
+def _log_card(group: dict, source: str) -> str:
+    """Сервер на вкладке журналов: счётчики по категориям, внутри — записи."""
+    color = (STATUS_CRIT if group["level"] == "crit"
+             else STATUS_WARN if group["level"] == "warn" else STATUS_GOOD)
+    tag = (f'{group["total"]} за сутки' if group["total"]
+           else "сбор не удался" if group["error"] else "чисто")
+
+    cats = "".join(
+        f'<span class="cat{"" if c["count"] else " zero"}" '
+        f'style="--c:{STATUS_CRIT if c["level"] == "crit" else STATUS_WARN if c["count"] else STATUS_GOOD}">'
+        f'{c["icon"]} {c["label"]} <b>{c["count"]}</b></span>'
+        for c in group["categories"]
+    )
+
+    rows = []
+    for event in group["events"]:
+        row_color = STATUS_CRIT if event["level"] == "crit" else STATUS_WARN
+        code = f' <i>код {html.escape(event["event_id"])}</i>' if event["event_id"] else ""
+        detail = f'<span>{html.escape(event["detail"])}</span>' if event["detail"] else ""
+        rows.append(
+            f'<div class="lrow"><i class="dotc" style="--c:{row_color};margin-top:5px"></i>'
+            f'<span class="t">{_when(event["event_at"])}</span>'
+            f'<div class="m"><b>{html.escape(event["title"])}{code}</b>{detail}</div></div>'
+        )
+    if group["error"]:
+        rows.insert(0, f'<div class="lrow"><i class="dotc" style="--c:{STATUS_WARN};margin-top:5px"></i>'
+                       f'<span class="t">сбор</span><div class="m">'
+                       f'<b>Журнал прочитан не полностью</b>'
+                       f'<span>{html.escape(group["error"])}</span></div></div>')
+    if not rows:
+        rows.append('<div class="lrow"><div class="m">'
+                    '<span>За сутки записей нет.</span></div></div>')
+    rows.append('<div class="lrow"><div class="m"><span>Полный разбор — '
+                'кнопка в карточке сервера в боте.</span></div></div>')
+
+    stale = ""
+    age = _age_since(group.get("collected_at"))
+    if age and group.get("collected_at"):
+        delta_min = (datetime.now(timezone.utc) - group["collected_at"]).total_seconds() / 60
+        if delta_min > LOG_STALE_MINUTES:
+            stale = f'<div class="stale">◷ данные журналов собраны {age} назад</div>'
+
+    return (
+        f'<details class="logcard"{" open" if group["level"] == "crit" else ""}>'
+        f'<summary><div class="loghead"><i class="dotc" style="--c:{color}"></i>'
+        f'<span class="name">{html.escape(group["server"])}</span>'
+        f'<span class="tag" style="--c:{color};--cbg:{_tint(color, "24")}">{tag}</span></div>'
+        f'<div class="cats">{cats}</div>{stale}</summary>'
+        f'<div class="rows">{"".join(rows)}</div></details>'
+    )
+
+
+def _logs_pane(groups: list, source: str, hint: str) -> str:
+    if not groups:
+        return (f'<div class="pane pane-{source}"><div class="empty" style="display:block">'
+                f'Сводка журналов ещё не собрана. Монитор читает их раз в час — '
+                f'загляните после следующего цикла.</div></div>')
+    body = "".join(_log_card(g, source) for g in groups)
+    return f'<div class="pane pane-{source}"><div class="hint">{hint}</div>{body}</div>'
+
+
+def _backup_card(server: dict) -> str:
+    state = BACKUP_STATES[server["state"]]
+    counts = server["counts"]
+    cats = "".join(
+        f'<span class="cat{"" if counts[key] else " zero"}" style="--c:{BACKUP_STATES[key]["color"]}">'
+        f'{BACKUP_STATES[key]["icon"]} {BACKUP_STATES[key]["label"]} <b>{counts[key]}</b></span>'
+        for key in ("crit", "warn", "ok")
+    )
+
+    rows = []
+    for item in server["items"]:
+        color = BACKUP_STATES[item["state"]]["color"]
+        if item["missing"]:
+            detail = "сбор ни разу не отработал по этому пути"
+        elif item["error"]:
+            detail = f'путь недоступен: {item["error"]}'
+        elif not (item["files"] or 0):
+            detail = "каталог пуст"
+        else:
+            bits = [f'{item["files"]} файлов']
+            if item["age_h"] is not None:
+                bits.append(f'свежий {_age_text(item["age_h"] * 60)} назад')
+            if item["size_gb"]:
+                bits.append(_size_text(item["size_gb"]))
+            if item["free_pct"] is not None and item["free_pct"] < DISK_WARN_FREE:
+                bits.append(f'на диске свободно {item["free_pct"]:.0f}%')
+            detail = " · ".join(bits)
+        rows.append(
+            f'<div class="lrow"><i class="dotc" style="--c:{color};margin-top:5px"></i>'
+            f'<span class="t">{html.escape(item["type"])}</span>'
+            f'<div class="m"><b>{html.escape(detail)}</b>'
+            f'<span class="bpath">{html.escape(item["path"])}</span></div></div>'
+        )
+
+    return (
+        f'<details class="logcard"{" open" if server["state"] == "crit" else ""}>'
+        f'<summary><div class="loghead"><i class="dotc" style="--c:{state["color"]}"></i>'
+        f'<span class="name">{html.escape(server["name"])}</span>'
+        f'<span class="tag" style="--c:{state["color"]};--cbg:{_tint(state["color"], "24")}">'
+        f'{_size_text(server["size_gb"]) if server["size_gb"] else "нет копий"}</span></div>'
+        f'<div class="cats">{cats}</div></summary>'
+        f'<div class="rows">{"".join(rows)}</div></details>'
+    )
+
+
+def _backups_pane(backups: dict) -> str:
+    totals = backups["totals"]
+    if not backups["servers"]:
+        return ('<div class="pane pane-bak"><div class="empty" style="display:block">'
+                'Метрик бэкапов пока нет — дождитесь первого обхода каталогов.</div></div>')
+
+    tiles = "".join(
+        f'<div class="kpi" style="--c:{BACKUP_STATES[key]["color"]}"><b>{totals.get(key, 0)}</b>'
+        f'<span>{label}</span></div>'
+        for key, label in (("crit", "устарели"), ("warn", "на грани"), ("ok", "свежие"))
+    )
+    tiles += (f'<div class="kpi"><b>{_size_text(backups["size_gb"])}</b>'
+              f'<span>всего копий</span></div>')
+
+    body = "".join(_backup_card(server) for server in backups["servers"])
+    return (
+        '<div class="pane pane-bak">'
+        f'<div class="kpis">{tiles}</div>'
+        '<div class="hint">Счётчики — по путям бэкапов, не по серверам. '
+        'Тап по серверу разворачивает все его пути.</div>'
+        f'{body}</div>'
+    )
+
 
 def render_dashboard(data: dict) -> str:
     """Данные → готовый HTML. Отдельно от базы, чтобы тесты проверяли разметку
@@ -520,6 +882,30 @@ def render_dashboard(data: dict) -> str:
     empty = ('<div class="empty">Здоровых серверов нет — все требуют внимания.</div>'
              if not good else "")
 
+    logs = data.get("logs") or {"win": [], "sql": []}
+    backups = data.get("backups") or {"servers": [], "totals": {}, "size_gb": 0}
+    win_hot = sum(1 for g in logs["win"] if g["level"] == "crit")
+    sql_hot = sum(1 for g in logs["sql"] if g["level"] == "crit")
+    bak_hot = backups.get("totals", {}).get("crit", 0)
+
+    tabs = [
+        ("srv", "Серверы", bad, STATUS_CRIT if down else STATUS_SERIOUS),
+        ("win", "Windows", win_hot, STATUS_CRIT),
+        ("sql", "SQL", sql_hot, STATUS_CRIT),
+        ("bak", "Бэкапы", bak_hot, STATUS_CRIT),
+    ]
+    radios += "".join(
+        f'<input class="switch" type="radio" name="v" id="v-{key}"'
+        f'{" checked" if key == "srv" else ""}>'
+        for key, _label, _count, _color in tabs
+    )
+    tabs_html = "".join(
+        f'<label for="v-{key}">{label}'
+        + (f'<span class="badge" style="--bg:{color}">{count}</span>' if count else "")
+        + '</label>'
+        for key, label, count, color in tabs
+    )
+
     return (
         '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
@@ -530,10 +916,19 @@ def render_dashboard(data: dict) -> str:
         f'<div class="sub">{len(servers)} серверов · за {period} · '
         f'сформировано {data["generated_at"]}</div></div>'
         f'<div class="theme">{theme_html}</div></header>'
+        f'<div class="tabs">{tabs_html}</div>'
+        '<div class="pane pane-srv">'
         f'<div class="kpis">{kpi_html}</div>'
         f'<div class="chips">{chips_html}</div>'
-        f'{"".join(_card(s) for s in servers)}{empty}'
-        '<footer>AgentMonitor · автономный HTML-отчёт, работает без сети<br>'
+        f'{"".join(_card(s) for s in servers)}{empty}</div>'
+        + _logs_pane(logs["win"], "win",
+                     "Event Log за сутки: перезагрузки и падения, службы, диски, "
+                     "приложения, отказы входа.")
+        + _logs_pane(logs["sql"], "sql",
+                     "SQL Server за сутки: отказы входа, ошибки копирования "
+                     "и движка, упавшие джобы Agent.")
+        + _backups_pane(backups)
+        + '<footer>AgentMonitor · автономный HTML-отчёт, работает без сети<br>'
         'данные на момент формирования — обновить можно командой /dashboard</footer>'
         '</div></body></html>'
     )
