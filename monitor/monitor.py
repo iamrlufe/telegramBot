@@ -2,6 +2,7 @@ import json
 import time
 import os
 import subprocess
+import tempfile
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,14 @@ RETRY_DELAY = 30       # пауза перед повторной попытко
 RETRY_COUNT = 2        # количество попыток WinRM перед алертом офлайн
 PING_FAIL_THRESHOLD = 15  # сколько подряд неудачных пингов = сервер упал
 MAX_PARALLEL_CHECKS = 5   # сколько серверов опрашиваем одновременно
+
+# Пинг — чистое ожидание ответа, поэтому потоков берём больше, чем на полный
+# опрос: недоступный хост стоит до 4 секунд, и в один поток цикл из десятка
+# серверов переставал укладываться в PING_INTERVAL. А значит, и порог
+# PING_FAIL_THRESHOLD переставал означать обещанные 7,5 минут — падение
+# замечалось позже, чем задумано.
+MAX_PARALLEL_PINGS = 16
+
 SERVERS_FILE = "/app/config/servers.json"
 
 DISK_STATE_FILE = "/app/data/disk_alert_state.json"
@@ -66,6 +75,25 @@ HEARTBEAT_FILE = "/app/data/heartbeat"
 SELF_REPORT_STATE_FILE = "/app/data/self_report_state.json"
 
 RETAIN_DAYS = 30
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        print(f"[monitor] Некорректный {name}, использую {default}", flush=True)
+        return default
+
+
+# Как часто обходить каталоги бэкапов. Копия появляется раз в сутки, а обход
+# каталога на NAS — это удалённая сессия на каждый путь и десятки тысяч файлов
+# в выдаче; делать это каждые 5 минут значит греть хранилище и писать в базу
+# 288 одинаковых замеров в сутки на каждый путь. 0 — как раньше, каждый цикл.
+BACKUP_SCAN_MINUTES = _int_env("BACKUP_SCAN_MINUTES", 30)
+
+# Момент последнего обхода бэкапов (monotonic). None — ещё не было: первый
+# цикл после старта собирает метрики сразу, ждать полчаса незачем.
+_last_backup_scan = None
 
 # Ежедневный отчёт «монитор жив»: час по Алматы. Пусто в .env — выключено.
 SELF_REPORT_HOUR = os.getenv("SELF_REPORT_HOUR", "9").strip()
@@ -80,12 +108,27 @@ _ping_lock = threading.Lock()
 
 
 def touch_heartbeat():
-    """Обновляет файл-пульс: docker healthcheck проверяет его свежесть."""
+    """Обновляет файл-пульс: docker healthcheck проверяет его свежесть.
+
+    Вызывается не только в конце цикла, но и по ходу — после каждого
+    опрошенного сервера. Иначе долгий, но живой цикл (десяток серверов с
+    таймаутами плюс обход бэкапов) выглядел для healthcheck зависшим.
+
+    Запись через временный файл: пульс трогают несколько потоков сразу, и
+    оборванная запись оставила бы пустой файл — то есть ложную тревогу."""
+    tmp = None
     try:
-        with open(HEARTBEAT_FILE, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(HEARTBEAT_FILE))
+        with os.fdopen(fd, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
+        os.replace(tmp, HEARTBEAT_FILE)
     except OSError as e:
         print(f"[monitor] Не удалось обновить heartbeat: {e}", flush=True)
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def ping_host(host: str) -> bool:
@@ -106,23 +149,53 @@ def load_servers() -> list:
         return json.load(f)
 
 
-def try_check_server(server: dict) -> dict:
-    name = server["name"]
-    last_error = None
+def run_server_checks(servers: list) -> dict:
+    """Опрос серверов пулом потоков; неудачные повторяются отдельным проходом.
+
+    Раньше повтор жил внутри воркера: поток засыпал на RETRY_DELAY, не
+    отпуская слот пула. Один сервер с живым ping и сломанным WinRM держал
+    пятую часть параллелизма полминуты, а при нескольких таких очередь
+    вставала. Теперь пауза одна на весь проход и берётся между проходами.
+
+    Возвращает {имя сервера: "online" | "offline"}.
+    """
+    pending = list(servers)
+    outcomes = {}
 
     for attempt in range(1, RETRY_COUNT + 1):
-        try:
-            return check_server(server)
-        except Exception as e:
-            last_error = e
-            if attempt < RETRY_COUNT:
-                print(f"  ⚠️ {name}: попытка {attempt}/{RETRY_COUNT} не удалась: {e}", flush=True)
-                print(f"  ⏳ {name}: повтор через {RETRY_DELAY} сек...", flush=True)
-                time.sleep(RETRY_DELAY)
-            else:
-                print(f"  ❌ Все {RETRY_COUNT} попытки исчерпаны для {name}", flush=True)
+        # На последней попытке process_server уже шлёт алерт офлайна
+        final = attempt == RETRY_COUNT
 
-    raise last_error
+        def check(server, final=final):
+            outcome = process_server(server, final=final)
+            # Пульс по ходу дела: цикл из десятка серверов с таймаутами живой,
+            # но длинный, и без этого healthcheck считал бы его зависшим
+            touch_heartbeat()
+            return outcome
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHECKS) as pool:
+            results = list(pool.map(check, pending))
+
+        retry = []
+        for server, outcome in zip(pending, results):
+            if outcome == "retry":
+                retry.append(server)
+            else:
+                outcomes[server["name"]] = outcome
+
+        pending = retry
+        if not pending:
+            break
+
+        names = ", ".join(server["name"] for server in pending)
+        print(
+            f"  ⏳ Повтор через {RETRY_DELAY} сек "
+            f"(попытка {attempt + 1}/{RETRY_COUNT}): {names}",
+            flush=True
+        )
+        time.sleep(RETRY_DELAY)
+
+    return outcomes
 
 
 def maybe_cleanup():
@@ -159,10 +232,17 @@ def run_ping_cycle():
         print(f"[ping] Не могу прочитать {SERVERS_FILE}: {e}", flush=True)
         return
 
-    for server in servers:
+    if not servers:
+        return
+
+    # Сначала пингуем все хосты разом, потом разбираем результаты по очереди:
+    # решения об алертах остаются в одном потоке, как и раньше.
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PINGS, len(servers))) as pool:
+        alive_flags = list(pool.map(lambda s: ping_host(s["host"]), servers))
+
+    for server, is_alive in zip(servers, alive_flags):
         name = server["name"]
         host = server["host"]
-        is_alive = ping_host(host)
 
         # Решение принимаем под блокировкой, медленный I/O (БД, Telegram) — вне её
         action = None
@@ -209,8 +289,12 @@ def ping_loop():
         time.sleep(PING_INTERVAL)
 
 
-def process_server(server: dict):
-    """Полная проверка одного сервера (выполняется в пуле потоков)."""
+def process_server(server: dict, final: bool = True):
+    """Полная проверка одного сервера (выполняется в пуле потоков).
+
+    final=False — это не последняя попытка: неудача возвращается как "retry",
+    без записи статуса и алерта, и сервер уходит в следующий проход.
+    """
     name = server["name"]
     host = server["host"]
     print(f"[monitor] Проверяю: {name} ({host})", flush=True)
@@ -232,7 +316,7 @@ def process_server(server: dict):
             print(f"[monitor] Пинг не прошёл {name}, пропускаю WinRM", flush=True)
             return "offline"
 
-        info = try_check_server(server)
+        info = check_server(server)
 
         # Замеры пишем одной вставкой до проверок, а не по диску внутри цикла:
         # прогноз заполнения читает историю из БД и должен видеть текущий замер,
@@ -358,6 +442,9 @@ def process_server(server: dict):
 
     except Exception as e:
         error_str = str(e)
+        if not final:
+            print(f"  ⚠️ {name}: попытка не удалась: {error_str}", flush=True)
+            return "retry"
         status = parse_status(error_str)
         print(f"[monitor] ОФЛАЙН {name}: {status}", flush=True)
         save_server_status(name, status, error=error_str)
@@ -425,6 +512,35 @@ def save_json_safe(path: str, data: dict):
         print(f"[monitor] Не удалось записать {path}: {e}", flush=True)
 
 
+def backup_scan_due(now: float, last: float) -> bool:
+    """Пора ли обходить каталоги бэкапов. Вынесено отдельно ради теста:
+    решение зависит только от времени, а не от состояния монитора."""
+    if BACKUP_SCAN_MINUTES <= 0:
+        return True
+    if last is None:
+        return True
+    return now - last >= BACKUP_SCAN_MINUTES * 60
+
+
+def maybe_run_backup_cycle():
+    """Обход каталогов бэкапов — раз в BACKUP_SCAN_MINUTES, а не каждый цикл.
+
+    Опрос серверов имеет смысл частым: диск заполняется, служба падает
+    в любую минуту. Копия же появляется раз в сутки, а её поиск — это
+    удалённая сессия и обход каталога с десятками тысяч файлов.
+    """
+    global _last_backup_scan
+    now = time.monotonic()
+    if not backup_scan_due(now, _last_backup_scan):
+        left = round((BACKUP_SCAN_MINUTES * 60 - (now - _last_backup_scan)) / 60)
+        print(f"[backup] Пропускаю обход: следующий через ~{left} мин", flush=True)
+        return False
+
+    _last_backup_scan = now
+    run_backup_cycle(on_progress=touch_heartbeat)
+    return True
+
+
 def run_cycle():
     # Утро после тихих часов: отправляем накопленные некритичные алерты
     try:
@@ -458,8 +574,7 @@ def run_cycle():
 
     # Серверы опрашиваются параллельно: один недоступный сервер
     # (таймауты + ретраи) не задерживает проверку остальных.
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHECKS) as pool:
-        outcomes = list(pool.map(process_server, servers))
+    outcomes = list(run_server_checks(servers).values())
 
     online = sum(1 for o in outcomes if o == "online")
     offline = sum(1 for o in outcomes if o == "offline")
@@ -475,7 +590,7 @@ def run_cycle():
     # битая запись в конфиге) раньше пробивался наружу через run_cycle()
     # и завершал процесс монитора целиком — вместе с ping-циклом.
     try:
-        run_backup_cycle()
+        maybe_run_backup_cycle()
     except Exception as e:
         print(f"[monitor] Ошибка сбора метрик бэкапов: {e}", flush=True)
 

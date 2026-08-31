@@ -49,6 +49,21 @@ def compact_ps(script: str) -> str:
     )
 
 
+def ps_encoded_length(script: str) -> int:
+    """Длина скрипта в том виде, в каком его получит WinRM."""
+    return len(base64.b64encode(compact_ps(script).encode("utf_16_le")))
+
+
+def ps_fits(script: str) -> bool:
+    """Влезет ли скрипт в командную строку WinRM.
+
+    Нужна тем, кто собирает один скрипт из нескольких заданий (обход сразу
+    всех каталогов бэкапов одного сервера): пакет режется на части заранее,
+    а не падает с «The command line is too long» уже на сервере.
+    """
+    return ps_encoded_length(script) <= MAX_PS_COMMAND_CHARS
+
+
 def run_ps(host: str, script: str, username: str = None, password: str = None,
            operation_timeout_sec: int = 120, read_timeout_sec: int = 180) -> str:
     """
@@ -62,8 +77,8 @@ def run_ps(host: str, script: str, username: str = None, password: str = None,
     username = username or os.getenv("WINRM_USERNAME")
     password = password or os.getenv("WINRM_PASSWORD")
 
+    encoded_len = ps_encoded_length(script)
     script = compact_ps(script)
-    encoded_len = len(base64.b64encode(script.encode("utf_16_le")))
     if encoded_len > MAX_PS_COMMAND_CHARS:
         raise Exception(
             f"PowerShell-скрипт слишком длинный для WinRM: {encoded_len} из "

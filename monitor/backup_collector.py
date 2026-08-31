@@ -7,8 +7,9 @@ monitor/backup_collector.py
 import json
 import os
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from winrm_client import run_ps
+from winrm_client import ps_fits, run_ps
 from linux_check import run_ssh
 from server_check import server_type
 from alerts import (
@@ -96,90 +97,101 @@ from pgconn import get_conn
 
 # ─── WinRM: метрики папки бэкапов ────────────────────────────
 
-def collect_backup_path(host: str, backup_path: str, backup_type: str,
-                         username: str = None, password: str = None) -> dict:
-    """
-    Возвращает метрики папки бэкапов через PowerShell.
-    """
-    exts = EXTENSIONS.get(backup_type, [])
-    ext_filter = ""
-    if exts:
-        conditions = " -or ".join(f'$_.Extension -eq "{e}"' for e in exts)
-        ext_filter = f"| Where-Object {{ {conditions} }}"
+def _ps_scan_script(items_json: str) -> str:
+    """PowerShell, считающий метрики сразу нескольких каталогов за один вызов.
 
-    path_json = json.dumps(backup_path).replace("'", "''")
-    script = f"""
-    $path = '{path_json}' | ConvertFrom-Json
-    $extFilter = $true
+    items_json — [{"Index": 0, "Path": "...", "Exts": [".bak"]}, ...].
+    Пути и расширения передаются данными, а не подстановкой в код: путь
+    может содержать кавычки, а скрипт от этого не должен разъезжаться.
 
-    if (-not (Test-Path -LiteralPath $path)) {{
-        @{{ Error = "Path not found" }} | ConvertTo-Json
-        return
+    Скрипт нарочно короткий: командная строка WinRM ограничена 8000
+    символами после кодирования, и каждая сотня символов тела — это
+    минус один каталог в пачке (комментарии не в счёт, их снимает
+    compact_ps). Отсюда функции-сокращения и одна общая заготовка ответа
+    вместо двух почти одинаковых.
+    """
+    payload = items_json.replace("'", "''")
+    return f"""
+    $items = '{payload}' | ConvertFrom-Json
+    $drives = @(Get-PSDrive -PSProvider FileSystem)
+    function U($f) {{ if ($f) {{ $f.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss") }} else {{ $null }} }}
+    function GB($n) {{ [math]::Round($n / 1GB, 3) }}
+    $out = @()
+
+    foreach ($item in $items) {{
+        $path = $item.Path
+        $r = @{{ Index = $item.Index; FileCount = 0; TotalGB = 0; OldestFile = $null;
+                NewestFile = $null; NewestFileGB = $null; LogCount = 0; LogNewest = $null;
+                FullCount = 0; FullNewest = $null; FullNewestGB = $null;
+                DiskTotalGB = 0; DiskFreeGB = 0 }}
+        try {{
+            if (-not (Test-Path -LiteralPath $path)) {{
+                $out += @{{ Index = $item.Index; Error = "Path not found" }}
+                continue
+            }}
+            $disk = $drives | Where-Object {{ $path.StartsWith($_.Root, "OrdinalIgnoreCase") }} | Select-Object -First 1
+            if ($disk) {{
+                $r.DiskTotalGB = [math]::Round(($disk.Used + $disk.Free) / 1GB, 2)
+                $r.DiskFreeGB = [math]::Round($disk.Free / 1GB, 2)
+            }}
+            $files = @(Get-ChildItem -LiteralPath $path -Recurse -Force -File -ErrorAction SilentlyContinue)
+            if ($item.Exts) {{ $files = @($files | Where-Object {{ $item.Exts -contains $_.Extension }}) }}
+            if ($files) {{
+                $sorted = $files | Sort-Object LastWriteTime
+                $newest = $sorted | Select-Object -Last 1
+                # Журналы транзакций и полные копии считаем раздельно: иначе свежий
+                # .trn маскирует пропавшую полную копию — общий newest берёт максимум
+                $logs = @($files | Where-Object {{ $_.Extension -eq ".trn" }})
+                $fulls = @($files | Where-Object {{ $_.Extension -ne ".trn" }})
+                $fullNewest = $fulls | Sort-Object LastWriteTime | Select-Object -Last 1
+                $r.FileCount = $files.Count
+                $r.TotalGB = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1GB, 2)
+                $r.OldestFile = U ($sorted | Select-Object -First 1)
+                $r.NewestFile = U $newest
+                $r.NewestFileGB = GB $newest.Length
+                $r.LogCount = $logs.Count
+                $r.LogNewest = U ($logs | Sort-Object LastWriteTime | Select-Object -Last 1)
+                $r.FullCount = $fulls.Count
+                $r.FullNewest = U $fullNewest
+                $r.FullNewestGB = $(if ($fullNewest) {{ GB $fullNewest.Length }} else {{ $null }})
+            }}
+            $out += $r
+        }} catch {{
+            # Ошибка одного каталога (нет прав, отвалилась шара) не должна
+            # отменять остальные: они в этом же вызове
+            $out += @{{ Index = $item.Index; Error = "$($_.Exception.Message)" }}
+        }}
     }}
 
-    $files = @(Get-ChildItem -LiteralPath $path -Recurse -Force -File -ErrorAction SilentlyContinue {ext_filter})
-
-    $disk = Get-PSDrive -PSProvider FileSystem |
-        Where-Object {{ $path.StartsWith($_.Root, [System.StringComparison]::OrdinalIgnoreCase) }} |
-        Select-Object -First 1
-
-    $diskTotal = 0
-    $diskFree  = 0
-    if ($disk) {{
-        $diskTotal = [math]::Round(($disk.Used + $disk.Free) / 1GB, 2)
-        $diskFree  = [math]::Round($disk.Free / 1GB, 2)
-    }}
-
-    if (-not $files) {{
-        @{{
-            FileCount  = 0
-            TotalGB    = 0
-            OldestFile = $null
-            NewestFile = $null
-            NewestFileGB = $null
-            LogCount   = 0
-            LogNewest  = $null
-            FullCount  = 0
-            FullNewest = $null
-            FullNewestGB = $null
-            DiskTotalGB = $diskTotal
-            DiskFreeGB  = $diskFree
-        }} | ConvertTo-Json
-        return
-    }}
-
-    $sorted  = $files | Sort-Object LastWriteTime
-    $oldest  = $sorted | Select-Object -First 1
-    $newest  = $sorted | Select-Object -Last 1
-    $totalGB = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1GB, 2)
-    $newestGB = [math]::Round($newest.Length / 1GB, 3)
-
-    # Журналы транзакций и полные копии считаем раздельно: иначе свежий .trn
-    # маскирует пропавшую полную копию — общий newest_file берёт максимум
-    $logs  = @($files | Where-Object {{ $_.Extension.ToLowerInvariant() -eq ".trn" }})
-    $fulls = @($files | Where-Object {{ $_.Extension.ToLowerInvariant() -ne ".trn" }})
-    $logNewest  = $logs  | Sort-Object LastWriteTime | Select-Object -Last 1
-    $fullNewest = $fulls | Sort-Object LastWriteTime | Select-Object -Last 1
-
-    @{{
-        FileCount   = $files.Count
-        TotalGB     = $totalGB
-        OldestFile  = $oldest.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-        NewestFile  = $newest.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-        NewestFileGB = $newestGB
-        LogCount    = $logs.Count
-        LogNewest   = $(if ($logNewest) {{ $logNewest.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss") }} else {{ $null }})
-        FullCount   = $fulls.Count
-        FullNewest  = $(if ($fullNewest) {{ $fullNewest.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss") }} else {{ $null }})
-        FullNewestGB = $(if ($fullNewest) {{ [math]::Round($fullNewest.Length / 1GB, 3) }} else {{ $null }})
-        DiskTotalGB = $diskTotal
-        DiskFreeGB  = $diskFree
-    }} | ConvertTo-Json
+    ConvertTo-Json @($out) -Depth 4 -Compress
     """
 
-    result = run_ps(host, script, username, password)
-    data = json.loads(result)
 
+def _ps_items_json(targets: list) -> str:
+    return json.dumps([
+        {"Index": index, "Path": path, "Exts": EXTENSIONS.get(backup_type, [])}
+        for index, (backup_type, path) in enumerate(targets)
+    ], ensure_ascii=False)
+
+
+def _ps_scan_chunks(targets: list) -> list:
+    """Режет список каталогов так, чтобы каждый скрипт влезал в командную
+    строку WinRM (8000 символов после кодирования)."""
+    chunks = []
+    current = []
+    for target in targets:
+        candidate = current + [target]
+        if current and not ps_fits(_ps_scan_script(_ps_items_json(candidate))):
+            chunks.append(current)
+            current = [target]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _parse_ps_metrics(data: dict) -> dict:
     if data.get("Error"):
         raise RuntimeError(data["Error"])
 
@@ -208,6 +220,55 @@ def collect_backup_path(host: str, backup_path: str, backup_type: str,
     }
 
 
+def collect_backup_paths(host: str, targets: list, username: str = None,
+                         password: str = None) -> dict:
+    """Метрики сразу всех каталогов сервера — одной сессией WinRM.
+
+    targets — [(backup_type, backup_path), ...]. Возвращает
+    {(type, path): метрики | Exception}.
+
+    Раньше на каждый каталог открывалась своя сессия: рукопожатие, NTLM,
+    запуск powershell.exe. На сервере с десятком путей постоянные расходы
+    занимали больше времени, чем сам обход каталогов.
+    """
+    results = {}
+    for chunk in _ps_scan_chunks(targets):
+        try:
+            raw = run_ps(host, _ps_scan_script(_ps_items_json(chunk)),
+                         username, password)
+            data = json.loads(raw) if raw else []
+            if isinstance(data, dict):
+                # ConvertTo-Json разворачивает массив из одного элемента
+                data = [data]
+        except Exception as e:
+            # Не достучались вообще — ошибка общая для всей пачки
+            for target in chunk:
+                results[target] = e
+            continue
+
+        by_index = {int(row.get("Index", -1)): row for row in data}
+        for index, target in enumerate(chunk):
+            row = by_index.get(index)
+            if row is None:
+                results[target] = RuntimeError("Сервер не вернул метрики каталога")
+                continue
+            try:
+                results[target] = _parse_ps_metrics(row)
+            except Exception as e:
+                results[target] = e
+    return results
+
+
+def collect_backup_path(host: str, backup_path: str, backup_type: str,
+                         username: str = None, password: str = None) -> dict:
+    """Метрики одного каталога бэкапов через PowerShell."""
+    key = (backup_type, backup_path)
+    result = collect_backup_paths(host, [key], username, password)[key]
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
 # ─── SSH: метрики папки бэкапов (Linux / Synology NAS) ───────
 
 def _sh_quote(value: str) -> str:
@@ -215,16 +276,16 @@ def _sh_quote(value: str) -> str:
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
-def collect_backup_path_ssh(server: dict, backup_path: str, backup_type: str) -> dict:
-    """Те же метрики, что collect_backup_path, но по SSH — для каталогов,
-    лежащих на Linux/NAS (например, Synology, куда копии приезжают по FTP).
+def _ssh_scan_block(backup_path: str, backup_type: str) -> str:
+    """Кусок shell-скрипта, считающий метрики одного каталога.
 
-    Сетевую шару правильнее опрашивать на самом хранилище: подключённый на
-    Windows сетевой диск (Y:, Z:) виден только в сессии того пользователя,
-    который его подключил, и через WinRM недоступен в принципе.
+    Вынесен отдельно, потому что используется дважды: сам по себе (один
+    путь — один вызов) и склеенным в пакет, когда у сервера каталогов
+    много и открывать SSH-сессию на каждый расточительно.
 
-    Считаем в shell (find + stat + awk), наружу отдаём одну JSON-строку —
-    не тащим список файлов целиком, каталог может быть большим."""
+    Считаем прямо в shell (find + stat + awk), наружу отдаём одну
+    JSON-строку — не тащим список файлов целиком, каталог может быть
+    большим."""
     exts = EXTENSIONS.get(backup_type, [])
     if exts:
         conditions = " -o ".join(f"-iname '*{e}'" for e in exts)
@@ -237,9 +298,11 @@ def collect_backup_path_ssh(server: dict, backup_path: str, backup_type: str) ->
     # @eaDir — служебные метаданные Synology, #recycle — корзина шары: без
     # -prune туда бы заходил find, и удалённый бэкап из корзины считался бы
     # живым (завышенный объём и ложно свежий newest_file).
-    script = f"""
+    # Ветка else вместо `exit 0`: в пакете из нескольких каталогов выход
+    # оборвал бы обход на первом же отсутствующем пути.
+    return f"""
 P={path_q}
-if [ ! -d "$P" ]; then echo '{{"Error":"Path not found"}}'; exit 0; fi
+if [ ! -d "$P" ]; then echo '{{"Error":"Path not found"}}'; else
 DISK=$(df -Pk "$P" 2>/dev/null | awk 'NR==2 {{print $2" "$4}}')
 find "$P" \\( -name '@eaDir' -o -name '#recycle' -o -name '.snapshot' \\) -prune \\
     -o -type f {ext_filter} -exec stat -c '%Y %s %n' {{}} + 2>/dev/null | awk -v disk="$DISK" '
@@ -262,13 +325,12 @@ END {{
         c, sum, (oldest == "" ? 0 : oldest), (newest == "" ? 0 : newest), nsize,
         lc, (lnewest == "" ? 0 : lnewest), fc, (fnewest == "" ? 0 : fnewest), fnsize, d[1], d[2]
 }}'
+fi
 """
-    output = run_ssh(
-        server["host"], script,
-        server.get("username"), server.get("password"),
-        port=int(server.get("ssh_port") or 22),
-        key_path=server.get("ssh_key"),
-    )
+
+
+def _parse_ssh_metrics(output: str) -> dict:
+    """JSON от _ssh_scan_block → те же ключи, что отдаёт WinRM-ветка."""
     output = (output or "").strip()
     if not output:
         # find не нашёл ни одного файла — awk не печатает ничего
@@ -304,6 +366,77 @@ END {{
     }
 
 
+def _run_ssh_on_server(server: dict, script: str) -> str:
+    return run_ssh(
+        server["host"], script,
+        server.get("username"), server.get("password"),
+        port=int(server.get("ssh_port") or 22),
+        key_path=server.get("ssh_key"),
+    )
+
+
+def collect_backup_path_ssh(server: dict, backup_path: str, backup_type: str) -> dict:
+    """Те же метрики, что collect_backup_path, но по SSH — для каталогов,
+    лежащих на Linux/NAS (например, Synology, куда копии приезжают по FTP).
+
+    Сетевую шару правильнее опрашивать на самом хранилище: подключённый на
+    Windows сетевой диск (Y:, Z:) виден только в сессии того пользователя,
+    который его подключил, и через WinRM недоступен в принципе."""
+    output = _run_ssh_on_server(server, _ssh_scan_block(backup_path, backup_type))
+    return _parse_ssh_metrics(output)
+
+
+# Маркер между ответами в пакетном обходе. Одна строка на каталог: сам ответ
+# awk печатает без перевода строки, поэтому границы нужны явные.
+SSH_BATCH_MARKER = "###AGENTMON"
+
+
+def collect_backup_paths_ssh(server: dict, targets: list) -> dict:
+    """Метрики сразу всех каталогов сервера за одну SSH-сессию.
+
+    targets — [(backup_type, backup_path), ...]. Возвращает
+    {(type, path): метрики | Exception}: ошибка одного каталога не должна
+    отменять остальные.
+
+    Зачем: на хранилище бэкапов путей бывает полтора десятка, а каждая
+    сессия — это TCP, обмен ключами и аутентификация. Сам обход каталога
+    от этого не ускоряется, но постоянные накладные расходы исчезают.
+    """
+    if not targets:
+        return {}
+
+    blocks = []
+    for index, (backup_type, backup_path) in enumerate(targets):
+        blocks.append(f'echo "{SSH_BATCH_MARKER} {index}"')
+        blocks.append(_ssh_scan_block(backup_path, backup_type))
+        blocks.append("echo")
+    output = _run_ssh_on_server(server, "\n".join(blocks))
+
+    chunks = {}
+    current = None
+    for line in (output or "").splitlines():
+        if line.startswith(SSH_BATCH_MARKER):
+            try:
+                current = int(line.split()[-1])
+            except ValueError:
+                current = None
+            if current is not None:
+                chunks[current] = []
+            continue
+        if current is not None:
+            chunks[current].append(line)
+
+    results = {}
+    for index, (backup_type, backup_path) in enumerate(targets):
+        key = (backup_type, backup_path)
+        raw = "\n".join(chunks.get(index, []))
+        try:
+            results[key] = _parse_ssh_metrics(raw)
+        except Exception as e:
+            results[key] = e
+    return results
+
+
 # ─── Сбои резервного копирования по данным SQL ───────────────
 
 # Окно поиска: сутки. Больше не нужно — алерт шлётся один раз на событие,
@@ -311,7 +444,7 @@ END {{
 BACKUP_FAIL_WINDOW_HOURS = 24
 
 
-def check_mssql_backup_failures(server: dict):
+def check_mssql_backup_failures(server: dict, data: dict = None):
     """Читает ошибки бэкапа из ERRORLOG и истории джоб, шлёт алерт на новые.
 
     Отдельная проверка нужна потому, что файловый мониторинг видит только
@@ -324,7 +457,10 @@ def check_mssql_backup_failures(server: dict):
     )
 
     name = server["name"]
-    data = read_backup_errors(server, hours=BACKUP_FAIL_WINDOW_HOURS)
+    # data передают, когда чтение уже сделано заранее — сбор с серверов идёт
+    # параллельно, а разбор и алерты остаются в один поток
+    if data is None:
+        data = read_backup_errors(server, hours=BACKUP_FAIL_WINDOW_HOURS)
     events = []
 
     for row in data.get("engine", []):
@@ -807,7 +943,297 @@ def _prune_legacy_disk_keys():
               flush=True)
 
 
-def run_backup_cycle():
+MAX_PARALLEL_BACKUP_SERVERS = 4
+
+
+def _has_backup_work(server: dict) -> bool:
+    """Есть ли что собирать. Сетевому устройству доступен только ping, а
+    датастор VMware — не файловая система: каталогов с копиями там нет."""
+    if server_type(server) in ("device", "vmware"):
+        return False
+    return bool(server.get("backups") or server.get("dbsize")
+                or server.get("onec_logs"))
+
+
+def _backup_targets(server: dict) -> list:
+    """Пути бэкапов сервера в разобранном виде: путь + все настройки,
+    которые к нему применяются.
+
+    Приоритет: своё значение у пути > значение у сервера > глобальное.
+    Разбор вынесен из цикла, чтобы сбор метрик (сеть) и разбор с алертами
+    (БД, файлы состояния) могли идти в разных потоках.
+    """
+    server_alert_hours = server.get("backup_alert_hours", BACKUP_ALERT_HOURS)
+    server_size_check = bool(server.get("backup_size_check", False))
+    targets = []
+
+    for backup_type, paths in (server.get("backups") or {}).items():
+        if not isinstance(paths, list):
+            paths = [paths]
+        for path_spec in paths:
+            # Путь — либо просто строка, либо {"path": ..., "alert_hours": ...}
+            # для своего времени алерта на конкретную папку.
+            if isinstance(path_spec, dict):
+                backup_path = path_spec.get("path")
+                path_alert_hours = path_spec.get("alert_hours")
+                path_size_check = path_spec.get("size_check")
+                # Каталог, где рядом с полными копиями лежат журналы .trn
+                path_ignore_logs = bool(path_spec.get("ignore_logs"))
+            else:
+                backup_path = path_spec
+                path_alert_hours = None
+                path_size_check = None
+                path_ignore_logs = False
+
+            if not backup_path:
+                # Путь без "path" (правка servers.json руками мимо валидации)
+                # ронял весь цикл сбора на backup_path.lower() ниже
+                targets.append({"type": backup_type, "path": None})
+                continue
+
+            size_check = (path_size_check if path_size_check is not None
+                          else server_size_check)
+            # DIFF-копии по природе растут неравномерно всю неделю (после
+            # очередного FULL резко "сбрасываются") — сравнение размера
+            # с историей там даёт ложные срабатывания, поэтому не проверяем
+            # вообще, независимо от настройки size_check.
+            if "diff" in backup_path.lower():
+                size_check = False
+
+            targets.append({
+                "type": backup_type,
+                "path": backup_path,
+                "alert_hours": (path_alert_hours if path_alert_hours is not None
+                                else server_alert_hours),
+                "size_check": size_check,
+                "ignore_logs": path_ignore_logs,
+                "schedule": path_schedule(path_spec),
+            })
+    return targets
+
+
+def _onec_targets(server: dict) -> list:
+    logs = server.get("onec_logs") or []
+    if isinstance(logs, dict):
+        logs = [logs]
+    targets = []
+    for log_spec in logs:
+        if isinstance(log_spec, str):
+            targets.append({"name": "1C log", "path": log_spec,
+                            "warn_gb": ONEC_LOG_WARN_GB, "crit_gb": ONEC_LOG_CRIT_GB})
+            continue
+        log_path = log_spec.get("path")
+        if not log_path:
+            continue
+        targets.append({
+            "name": log_spec.get("name") or "1C log",
+            "path": log_path,
+            "warn_gb": float(log_spec.get("warn_gb", ONEC_LOG_WARN_GB)),
+            "crit_gb": float(log_spec.get("crit_gb", ONEC_LOG_CRIT_GB)),
+        })
+    return targets
+
+
+def collect_server_backups(server: dict) -> dict:
+    """Удалённая часть сбора: опрос сервера и ничего больше.
+
+    Ни записи в БД, ни файлов состояния алертов здесь нет намеренно.
+    Серверы опрашиваются параллельно, а состояние алертов — общий JSON,
+    который читается и переписывается целиком: параллельная запись
+    потеряла бы чужие ключи. Поэтому разбор идёт отдельным шагом,
+    в один поток (apply_server_backups).
+    """
+    kind = server_type(server)
+    host = server["host"]
+    collected = {
+        "server": server,
+        "kind": kind,
+        "targets": _backup_targets(server),
+        "metrics": {},
+        "db_sizes": None,
+        "db_sizes_error": None,
+        "backup_errors": None,
+        "backup_errors_error": None,
+        "onec": [],
+    }
+
+    pairs = [(t["type"], t["path"]) for t in collected["targets"] if t["path"]]
+    if pairs:
+        try:
+            if kind == "linux":
+                collected["metrics"] = collect_backup_paths_ssh(server, pairs)
+            else:
+                collected["metrics"] = collect_backup_paths(
+                    host, pairs, server.get("username"), server.get("password")
+                )
+        except Exception as e:
+            # Сервер не отвечает вовсе — ошибка общая для всех его каталогов
+            collected["metrics"] = {pair: e for pair in pairs}
+
+    # Размеры MSSQL баз и журналы 1С — только Windows (Invoke-Sqlcmd,
+    # PowerShell). На Linux/NAS их просто нет.
+    if kind == "linux":
+        return collected
+
+    if server.get("dbsize"):
+        try:
+            collected["db_sizes"] = collect_mssql_sizes(
+                host, server.get("username"), server.get("password")
+            )
+        except Exception as e:
+            collected["db_sizes_error"] = e
+
+        # Сбои резервного копирования по данным самого SQL. Файловая
+        # проверка ловит только отсутствие свежей копии — и лишь через
+        # backup_alert_hours; здесь причина видна в ту же ночь.
+        try:
+            from mssql_log import read_backup_errors
+            collected["backup_errors"] = read_backup_errors(
+                server, hours=BACKUP_FAIL_WINDOW_HOURS
+            )
+        except Exception as e:
+            collected["backup_errors_error"] = e
+
+    for log in _onec_targets(server):
+        try:
+            metrics = collect_onec_log_path(
+                host, log["path"], server.get("username"), server.get("password")
+            )
+            collected["onec"].append((log, metrics))
+        except Exception as e:
+            collected["onec"].append((log, e))
+
+    return collected
+
+
+def apply_server_backups(collected: dict):
+    """Разбор собранного: запись в БД, алерты, вывод в лог. Один поток."""
+    server = collected["server"]
+    name = server["name"]
+    kind = collected["kind"]
+
+    print(f"[backup] Проверяю: {name} ({server['host']})", flush=True)
+
+    for target in collected["targets"]:
+        backup_type, backup_path = target["type"], target["path"]
+        if not backup_path:
+            print(f"  ⚠️ {name}: в backups.{backup_type} есть запись без пути "
+                  f"— пропускаю", flush=True)
+            continue
+
+        # Недельное расписание — отдельная проверка по истории из БД,
+        # не зависит от успеха текущего опроса (важно, если сервер offline).
+        if target["schedule"]:
+            try:
+                _check_weekly_schedule_alert(
+                    name, backup_type, backup_path,
+                    target["schedule"][0], target["schedule"][1]
+                )
+            except Exception as e:
+                print(f"  ❌ weekly schedule {backup_type} {backup_path}: {e}", flush=True)
+
+        metrics = collected["metrics"].get((backup_type, backup_path))
+        if metrics is None:
+            metrics = RuntimeError("Метрики не собраны")
+
+        if isinstance(metrics, Exception):
+            save_backup_metric(
+                name, backup_type, backup_path,
+                {
+                    "file_count": None,
+                    "oldest_file": None,
+                    "newest_file": None,
+                    "total_size_gb": None,
+                    "disk_total_gb": None,
+                    "disk_free_gb": None,
+                },
+                status="error",
+                error=str(metrics),
+            )
+            print(f"  ❌ {backup_type} {backup_path}: {metrics}", flush=True)
+            continue
+
+        save_backup_metric(name, backup_type, backup_path, metrics, status="ok")
+        _check_backup_alerts(
+            name, backup_type, backup_path, metrics,
+            target["alert_hours"], target["size_check"],
+            weekly_scheduled=bool(target["schedule"]),
+            ignore_logs=target["ignore_logs"],
+        )
+        print(
+            f"  [{backup_type}] {backup_path}: "
+            f"{metrics['file_count']} файлов, "
+            f"{metrics['total_size_gb']} ГБ, "
+            f"диск свободно: {metrics['disk_free_gb']} ГБ",
+            flush=True
+        )
+
+    if kind == "linux":
+        if server.get("dbsize"):
+            print(f"  ⏭ {name}: dbsize только для Windows, пропускаю", flush=True)
+        if server.get("onec_logs"):
+            print(f"  ⏭ {name}: журналы 1С только для Windows, пропускаю", flush=True)
+        return
+
+    if server.get("dbsize"):
+        if collected["db_sizes_error"]:
+            print(f"  ❌ MSSQL dbsize: {collected['db_sizes_error']}", flush=True)
+        elif collected["db_sizes"] is not None:
+            save_db_sizes(name, collected["db_sizes"])
+            print(f"  🗄 MSSQL: {len(collected['db_sizes'])} баз", flush=True)
+
+        if collected["backup_errors_error"]:
+            print(f"  ❌ MSSQL backup errors: {collected['backup_errors_error']}",
+                  flush=True)
+        elif collected["backup_errors"] is not None:
+            try:
+                check_mssql_backup_failures(server, data=collected["backup_errors"])
+            except Exception as e:
+                print(f"  ❌ MSSQL backup errors: {e}", flush=True)
+
+    for log, metrics in collected["onec"]:
+        if isinstance(metrics, Exception):
+            save_onec_log_metric(
+                name, log["name"], log["path"],
+                {"total_size_gb": None, "file_count": None,
+                 "oldest_file": None, "newest_file": None},
+                status="error", error=str(metrics),
+            )
+            print(f"  ❌ 1C log {log['path']}: {metrics}", flush=True)
+            continue
+
+        save_onec_log_metric(name, log["name"], log["path"], metrics)
+        _check_onec_log_alerts(name, log["name"], log["path"], metrics,
+                               log["warn_gb"], log["crit_gb"])
+        print(
+            f"  📒 1C log {log['path']}: "
+            f"{metrics['total_size_gb']} ГБ, {metrics['file_count']} файлов",
+            flush=True
+        )
+
+
+def _collect_safe(server: dict) -> dict:
+    """Сбор одного сервера в потоке: своя авария не должна ронять пул."""
+    try:
+        return collect_server_backups(server)
+    except Exception as e:
+        print(f"[backup] ❌ {server.get('name')}: сбор не выполнен: {e}", flush=True)
+        return {"server": server, "kind": server_type(server), "targets": [],
+                "metrics": {}, "db_sizes": None, "db_sizes_error": e,
+                "backup_errors": None, "backup_errors_error": e, "onec": []}
+
+
+def run_backup_cycle(on_progress=None):
+    """Обход каталогов бэкапов: серверы опрашиваются параллельно, разбор
+    и алерты идут по очереди.
+
+    Раньше цикл был полностью последовательным, и на каждый путь открывалась
+    своя сессия WinRM/SSH: полсотни рукопожатий подряд занимали больше
+    времени, чем сам обход каталогов.
+
+    on_progress вызывается после каждого разобранного сервера — монитор
+    обновляет им heartbeat, чтобы долгий обход не выглядел зависшим.
+    """
     _prune_legacy_disk_keys()
     try:
         servers = load_servers()
@@ -815,186 +1241,21 @@ def run_backup_cycle():
         print(f"[backup] Не могу прочитать {SERVERS_FILE}: {e}", flush=True)
         return
 
-    for server in servers:
-        name = server["name"]
-        host = server["host"]
-        backups = server.get("backups", {})
-        dbsize = server.get("dbsize", False)
-        onec_logs = server.get("onec_logs", [])
-        alert_hours = server.get("backup_alert_hours", BACKUP_ALERT_HOURS)
-        size_check_default = bool(server.get("backup_size_check", False))
+    work = [server for server in servers if _has_backup_work(server)]
+    if not work:
+        print("[backup] Цикл завершён", flush=True)
+        return
 
-        if not backups and not dbsize and not onec_logs:
-            continue
-
-        kind = server_type(server)
-        if kind in ("device", "vmware"):
-            # Сетевому устройству доступен только ping, а датастор VMware —
-            # не файловая система: каталогов с копиями там нет.
-            continue
-
-        print(f"[backup] Проверяю: {name} ({host})", flush=True)
-
-        # Собираем метрики по каждому типу и пути
-        for backup_type, paths in backups.items():
-            if not isinstance(paths, list):
-                paths = [paths]
-            for path_spec in paths:
-                # Путь — либо просто строка, либо {"path": ..., "alert_hours": ...}
-                # для своего времени алерта на конкретную папку (иначе — время сервера).
-                if isinstance(path_spec, dict):
-                    backup_path = path_spec.get("path")
-                    path_alert_hours = path_spec.get("alert_hours")
-                    path_size_check = path_spec.get("size_check")
-                    # Каталог, где рядом с полными копиями лежат журналы .trn
-                    path_ignore_logs = bool(path_spec.get("ignore_logs"))
-                else:
-                    backup_path = path_spec
-                    path_alert_hours = None
-                    path_size_check = None
-                    path_ignore_logs = False
-
-                # Путь без "path" (правка servers.json руками мимо валидации)
-                # ронял весь цикл сбора на backup_path.lower() ниже
-                if not backup_path:
-                    print(f"  ⚠️ {name}: в backups.{backup_type} есть запись без пути "
-                          f"— пропускаю", flush=True)
-                    continue
-
-                schedule = path_schedule(path_spec)
-                effective_alert_hours = (
-                    path_alert_hours if path_alert_hours is not None else alert_hours
-                )
-                effective_size_check = (
-                    path_size_check if path_size_check is not None else size_check_default
-                )
-                # DIFF-копии по природе растут неравномерно всю неделю (после
-                # очередного FULL резко "сбрасываются") — сравнение размера
-                # с историей там даёт ложные срабатывания, поэтому не проверяем
-                # вообще, независимо от настройки size_check.
-                if "diff" in backup_path.lower():
-                    effective_size_check = False
-
-                # Недельное расписание — отдельная проверка по истории из БД,
-                # не зависит от успеха текущего опроса (важно, если сервер offline).
-                if schedule:
-                    try:
-                        _check_weekly_schedule_alert(
-                            name, backup_type, backup_path, schedule[0], schedule[1]
-                        )
-                    except Exception as e:
-                        print(f"  ❌ weekly schedule {backup_type} {backup_path}: {e}", flush=True)
-
-                try:
-                    if kind == "linux":
-                        metrics = collect_backup_path_ssh(server, backup_path, backup_type)
-                    else:
-                        metrics = collect_backup_path(
-                            host, backup_path, backup_type,
-                            server.get("username"), server.get("password")
-                        )
-                    save_backup_metric(name, backup_type, backup_path, metrics, status="ok")
-                    _check_backup_alerts(
-                        name, backup_type, backup_path, metrics,
-                        effective_alert_hours, effective_size_check,
-                        weekly_scheduled=bool(schedule),
-                        ignore_logs=path_ignore_logs,
-                    )
-                    print(
-                        f"  [{backup_type}] {backup_path}: "
-                        f"{metrics['file_count']} файлов, "
-                        f"{metrics['total_size_gb']} ГБ, "
-                        f"диск свободно: {metrics['disk_free_gb']} ГБ",
-                        flush=True
-                    )
-                except Exception as e:
-                    save_backup_metric(
-                        name,
-                        backup_type,
-                        backup_path,
-                        {
-                            "file_count": None,
-                            "oldest_file": None,
-                            "newest_file": None,
-                            "total_size_gb": None,
-                            "disk_total_gb": None,
-                            "disk_free_gb": None,
-                        },
-                        status="error",
-                        error=str(e),
-                    )
-                    print(f"  ❌ {backup_type} {backup_path}: {e}", flush=True)
-
-        # Размеры MSSQL баз и журналы 1С — только Windows (Invoke-Sqlcmd,
-        # PowerShell). На Linux/NAS их просто нет, молча пропускаем.
-        if kind == "linux":
-            if dbsize:
-                print(f"  ⏭ {name}: dbsize только для Windows, пропускаю", flush=True)
-            if onec_logs:
-                print(f"  ⏭ {name}: журналы 1С только для Windows, пропускаю", flush=True)
-            continue
-
-        # Размеры MSSQL баз
-        if dbsize:
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_PARALLEL_BACKUP_SERVERS, len(work))
+    ) as pool:
+        for collected in pool.map(_collect_safe, work):
             try:
-                sizes = collect_mssql_sizes(
-                    host,
-                    server.get("username"),
-                    server.get("password")
-                )
-                save_db_sizes(name, sizes)
-                print(f"  🗄 MSSQL: {len(sizes)} баз", flush=True)
+                apply_server_backups(collected)
             except Exception as e:
-                print(f"  ❌ MSSQL dbsize: {e}", flush=True)
-
-            # Сбои резервного копирования по данным самого SQL. Файловая
-            # проверка ловит только отсутствие свежей копии — и лишь через
-            # backup_alert_hours; здесь причина видна в ту же ночь.
-            try:
-                check_mssql_backup_failures(server)
-            except Exception as e:
-                print(f"  ❌ MSSQL backup errors: {e}", flush=True)
-
-        # Размеры журналов регистрации 1С
-        if isinstance(onec_logs, dict):
-            onec_logs = [onec_logs]
-        for log_spec in onec_logs:
-            if isinstance(log_spec, str):
-                log_name = "1C log"
-                log_path = log_spec
-                warn_gb = ONEC_LOG_WARN_GB
-                crit_gb = ONEC_LOG_CRIT_GB
-            else:
-                log_name = log_spec.get("name") or "1C log"
-                log_path = log_spec.get("path")
-                warn_gb = float(log_spec.get("warn_gb", ONEC_LOG_WARN_GB))
-                crit_gb = float(log_spec.get("crit_gb", ONEC_LOG_CRIT_GB))
-
-            if not log_path:
-                continue
-
-            try:
-                metrics = collect_onec_log_path(
-                    host,
-                    log_path,
-                    server.get("username"),
-                    server.get("password")
-                )
-                save_onec_log_metric(name, log_name, log_path, metrics)
-                _check_onec_log_alerts(name, log_name, log_path, metrics, warn_gb, crit_gb)
-                print(
-                    f"  📒 1C log {log_path}: "
-                    f"{metrics['total_size_gb']} ГБ, {metrics['file_count']} файлов",
-                    flush=True
-                )
-            except Exception as e:
-                metrics = {
-                    "total_size_gb": None,
-                    "file_count": None,
-                    "oldest_file": None,
-                    "newest_file": None,
-                }
-                save_onec_log_metric(name, log_name, log_path, metrics, status="error", error=str(e))
-                print(f"  ❌ 1C log {log_path}: {e}", flush=True)
+                print(f"[backup] ❌ {collected['server'].get('name')}: "
+                      f"разбор не выполнен: {e}", flush=True)
+            if on_progress:
+                on_progress()
 
     print("[backup] Цикл завершён", flush=True)
