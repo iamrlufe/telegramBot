@@ -24,7 +24,7 @@ from charts import build_server_chart, build_dashboard_chart, build_top_dirs_cha
 from db import (
     get_servers_status, get_server_detail, get_disk_usage, get_server_disks,
     get_problems, build_report, format_problems_for_server,
-    short_server_name,
+    short_server_name, ack_server_problems,
 )
 from net_tools import http_report, ports_report, resolve_target, single_port_report
 from ping_tools import load_targets, ping_report
@@ -344,6 +344,19 @@ def build_problems_keyboard(servers: list):
         for index, server in enumerate(servers)
     ]
     return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
+def build_server_problems_keyboard(index: int):
+    """Карточка сервера: «Принял» глушит перечисленные замечания навсегда.
+
+    Отдельно от 🔇 mute на час: mute выключает сервер целиком и на время, а
+    здесь известная и осознанно оставленная проблема убирается из сводки,
+    пока её не вернут вручную."""
+    return [
+        [InlineKeyboardButton("✅ Принял, больше не показывать",
+                              callback_data=f"probs_ack:{index}")],
+        [InlineKeyboardButton("◀️ К сводке", callback_data="probs_menu")],
+    ]
 
 
 async def cmd_problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -991,11 +1004,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message(query, "Список проблем устарел, открой 🚨 Проблемы заново")
             return
 
-        keyboard = [[InlineKeyboardButton("◀️ К сводке", callback_data="probs_menu")]]
         await safe_edit_message(
             query,
             format_problems_for_server(servers[index]),
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(build_server_problems_keyboard(index))
+        )
+
+    elif query.data.startswith("probs_ack:"):
+        servers = context.user_data.get("problem_servers")
+        index = int(query.data.split(":", 1)[1])
+        if not servers or index >= len(servers):
+            await safe_edit_message(query, "Список проблем устарел, открой 🚨 Проблемы заново")
+            return
+
+        server = servers[index]
+        count = await asyncio.to_thread(ack_server_problems, server)
+        text, servers = await asyncio.to_thread(get_problems)
+        context.user_data["problem_servers"] = servers
+        await safe_edit_message(
+            query,
+            f"✅ Принято: {server['name']} — {count} замечаний больше не "
+            f"показываются и не приходят алертами.\n"
+            f"Вернуть: ⚙️ Настройка → ✅ Принятые алерты.\n\n"
+            + text,
+            reply_markup=InlineKeyboardMarkup(build_problems_keyboard(servers))
+                         if servers else None
         )
 
     elif query.data.startswith("report:"):

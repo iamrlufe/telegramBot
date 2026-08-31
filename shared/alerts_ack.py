@@ -26,6 +26,13 @@ ALMATY = ZoneInfo("Asia/Almaty")
 # чинят, либо причина уходит сама (старые записи выпадают из логов).
 ACK_HOURS = int(os.getenv("ALERT_ACK_HOURS", "24"))
 
+# Метка бессрочного подавления вместо времени «до». Кнопка «Принял» в
+# сводке проблем нужна для того, что не чинится за сутки и повторным
+# напоминанием не станет полезнее: диск на 0% у списанной ВМ, служба,
+# выведенная из эксплуатации. Снимается только вручную —
+# ⚙️ Настройка → ✅ Принятые алерты.
+ACK_FOREVER = "forever"
+
 # callback_data ограничен 64 байтами, а ключ алерта содержит имя сервера,
 # путь к бэкапу или имя службы. В кнопку кладём короткий хеш, а
 # соответствие «хеш → ключ» пишем в файл: память у процессов разная.
@@ -85,26 +92,62 @@ def register_ack_key(key: str) -> str:
     return digest
 
 
+def _is_active(until: str, now_iso: str) -> bool:
+    """ACK_FOREVER сравнивается с ISO как обычная строка: «f» больше любой
+    цифры, поэтому бессрочное подавление активно всегда и сортируется в
+    конец списка — отдельной ветки не нужно."""
+    return bool(until) and until > now_iso
+
+
 def is_acked(key: str) -> bool:
     """Подавлен ли этот алерт прямо сейчас."""
     if not key:
         return False
     until = _load()["acks"].get(ack_hash(key))
-    return bool(until) and datetime.now(timezone.utc).isoformat() < until
+    return _is_active(until, datetime.now(timezone.utc).isoformat())
 
 
-def ack_alert(digest: str, hours: int = None) -> tuple:
-    """Подавляет алерт по хешу из кнопки. Возвращает (ключ, до какого времени)."""
-    hours = hours or ACK_HOURS
-    until = datetime.now(timezone.utc) + timedelta(hours=hours)
+def active_ack_digests() -> set:
+    """Хеши подавленных сейчас алертов — одним чтением файла.
+
+    Сводка проблем проверяет несколько десятков ключей за раз, и is_acked
+    на каждый означал бы столько же чтений одного и того же файла.
+    """
+    data = _load()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {digest for digest, until in data["acks"].items()
+            if _is_active(until, now_iso)}
+
+
+def ack_alert(digest: str, hours: int = None, forever: bool = False) -> tuple:
+    """Подавляет алерт по хешу из кнопки.
+
+    Возвращает (ключ, до какого времени); для бессрочного подавления время
+    None — «навсегда, пока не вернут вручную».
+    """
+    if forever:
+        until_value, until_local = ACK_FOREVER, None
+    else:
+        hours = hours or ACK_HOURS
+        until = datetime.now(timezone.utc) + timedelta(hours=hours)
+        until_value, until_local = until.isoformat(), until.astimezone(ALMATY)
     with _lock:
         data = _load()
         key = data["keys"].get(digest)
         if key is None:
             return None, None
-        data["acks"][digest] = until.isoformat()
+        data["acks"][digest] = until_value
         _save(data)
-    return key, until.astimezone(ALMATY)
+    return key, until_local
+
+
+def ack_key_forever(key: str) -> str:
+    """Подавляет алерт по самому ключу и навсегда — для кнопки «Принял»
+    в сводке проблем, где ключ известен заранее и хеш регистрировать
+    отдельно незачем."""
+    digest = register_ack_key(key)
+    ack_alert(digest, forever=True)
+    return digest
 
 
 def unack_alert(digest: str) -> str:
@@ -122,8 +165,9 @@ def active_acks() -> list:
     data = _load()
     now = datetime.now(timezone.utc).isoformat()
     items = [
-        {"digest": digest, "key": data["keys"].get(digest, "?"), "until": until}
-        for digest, until in data["acks"].items() if until > now
+        {"digest": digest, "key": data["keys"].get(digest, "?"), "until": until,
+         "forever": until == ACK_FOREVER}
+        for digest, until in data["acks"].items() if _is_active(until, now)
     ]
     return sorted(items, key=lambda i: i["until"])
 

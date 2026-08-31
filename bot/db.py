@@ -14,6 +14,7 @@ from backup_files import disk_of_path
 from backup_verify import path_str
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
 from linux_check import PSEUDO_MOUNT_PREFIXES
+from alerts_ack import ack_hash, ack_key_forever, active_ack_digests
 
 ALMATY = ZoneInfo("Asia/Almaty")
 STALE_MINUTES = 15
@@ -602,12 +603,20 @@ def collect_problems() -> list:
 
     now_utc = datetime.now(timezone.utc)
     problems = []
+    acked = active_ack_digests()
 
-    def add(level, kind, server, text, weight=0.0, hint=None):
+    def add(level, kind, server, text, weight=0.0, hint=None, key=None):
         """Проблема хранится разобранной, а не готовой строкой: из тех же
-        записей собирается и сводка по категориям, и разбор по серверу."""
+        записей собирается и сводка по категориям, и разбор по серверу.
+
+        key — устойчивое имя проблемы (сервер + объект), по нему работает
+        кнопка «Принял». В текст оно не годится: там проценты и дни, они
+        меняются каждый час, и подавление слетало бы само собой."""
+        if key and ack_hash(key) in acked:
+            return
         problems.append({"level": level, "kind": kind, "server": server,
-                         "text": text, "weight": weight, "hint": hint})
+                         "text": text, "weight": weight, "hint": hint,
+                         "key": key})
 
     icons = {
         "auth_failed":      "🔑",
@@ -629,13 +638,14 @@ def collect_problems() -> list:
             line = f"{icon} {status} ({time_str})"
             if error:
                 line += f"\n   {error.splitlines()[0][:90]}"
-            add("crit", "status", server_name, line, weight=age_min)
+            add("crit", "status", server_name, line, weight=age_min,
+                key=f"offline:{server_name}")
             continue
 
         if age_min > STALE_MINUTES:
             add("warn", "stale", server_name,
                 f"⚠️ данные старше {round(age_min)} мин ({time_str})",
-                weight=age_min)
+                weight=age_min, key=f"stale:{server_name}")
 
     for server_name, disk_name, free_gb, used_gb, created_at in disk_rows:
         if is_pseudo_disk(disk_name):
@@ -648,12 +658,13 @@ def collect_problems() -> list:
         free_pct = round(free / total * 100, 1)
         detail = f"{disk_name}: свободно {free_pct}% ({free} ГБ)"
         hint = f"минимум {free_pct}% свободно"
+        disk_key = f"disk:{server_name}:{disk_name}"
         if free_pct < DISK_CRIT_FREE:
             add("crit", "disk", server_name, f"🔴 {detail}",
-                weight=100 - free_pct, hint=hint)
+                weight=100 - free_pct, hint=hint, key=disk_key)
         elif free_pct < DISK_WARN_FREE:
             add("warn", "disk", server_name, f"🟠 {detail}",
-                weight=100 - free_pct, hint=hint)
+                weight=100 - free_pct, hint=hint, key=disk_key)
 
     # RAID: развал массива не виден ни по свободному месту, ни по SMART
     # отдельного диска — в сводке проблем ему самое место
@@ -667,14 +678,17 @@ def collect_problems() -> list:
             if array.get("progress"):
                 percent = array["progress"].get("percent")
                 add("crit", "raid", config_name,
-                    f"🔄 RAID {array.get('name')} восстанавливается{counts} — {percent}%")
+                    f"🔄 RAID {array.get('name')} восстанавливается{counts} — {percent}%",
+                    key=f"raid:{config_name}:{array.get('name')}")
             else:
                 add("crit", "raid", config_name,
-                    f"🚨 RAID {array.get('name')} деградирован{counts}")
+                    f"🚨 RAID {array.get('name')} деградирован{counts}",
+                    key=f"raid:{config_name}:{array.get('name')}")
 
     for service_name, display_name, service_status, server_name, checked_at in service_rows:
         label = display_name if display_name and display_name != service_name else service_name
-        add("crit", "service", server_name, f"🚨 сервис {label} = {service_status}")
+        add("crit", "service", server_name, f"🚨 сервис {label} = {service_status}",
+            key=f"service:{server_name}:{service_name}")
 
     for (
         server_name, backup_type, backup_path, file_count,
@@ -688,14 +702,17 @@ def collect_problems() -> list:
         created_utc = created_at.replace(tzinfo=timezone.utc)
         age_min = (now_utc - created_utc).total_seconds() / 60
         label = f"{backup_type.upper()} {backup_path}"
+        backup_key = f"backup:{server_name}:{backup_type}:{backup_path}"
 
         if age_min > BACKUP_STALE_MINUTES:
             add("warn", "backup_stale", server_name,
                 f"⚠️ {label}: метрики backup старше {round(age_min)} мин",
-                weight=age_min)
+                weight=age_min,
+                key=f"backup_stale:{server_name}:{backup_path}")
 
         if not file_count:
-            add("crit", "backup", server_name, f"🚨 {label}: нет файлов backup")
+            add("crit", "backup", server_name, f"🚨 {label}: нет файлов backup",
+                key=backup_key)
             continue
 
         schedule = schedule_for(schedule_map, server_name, backup_type, backup_path)
@@ -711,38 +728,44 @@ def collect_problems() -> list:
                     add("crit", "backup", server_name,
                         f"🚨 {label}: пропущена недельная копия "
                         f"(последняя {age_days} дн назад)",
-                        weight=age_days, hint=f"худший {age_days} дн")
+                        weight=age_days, hint=f"худший {age_days} дн",
+                        key=backup_key)
             else:
                 age_hours = (now_utc - newest).total_seconds() / 3600
                 if age_hours > BACKUP_CRIT_HOURS:
                     age_days = round(age_hours / 24, 1)
                     add("crit", "backup", server_name,
                         f"🔴 {label}: последний backup {age_days} дн назад",
-                        weight=age_days, hint=f"худший {age_days} дн")
+                        weight=age_days, hint=f"худший {age_days} дн",
+                        key=backup_key)
                 elif age_hours > BACKUP_WARN_HOURS:
                     age_days = round(age_hours / 24, 1)
                     add("warn", "backup", server_name,
                         f"🟠 {label}: последний backup {age_days} дн назад",
-                        weight=age_days, hint=f"худший {age_days} дн")
+                        weight=age_days, hint=f"худший {age_days} дн",
+                        key=backup_key)
         elif schedule:
             add("crit", "backup", server_name,
-                f"🚨 {label}: пропущена недельная копия (нет даты последнего backup)")
+                f"🚨 {label}: пропущена недельная копия (нет даты последнего backup)",
+                key=backup_key)
         else:
-            add("warn", "backup", server_name, f"🟠 {label}: нет даты последнего backup")
+            add("warn", "backup", server_name, f"🟠 {label}: нет даты последнего backup",
+                key=backup_key)
 
         total = float(disk_total_gb or 0)
         free = float(disk_free_gb or 0)
         if total > 0:
             free_pct = round(free / total * 100, 1)
             hint = f"минимум {free_pct}% свободно"
+            disk_key = f"disk:{server_name}:backup:{backup_path}"
             if free_pct < DISK_CRIT_FREE:
                 add("crit", "disk", server_name,
                     f"🔴 {label}: диск backup свободно {free_pct}% ({free} ГБ)",
-                    weight=100 - free_pct, hint=hint)
+                    weight=100 - free_pct, hint=hint, key=disk_key)
             elif free_pct < DISK_WARN_FREE:
                 add("warn", "disk", server_name,
                     f"🟠 {label}: диск backup свободно {free_pct}% ({free} ГБ)",
-                    weight=100 - free_pct, hint=hint)
+                    weight=100 - free_pct, hint=hint, key=disk_key)
 
     for (
         server_name, log_name, log_path, total_size_gb,
@@ -754,26 +777,30 @@ def collect_problems() -> list:
 
         if age_min > ONEC_LOG_STALE_MINUTES:
             add("warn", "stale", server_name,
-                f"⚠️ {label}: метрики старше {round(age_min)} мин", weight=age_min)
+                f"⚠️ {label}: метрики старше {round(age_min)} мин", weight=age_min,
+                key=f"onec_stale:{server_name}:{log_path}")
 
         if status != "ok":
             detail = error.splitlines()[0][:90] if error else status
-            add("crit", "onec", server_name, f"🚨 {label}: {detail}")
+            add("crit", "onec", server_name, f"🚨 {label}: {detail}",
+                key=f"onec_log:{server_name}:{log_name}")
             continue
 
         size_gb = float(total_size_gb or 0)
         hint = f"крупнейший {size_gb} ГБ"
+        onec_key = f"onec_log:{server_name}:{log_name}"
         if size_gb >= ONEC_LOG_CRIT_GB:
             add("crit", "onec", server_name, f"🚨 {label}: размер {size_gb} ГБ",
-                weight=size_gb, hint=hint)
+                weight=size_gb, hint=hint, key=onec_key)
         elif size_gb >= ONEC_LOG_WARN_GB:
             add("warn", "onec", server_name, f"🟠 {label}: размер {size_gb} ГБ",
-                weight=size_gb, hint=hint)
+                weight=size_gb, hint=hint, key=onec_key)
 
     for server_name, backup_path, file_path, status, error, created_at in verify_rows:
         detail = (error or status or "").splitlines()[0][:90]
         add("crit", "verify", server_name,
-            f"🚨 backup не прошёл RESTORE VERIFYONLY\n   {backup_path}: {detail}")
+            f"🚨 backup не прошёл RESTORE VERIFYONLY\n   {backup_path}: {detail}",
+            key=f"verify:{server_name}:{backup_path}")
 
     return problems
 
@@ -871,6 +898,20 @@ def format_problems_for_server(server: dict) -> str:
         lines += [item["text"] for item in items]
 
     return "\n".join(lines)
+
+
+def ack_server_problems(server: dict) -> int:
+    """Принять все замечания сервера навсегда — кнопка «Принял».
+
+    Подавляются именно эти замечания (диск C:, эта база, эта служба), а не
+    сервер целиком: новая проблема на том же сервере придёт как обычно.
+    Возвращает, сколько замечаний заглушено — их же и показываем в ответе.
+    Снимается в ⚙️ Настройка → ✅ Принятые алерты.
+    """
+    keys = {item["key"] for item in server["items"] if item.get("key")}
+    for key in sorted(keys):
+        ack_key_forever(key)
+    return len(keys)
 
 
 def get_problems() -> tuple:
