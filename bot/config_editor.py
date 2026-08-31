@@ -25,6 +25,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
 
 from alerts_ack import active_acks, unack_alert
+from onec_logs import ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB
 from tg_utils import safe_edit_message, load_muted, save_muted, mute_expired, split_message
 from ping_tools import is_valid_host
 from backup_bot import load_delete_user_ids, build_paginated_server_keyboard
@@ -2001,6 +2002,8 @@ Host — IP или hostname, уникальный.
   и следим именно за ним, а не за мёртвой 32-битной службой.
 Бэкапы sql / 1c / veeam — каталоги с копиями (см. раздел 💾 Бэкапы).
 Журналы 1С — каталоги журнала регистрации, контроль размера.
+Пороги пути (📏 Пороги) действуют и на алерт, и на 🚨 Проблемы:
+источник один. Без своих порогов берутся общие: 5 / 10 ГБ.
    Пороги правятся кнопкой 📏 Пороги в карточке пути; при
    добавлении их можно задать сразу: путь=100/150 (ГБ,
    предупреждение/критично), путь=100 — только предупреждение.
@@ -2759,8 +2762,10 @@ async def show_path_card(query, context, field: str, index: int):
 
 # Общие пороги журналов 1С; те же значения — в monitor/backup_collector.py и
 # bot/db.py, согласованность проверяется тестом.
-ONEC_DEFAULT_WARN_GB = 5
-ONEC_DEFAULT_CRIT_GB = 10
+# Общие пороги журнала 1С — из shared/onec_logs.py: мастер обязан проверять
+# ровно то, по чему потом считают монитор и сводка проблем.
+ONEC_DEFAULT_WARN_GB = ONEC_LOG_WARN_GB
+ONEC_DEFAULT_CRIT_GB = ONEC_LOG_CRIT_GB
 
 
 def onec_limits_conflict(entry) -> str:

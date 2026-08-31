@@ -18,6 +18,7 @@ from alerts import (
     mark_alert_sent,
     send_or_defer, load_json, save_json, is_muted, check_backup_failure_alerts,
 )
+from onec_logs import ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, onec_targets
 from backup_schedule import (
     ALMATY,
     most_recent_weekly_deadline,
@@ -73,9 +74,6 @@ def _float_env(name: str, default: float) -> float:
 
 
 BACKUP_ALERT_HOURS = _int_env("BACKUP_ALERT_HOURS", 25)
-# Алерт: размер журнала регистрации 1С
-ONEC_LOG_WARN_GB = 5
-ONEC_LOG_CRIT_GB = 10
 
 # Проверка «бэкап подозрительно маленький» (например, обрыв копирования по FTP):
 # новый файл сравнивается с медианой размеров последних N успешных бэкапов
@@ -1012,28 +1010,6 @@ def _backup_targets(server: dict) -> list:
     return targets
 
 
-def _onec_targets(server: dict) -> list:
-    logs = server.get("onec_logs") or []
-    if isinstance(logs, dict):
-        logs = [logs]
-    targets = []
-    for log_spec in logs:
-        if isinstance(log_spec, str):
-            targets.append({"name": "1C log", "path": log_spec,
-                            "warn_gb": ONEC_LOG_WARN_GB, "crit_gb": ONEC_LOG_CRIT_GB})
-            continue
-        log_path = log_spec.get("path")
-        if not log_path:
-            continue
-        targets.append({
-            "name": log_spec.get("name") or "1C log",
-            "path": log_path,
-            "warn_gb": float(log_spec.get("warn_gb", ONEC_LOG_WARN_GB)),
-            "crit_gb": float(log_spec.get("crit_gb", ONEC_LOG_CRIT_GB)),
-        })
-    return targets
-
-
 def collect_server_backups(server: dict) -> dict:
     """Удалённая часть сбора: опрос сервера и ничего больше.
 
@@ -1094,7 +1070,7 @@ def collect_server_backups(server: dict) -> dict:
         except Exception as e:
             collected["backup_errors_error"] = e
 
-    for log in _onec_targets(server):
+    for log in onec_targets(server):
         try:
             metrics = collect_onec_log_path(
                 host, log["path"], server.get("username"), server.get("password")

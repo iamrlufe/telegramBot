@@ -16,6 +16,9 @@ from backup_files import disk_of_path
 from backup_verify import path_str
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
 from linux_check import PSEUDO_MOUNT_PREFIXES
+from onec_logs import (
+    ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, load_onec_thresholds,
+)
 from alerts_ack import ack_hash, ack_key_forever, active_ack_digests
 
 ALMATY = ZoneInfo("Asia/Almaty")
@@ -49,8 +52,6 @@ BACKUP_STALE_MINUTES = 30
 # держались тома, которых больше нет, — отключённые диски, переименованные
 # буквы и отсеянные псевдо-ФС вроде efivarfs.
 DISK_METRIC_FRESH_HOURS = 2
-ONEC_LOG_WARN_GB = 5
-ONEC_LOG_CRIT_GB = 10
 ONEC_LOG_STALE_MINUTES = 30
 SERVER_BUTTONS_PER_PAGE = 8
 
@@ -542,6 +543,7 @@ def get_server_detail(server_name: str) -> str:
 def collect_problems() -> list:
     backup_targets, config_server_names = _load_backup_targets()
     schedule_map = load_schedule_map(SERVERS_FILE)
+    onec_thresholds = load_onec_thresholds(SERVERS_FILE)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -806,10 +808,17 @@ def collect_problems() -> list:
         size_gb = float(total_size_gb or 0)
         hint = f"крупнейший {size_gb} ГБ"
         onec_key = f"onec_log:{server_name}:{log_name}"
-        if size_gb >= ONEC_LOG_CRIT_GB:
+        # Пороги пути из конфига, а не общие: у журнала сервера 1С они бывают
+        # в разы больше (150/180 ГБ против общих 5/10). Пока сводка считала
+        # по общим, она красила журнал критичным, хотя алерт молчал, — и
+        # настройка выглядела сломанной.
+        warn_gb, crit_gb = onec_thresholds.get(
+            (server_name, log_path), (ONEC_LOG_WARN_GB, ONEC_LOG_CRIT_GB)
+        )
+        if size_gb >= crit_gb:
             add("crit", "onec", server_name, f"🚨 {label}: размер {size_gb} ГБ",
                 weight=size_gb, hint=hint, key=onec_key)
-        elif size_gb >= ONEC_LOG_WARN_GB:
+        elif size_gb >= warn_gb:
             add("warn", "onec", server_name, f"🟠 {label}: размер {size_gb} ГБ",
                 weight=size_gb, hint=hint, key=onec_key)
 

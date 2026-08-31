@@ -437,18 +437,23 @@ def test_onec_limits_conflict_for_low_crit_only():
     assert "не меньше критичного" in ce.onec_limits_conflict({"crit_gb": 4})
 
 
-def test_onec_defaults_match_collector_and_reports():
-    """Пороги по умолчанию продублированы в трёх модулях — расхождение
-    означало бы, что мастер проверяет не то, что делает монитор."""
+def test_onec_defaults_come_from_one_place():
+    """Пороги были продублированы в трёх модулях и разошлись: у пути стояли
+    свои 150/180 ГБ, монитор молчал, а сводка проблем считала по общим 5/10
+    и красила журнал критичным. Теперь источник один — shared/onec_logs.py."""
     from pathlib import Path
     import re
 
+    import onec_logs
+
+    assert (ce.ONEC_DEFAULT_WARN_GB, ce.ONEC_DEFAULT_CRIT_GB) == \
+        (onec_logs.ONEC_LOG_WARN_GB, onec_logs.ONEC_LOG_CRIT_GB)
+
     root = Path(__file__).resolve().parent.parent
-    for path in ("monitor/backup_collector.py", "bot/db.py"):
+    for path in ("monitor/backup_collector.py", "bot/db.py", "bot/config_editor.py"):
         source = (root / path).read_text(encoding="utf-8")
-        warn = int(re.search(r"ONEC_LOG_WARN_GB = (\d+)", source).group(1))
-        crit = int(re.search(r"ONEC_LOG_CRIT_GB = (\d+)", source).group(1))
-        assert (warn, crit) == (ce.ONEC_DEFAULT_WARN_GB, ce.ONEC_DEFAULT_CRIT_GB), path
+        assert not re.search(r"^ONEC_LOG_(WARN|CRIT)_GB = \d", source, re.M), \
+            f"{path}: порог задан своим числом вместо shared/onec_logs.py"
 
 
 def test_onec_log_thresholds_validated():
