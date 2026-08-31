@@ -1,8 +1,11 @@
 """Дашборд отдаётся HTML-файлом вместо PNG.
 
-Проверяется главное свойство отчёта: он самодостаточный. Ни одного внешнего
-запроса — иначе файл, открытый в Telegram без сети, развалится, а у бота
-появится повод смотреть наружу, чего в этом проекте быть не должно.
+Проверяются два свойства, без которых отчёт бесполезен. Он самодостаточный:
+ни одного внешнего запроса — иначе файл, открытый в Telegram без сети,
+развалится, а у бота появится повод смотреть наружу, чего в этом проекте
+быть не должно. И он работает без JavaScript: просмотрщик файлов в Telegram
+открывает страницу со скриптами выключёнными, на этом первая версия и
+попалась — кнопки просто не нажимались, кольца не закрашивались.
 
 `import db` в тестах достаётся из monitor/ — одноимённый модуль бота
 приходится подставлять по пути.
@@ -72,7 +75,7 @@ def test_report_has_no_external_requests():
 
     assert "http://" not in page
     assert "https://" not in page
-    assert "<script src" not in page
+    assert "<script" not in page
     assert "<link" not in page
     assert "url(" not in page.replace("url(#", "")  # градиенты SVG не в счёт
 
@@ -102,8 +105,19 @@ def test_problem_servers_come_first():
     assert page.index("down-01") < page.index("warn-01") < page.index("ok-01")
 
 
-def test_healthy_servers_hidden_until_filter_switched():
-    """Открывается на проблемных: ради них отчёт и запрашивают."""
+def test_no_javascript_at_all():
+    """Скрипты в просмотрщике Telegram не выполняются: всё интерактивное
+    обязано держаться на разметке и CSS."""
+    page = _render([_server("a.example.local", disks=[_disk("C:", 42)])])
+
+    assert "<script" not in page
+    assert "onclick" not in page
+    assert "addEventListener" not in page
+
+
+def test_filter_opens_on_problem_servers():
+    """Открывается на проблемных: ради них отчёт и запрашивают.
+    Прячет здоровых CSS по выбранному radio, а не инлайн-стиль в карточке."""
     page = _render([
         _server("ok-01.example.local", state="ok"),
         _server("down-01.example.local", state="down"),
@@ -111,16 +125,26 @@ def test_healthy_servers_hidden_until_filter_switched():
     cards = re.findall(r'<details class="card"[^>]*>', page)
 
     assert len(cards) == 2
-    assert sum("display:none" in card for card in cards) == 1
-    assert 'data-f="bad" aria-pressed="true"' in page
-
-
-def test_all_servers_visible_when_everything_is_fine():
-    page = _render([_server("ok-01.example.local"), _server("ok-02.example.local")])
-    cards = re.findall(r'<details class="card"[^>]*>', page)
-
     assert not any("display:none" in card for card in cards)
-    assert 'data-f="all" aria-pressed="true"' in page
+    assert 'id="f-bad" checked' in page
+    assert '#f-bad:checked~.wrap .card[data-state="ok"]{display:none}' in page
+
+
+def test_filter_opens_on_full_list_when_everything_is_fine():
+    """Иначе экран был бы пустым: проблемных нет, а фильтр стоит на них."""
+    page = _render([_server("ok-01.example.local"), _server("ok-02.example.local")])
+
+    assert 'id="f-all" checked' in page
+    assert 'id="f-bad" checked' not in page
+
+
+def test_theme_choice_is_pure_css():
+    """Системная тема плюс ручной выбор — тремя radio, без скрипта."""
+    page = _render([_server("a.example.local")])
+
+    assert 'id="t-auto" checked' in page
+    assert "#t-dark:checked~.wrap{" in page
+    assert "#t-light:checked~.wrap{" in page
 
 
 def test_ring_shows_worst_disk():
@@ -193,7 +217,7 @@ def test_sparkline_empty_series_draws_nothing():
 
 @pytest.mark.parametrize("scope", [
     "@media (prefers-color-scheme:dark)",
-    ':root[data-theme="dark"]',
+    "#t-dark:checked~.wrap",
 ])
 def test_dark_theme_declared_for_both_scopes(scope):
     """Системная тема и ручное переключение кнопкой ◐ — два разных

@@ -207,16 +207,21 @@ def sparkline_path(values: list, width: int = SPARK_W, height: int = SPARK_H) ->
 
 
 def _spark(values: list, color: str) -> str:
+    """Линия за сутки с точкой на последнем значении.
+
+    Подсказки по наведению здесь нет и быть не может: просмотрщик Telegram
+    открывает файл без JavaScript. Всё, что должно работать, работает на
+    голой разметке и CSS."""
     if not values:
         return '<div class="nodata">нет данных</div>'
+
     path = sparkline_path(values)
+    last_x, last_y = path.rsplit("L", 1)[-1].split(" ") if "L" in path else ("0", "0")
     return (
-        f'<svg class="spark" viewBox="0 0 {SPARK_W} {SPARK_H}" preserveAspectRatio="none"'
-        f' data-vals="{",".join(f"{v:.0f}" for v in values)}">'
+        f'<svg class="spark" viewBox="0 0 {SPARK_W + 4} {SPARK_H}" preserveAspectRatio="none">'
         f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"'
         f' stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>'
-        f'<line class="cross" x1="0" y1="0" x2="0" y2="{SPARK_H}" stroke="var(--baseline)"'
-        f' stroke-width="1" opacity="0" vector-effect="non-scaling-stroke"/></svg>'
+        f'<circle cx="{last_x}" cy="{last_y}" r="2.6" fill="{color}"/></svg>'
     )
 
 
@@ -241,8 +246,9 @@ def _ring(disk: dict) -> str:
         f'<svg class="ring" viewBox="0 0 100 100">'
         f'<circle cx="50" cy="50" r="{RING_R}" class="track"/>'
         f'<circle cx="50" cy="50" r="{RING_R}" class="value" stroke="{color}"'
-        f' stroke-dasharray="{RING_C:.1f}" stroke-dashoffset="{RING_C:.1f}"'
-        f' data-offset="{offset:.1f}" transform="rotate(-90 50 50)"/></svg>'
+        f' stroke-dasharray="{RING_C:.1f}" stroke-dashoffset="{offset:.1f}"'
+        f' style="--from:{RING_C:.1f};--to:{offset:.1f}"'
+        f' transform="rotate(-90 50 50)"/></svg>'
         f'<div class="ringtext" style="--ringc:{color}"><b>{free:.0f}%</b>'
         f'<span>своб. · {html.escape(disk["name"])}</span></div>'
     )
@@ -254,7 +260,7 @@ def _tint(color: str, alpha: str) -> str:
     return f"{color}{alpha}"
 
 
-def _card(server: dict, hidden: bool = False) -> str:
+def _card(server: dict) -> str:
     state = STATUSES[server["state"]]
     name = html.escape(server["name"])
     cpu = server["cpu"][-1] if server["cpu"] else None
@@ -270,10 +276,9 @@ def _card(server: dict, hidden: bool = False) -> str:
         meta.append(f"проверен в {server['checked_at']}")
 
     parts = [
-        f'<details class="card" data-state="{server["state"]}"'
-        f'{" style=\'display:none;" if hidden else " style=\'"}'
+        f'<details class="card" data-state="{server["state"]}" style="'
         f'--status:{state["color"]};--glow:{_tint(state["color"], "5c")};'
-        f'--pillbg:{_tint(state["color"], "24")}\'>',
+        f'--pillbg:{_tint(state["color"], "24")}">',
         '<summary>',
         '<div class="visual"><div class="glow"></div><div class="grid"></div>',
         f'<div class="ringbox">{_ring(worst)}</div>',
@@ -332,7 +337,7 @@ STYLE = """
   --shadow:0 1px 2px rgba(11,11,11,.06),0 4px 12px rgba(11,11,11,.05);
 }
 @media (prefers-color-scheme:dark){
-  :root:where(:not([data-theme="light"])){
+  :root{
     color-scheme:dark;
     --surface:#131312;--panel:#1a1a19;--panel-2:#232322;
     --ink:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
@@ -342,7 +347,18 @@ STYLE = """
     --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
   }
 }
-:root[data-theme="dark"]{
+/* Выбор темы вручную бьёт системную: токены переопределяются на .wrap,
+   которая идёт следом за переключателем. */
+#t-light:checked~.wrap{
+  color-scheme:light;
+  --surface:#fcfcfb;--panel:#fff;--panel-2:#f6f5f1;
+  --ink:#0b0b0b;--ink-2:#52514e;--ink-3:#898781;
+  --line:#e1e0d9;--baseline:#c3c2b7;--gridline:#80808033;
+  --cpu:#2a78d6;--ram:#4a3aa7;
+  --panel-soft:rgba(255,255,255,.72);
+  --shadow:0 1px 2px rgba(11,11,11,.06),0 4px 12px rgba(11,11,11,.05);
+}
+#t-dark:checked~.wrap{
   color-scheme:dark;
   --surface:#131312;--panel:#1a1a19;--panel-2:#232322;
   --ink:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
@@ -351,6 +367,10 @@ STYLE = """
   --panel-soft:rgba(26,26,25,.72);
   --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
 }
+/* Цвет текста задаётся здесь, а не на body: при ручном выборе темы
+   токены переопределяются на .wrap, и унаследованный от body ink
+   остался бы от системной темы — тёмное по тёмному. */
+.wrap{background:var(--surface);color:var(--ink);min-height:100vh}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
 body{background:var(--surface);color:var(--ink);-webkit-text-size-adjust:100%;
@@ -360,16 +380,32 @@ b,.mval,.dv,.kv b,.ringtext b{font-variant-numeric:tabular-nums}
 header{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
 header h1{margin:0 0 2px;font-size:19px;font-weight:700;letter-spacing:-.01em}
 header .sub{font-size:12.5px;color:var(--ink-3)}
-.themebtn{margin-left:auto;flex:none;width:36px;height:36px;font-size:15px;cursor:pointer;
-  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:9px}
+.theme{margin-left:auto;flex:none;display:flex;border:1px solid var(--line);
+  background:var(--panel);border-radius:9px;overflow:hidden}
+.theme label{cursor:pointer;font-size:12.5px;line-height:1;padding:9px 9px;color:var(--ink-3);
+  border-right:1px solid var(--line);-webkit-user-select:none;user-select:none}
+.theme label:last-child{border-right:0}
+#t-auto:checked~.wrap label[for="t-auto"],
+#t-light:checked~.wrap label[for="t-light"],
+#t-dark:checked~.wrap label[for="t-dark"]{background:var(--ink);color:var(--surface)}
 .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 11px;box-shadow:var(--shadow)}
 .kpi b{display:block;font-size:22px;font-weight:700;line-height:1.1;letter-spacing:-.02em;color:var(--c,var(--ink))}
 .kpi span{font-size:11.5px;color:var(--ink-3)}
 .chips{display:flex;gap:7px;margin-bottom:14px;overflow-x:auto;padding-bottom:2px}
-.chip{flex:none;white-space:nowrap;cursor:pointer;font:inherit;font-size:13px;padding:7px 13px;
-  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:999px}
-.chip[aria-pressed="true"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.chip{flex:none;white-space:nowrap;cursor:pointer;font-size:13px;padding:7px 13px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:999px;
+  -webkit-user-select:none;user-select:none}
+/* Переключатели держатся на radio + :checked: во встроенном браузере
+   Telegram скриптов нет, а этот способ работает на голом CSS. */
+.switch{position:absolute;opacity:0;pointer-events:none}
+#f-bad:checked~.wrap label[for="f-bad"],
+#f-all:checked~.wrap label[for="f-all"],
+#f-ok:checked~.wrap label[for="f-ok"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+#f-bad:checked~.wrap .card[data-state="ok"]{display:none}
+#f-ok:checked~.wrap .card:not([data-state="ok"]){display:none}
+#f-ok:checked~.wrap .empty{display:block}
+.empty{display:none;padding:22px 4px;text-align:center;font-size:13px;color:var(--ink-3)}
 .card{position:relative;margin-bottom:12px;overflow:hidden;background:var(--panel);
   border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
 .card>summary{display:block;list-style:none;cursor:pointer}
@@ -388,7 +424,8 @@ header .sub{font-size:12.5px;color:var(--ink-3)}
 .ring{position:absolute;width:104px;height:104px}
 .ring .track{fill:none;stroke:var(--ink);stroke-width:9;opacity:.11}
 .ring .value{fill:none;stroke-width:11;stroke-linecap:round;
-  transition:stroke-dashoffset .7s cubic-bezier(.6,.6,0,1)}
+  animation:ringfill .7s cubic-bezier(.6,.6,0,1) both}
+@keyframes ringfill{from{stroke-dashoffset:var(--from)}to{stroke-dashoffset:var(--to)}}
 .ringtext{position:relative;text-align:center;line-height:1.15}
 .ringtext b{display:block;font-size:20px;font-weight:700;letter-spacing:-.02em;color:var(--ringc,var(--ink))}
 .ringtext span{display:block;max-width:92px;margin:0 auto;font-size:9.5px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -418,60 +455,19 @@ details[open] .chev{transform:rotate(90deg)}
 .dv{flex:none;width:118px;text-align:right;color:var(--ink-2)}
 .kv{display:flex;gap:8px;padding:3px 0;font-size:12.5px;color:var(--ink-2)}
 .kv b{margin-left:auto;font-weight:600;color:var(--ink)}
-.tip{position:fixed;z-index:9;pointer-events:none;opacity:0;transition:opacity .1s;white-space:nowrap;
-  background:var(--ink);color:var(--surface);font-size:11.5px;padding:5px 8px;border-radius:7px}
 footer{margin-top:18px;text-align:center;font-size:11.5px;line-height:1.6;color:var(--ink-3)}
 @media (max-width:430px){.kpis{grid-template-columns:repeat(2,1fr)}}
 @media (prefers-reduced-motion:reduce){.ring .value{transition:none}}
 """
 
-SCRIPT = """
-document.querySelectorAll(".ring .value").forEach(function(c){
-  requestAnimationFrame(function(){ c.style.strokeDashoffset = c.dataset.offset; });
-});
-var chips = document.getElementById("chips"), cards = document.querySelectorAll(".card");
-chips.addEventListener("click", function(e){
-  var b = e.target.closest(".chip"); if (!b) return;
-  [].forEach.call(this.children, function(c){ c.setAttribute("aria-pressed", c === b); });
-  cards.forEach(function(card){
-    var bad = card.dataset.state !== "ok";
-    card.style.display = (b.dataset.f === "all" || (b.dataset.f === "bad") === bad) ? "" : "none";
-  });
-});
-var tip = document.getElementById("tip");
-function hide(){
-  tip.style.opacity = 0;
-  document.querySelectorAll(".cross").forEach(function(c){ c.setAttribute("opacity", 0); });
-}
-function move(e){
-  var svg = e.target.closest(".spark"); if (!svg) { hide(); return; }
-  var pt = e.touches ? e.touches[0] : e, box = svg.getBoundingClientRect();
-  var vals = svg.dataset.vals.split(",");
-  var i = Math.round(Math.max(0, Math.min(1, (pt.clientX - box.left) / box.width)) * (vals.length - 1));
-  var line = svg.querySelector(".cross"), x = i / (vals.length - 1) * 240;
-  line.setAttribute("x1", x); line.setAttribute("x2", x); line.setAttribute("opacity", ".8");
-  var step = WINDOW_MINUTES / (vals.length - 1), back = Math.round((vals.length - 1 - i) * step);
-  tip.textContent = vals[i] + "% · " + (back < 1 ? "сейчас" : back < 60 ? back + " мин назад"
-    : (back / 60).toFixed(1).replace(".0", "") + " ч назад");
-  tip.style.left = Math.min(innerWidth - 140, Math.max(6, pt.clientX - 50)) + "px";
-  tip.style.top = Math.max(4, box.top - 30) + "px";
-  tip.style.opacity = 1;
-}
-document.addEventListener("mousemove", move);
-document.addEventListener("touchmove", move, {passive: true});
-document.addEventListener("touchend", hide);
-document.getElementById("theme").onclick = function(){
-  var root = document.documentElement;
-  var dark = root.getAttribute("data-theme") === "dark" ||
-    (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
-  root.setAttribute("data-theme", dark ? "light" : "dark");
-};
-"""
-
-
 def render_dashboard(data: dict) -> str:
     """Данные → готовый HTML. Отдельно от базы, чтобы тесты проверяли разметку
-    без Postgres."""
+    без Postgres.
+
+    Ни строчки JavaScript: просмотрщик файлов в Telegram открывает страницу
+    со скриптами выключёнными — на кнопках это было видно сразу, они просто
+    не нажимались. Фильтр и выбор темы держатся на radio + :checked, кольца
+    рисуются готовыми, разворот карточки — на <details>."""
     # Порядок задаётся здесь, а не при выборке: сортировка — часть отчёта,
     # и её проверяют тесты, не поднимая базу.
     servers = sorted(data["servers"],
@@ -495,34 +491,51 @@ def render_dashboard(data: dict) -> str:
         for value, label, color in kpis
     )
 
-    chips = [
-        ("bad", f"Требуют внимания · {bad}", bad > 0),
-        ("all", f"Все · {len(servers)}", bad == 0),
-        ("ok", f"В норме · {good}", False),
+    # Открывается на проблемных: ради них отчёт и запрашивают. Если всё
+    # хорошо — сразу общий список, иначе экран выглядел бы пустым.
+    default_filter = "bad" if bad else "all"
+    filters = [
+        ("bad", f"Требуют внимания · {bad}"),
+        ("all", f"Все · {len(servers)}"),
+        ("ok", f"В норме · {good}"),
     ]
-    chips_html = "".join(
-        f'<button class="chip" data-f="{key}" aria-pressed="{str(pressed).lower()}">{label}</button>'
-        for key, label, pressed in chips
+    radios = "".join(
+        f'<input class="switch" type="radio" name="f" id="f-{key}"'
+        f'{" checked" if key == default_filter else ""}>'
+        for key, _label in filters
     )
-    cards = [_card(s, hidden=(bad > 0 and s["state"] == "ok")) for s in servers]
+    chips_html = "".join(
+        f'<label class="chip" for="f-{key}">{label}</label>' for key, label in filters
+    )
+    themes = [("auto", "◐"), ("light", "☀"), ("dark", "☾")]
+    radios += "".join(
+        f'<input class="switch" type="radio" name="t" id="t-{key}"'
+        f'{" checked" if key == "auto" else ""}>'
+        for key, _icon in themes
+    )
+    theme_html = "".join(
+        f'<label for="t-{key}" title="Тема: {key}">{icon}</label>' for key, icon in themes
+    )
 
-    script = SCRIPT.replace("WINDOW_MINUTES", str(hours * 60))
+    empty = ('<div class="empty">Здоровых серверов нет — все требуют внимания.</div>'
+             if not good else "")
+
     return (
         '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
         '<title>Дашборд · AgentMonitor</title>'
-        f'<style>{STYLE}</style></head><body><div class="wrap">'
+        f'<style>{STYLE}</style></head><body>'
+        f'{radios}<div class="wrap">'
         '<header><div><h1>Дашборд инфраструктуры</h1>'
         f'<div class="sub">{len(servers)} серверов · за {period} · '
         f'сформировано {data["generated_at"]}</div></div>'
-        '<button class="themebtn" id="theme" title="Светлая или тёмная тема">◐</button></header>'
+        f'<div class="theme">{theme_html}</div></header>'
         f'<div class="kpis">{kpi_html}</div>'
-        f'<div class="chips" id="chips">{chips_html}</div>'
-        f'{"".join(cards)}'
+        f'<div class="chips">{chips_html}</div>'
+        f'{"".join(_card(s) for s in servers)}{empty}'
         '<footer>AgentMonitor · автономный HTML-отчёт, работает без сети<br>'
         'данные на момент формирования — обновить можно командой /dashboard</footer>'
-        '</div><div class="tip" id="tip"></div>'
-        f'<script>{script}</script></body></html>'
+        '</div></body></html>'
     )
 
 
