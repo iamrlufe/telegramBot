@@ -274,3 +274,48 @@ def test_paginate_helper_boundaries():
     assert chunk == [8, 9] and page == 2
     chunk, page, total = paginate([], 0, 4)
     assert chunk == [] and total == 1
+
+
+# ─── Чтение занятого файла ───────────────────────────────────
+
+def test_current_day_log_opened_with_shared_access(monkeypatch):
+    """Текущие сутки IIS держит открытыми: монопольный ReadLines падает с
+    «файл используется другим процессом», а при SilentlyContinue — падает
+    молча, и раздел показывал пустоту вместо сегодняшних сеансов."""
+    scripts = _fake_ps(monkeypatch, {"rows": [], "scanned": 0})
+    exchange_log.read_owa_logins(SERVER)
+
+    assert "ReadLines" not in scripts[0]
+    assert "'Open', 'Read', 'ReadWrite'" in scripts[0]
+    assert "StreamReader" in scripts[0]
+
+
+def test_unreadable_file_is_reported_not_swallowed(monkeypatch):
+    """Файл, который всё же не открылся, попадает в $failed — неполная
+    выборка обязана быть названа."""
+    scripts = _fake_ps(monkeypatch, {"rows": [], "scanned": 0})
+    exchange_log.read_owa_logins(SERVER)
+
+    assert "$failed" in scripts[0]
+    assert "failed = $failed" in scripts[0]
+
+
+def test_incomplete_read_is_visible_in_the_card():
+    """Пользователь должен видеть, что выборка неполная, а не гадать."""
+    data = {"rows": [{"user": "petrov", "ip": "192.0.2.30", "ua": "1CV8C",
+                      "count": 3, "last": "2026-09-01 08:00:00"}],
+            "scanned": 3, "failed": ["u_ex260901.log"]}
+
+    header, _blocks = exchange_bot.format_owa(data, 24)
+
+    assert "не удалось прочитать" in header.lower()
+
+
+def test_complete_read_says_nothing_extra():
+    data = {"rows": [{"user": "petrov", "ip": "192.0.2.30", "ua": "1CV8C",
+                      "count": 3, "last": "2026-09-01 08:00:00"}],
+            "scanned": 3, "failed": []}
+
+    header, _blocks = exchange_bot.format_owa(data, 24)
+
+    assert "не удалось" not in header.lower()

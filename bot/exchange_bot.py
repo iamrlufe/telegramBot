@@ -164,16 +164,28 @@ def render(header: str, blocks: list, page: int = 0) -> tuple:
     return text, page, total_pages
 
 
+def _unread_note(data: dict) -> str:
+    """Файл, который не удалось прочитать, обязан быть назван: иначе неполная
+    выборка выглядит как «сегодня никто не заходил»."""
+    failed = data.get("failed") or []
+    if isinstance(failed, str):
+        failed = [failed]
+    if not failed:
+        return ""
+    return f"\n⚠️ Не удалось прочитать файлов журнала: {len(failed)} — данные неполные."
+
+
 def format_owa(data: dict, hours: int) -> tuple:
     rows = data.get("rows") or []
     if not rows:
         return (f"🔓 Входы в OWA за {period_name(hours)}\n\n"
                 "Записей нет. Проверьте, что на сервере включено ведение "
                 "журналов IIS для сайта Default Web Site — раздел читает "
-                "именно их.", [])
+                f"именно их.{_unread_note(data)}", [])
     header = (f"🔓 Входы в OWA за {period_name(hours)}\n"
               f"Пользователей и адресов: {len(rows)} · "
-              f"запросов: {data.get('scanned', 0)}\n")
+              f"запросов: {data.get('scanned', 0)}"
+              f"{_unread_note(data)}\n")
     blocks = [
         f"{row.get('user')}  ← {row.get('ip')}\n"
         f"   {_client_name(row.get('ua'))} · {row.get('count')} обращений · "
@@ -211,7 +223,8 @@ def format_eas(data: dict, hours: int) -> tuple:
         return (f"📱 Мобильные клиенты за {period_name(hours)}\n\n"
                 "Обращений ActiveSync нет.", [])
     header = (f"📱 Мобильные клиенты за {period_name(hours)}\n"
-              f"Устройств: {len(rows)} · запросов: {data.get('scanned', 0)}\n")
+              f"Устройств: {len(rows)} · запросов: {data.get('scanned', 0)}"
+              f"{_unread_note(data)}\n")
     blocks = [
         f"{row.get('user')}  ·  {_client_name(row.get('ua'))}\n"
         f"   {row.get('count')} обращений · последнее {_when(row.get('last'))}"

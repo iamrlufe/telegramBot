@@ -15,6 +15,12 @@ OWA по умолчанию) логин и пароль уходят в теле
 
 Логи IIS на живом сервере — сотни мегабайт в сутки, поэтому строки
 считаются и группируются на самом сервере: в бот приезжает уже сводка.
+
+Файл открывается с общим доступом на чтение и запись. Текущие сутки IIS
+держит открытыми, и монопольное чтение (`[IO.File]::ReadLines`) на них
+падает с «файл используется другим процессом» — а при
+`$ErrorActionPreference = 'SilentlyContinue'` падает молча, и раздел
+показывал пустоту вместо сегодняшних сеансов.
 """
 from winlog import _query, _normalize_status, LOGON_FAILURE_REASONS
 from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
@@ -61,9 +67,23 @@ def _aggregate_script(hours: int, path_filter: str, group_by: str,
     if (-not $files) {{ Out-B64 @{{ rows = @(); scanned = 0 }}; return }}
     $agg = @{{}}
     $scanned = 0
+    $failed = @()
     foreach ($f in $files) {{
         $map = $null
-        foreach ($line in [System.IO.File]::ReadLines($f.FullName)) {{
+        # Текущие сутки IIS держит открытыми, и монопольное чтение
+        # на них падает — открываем файл с общим доступом.
+        $fs = $null
+        $sr = $null
+        try {{
+            $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
+            $sr = New-Object System.IO.StreamReader($fs)
+        }} catch {{
+            $failed += $f.Name
+            if ($sr) {{ $sr.Close() }}
+            if ($fs) {{ $fs.Close() }}
+            continue
+        }}
+        while ($null -ne ($line = $sr.ReadLine())) {{
             if ($line.StartsWith('#')) {{
                 if ($line.StartsWith('#Fields:')) {{
                     $map = @{{}}
@@ -88,9 +108,11 @@ def _aggregate_script(hours: int, path_filter: str, group_by: str,
                 $agg[$key] = @{{ n = 1; last = $stamp; user = $user; ip = $p[$map['c-ip']]; ua = $p[$map['cs(User-Agent)']] }}
             }}
         }}
+        $sr.Close()
+        $fs.Close()
     }}
     $rows = @($agg.Values | Sort-Object {{ $_.n }} -Descending | Select-Object -First {top} | ForEach-Object {{ @{{ user = $_.user; ip = $_.ip; ua = $_.ua; count = $_.n; last = $_.last }} }})
-    Out-B64 @{{ rows = $rows; scanned = $scanned; files = $files.Count }}
+    Out-B64 @{{ rows = $rows; scanned = $scanned; files = $files.Count; failed = $failed }}
     """
 
 
