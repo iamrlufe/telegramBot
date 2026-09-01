@@ -15,9 +15,10 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from alerts import check_iis_alerts
 from iis_log import read_site_logs, read_httperr_and_config, SLOW_MS
 from iis_store import (
-    load_state, save_state, save_events, save_fact, cleanup,
+    load_state, save_state, save_events, save_fact, cleanup, iis_findings,
 )
 from server_check import server_type
 
@@ -98,7 +99,6 @@ def collect_server(server: dict) -> tuple:
         data = read_site_logs(server, state, slow_ms=IIS_SLOW_MS)
         rows.extend(_rows_from_site(data))
         save_state(name, "site", data.get("state") or {})
-        facts["uniq_ips"] = data.get("uniq") or 0
     except Exception as e:
         problems.append(f"логи сайта: {str(e).splitlines()[0][:200]}")
 
@@ -151,6 +151,13 @@ def run_iis_cycle(servers: list, on_progress=None) -> int:
                 print(f"[iis] ❌ {name}: запись не выполнена: {e}", flush=True)
             if on_progress:
                 on_progress()
+
+    # Находки считаются после записи: правило перебора смотрит на последний
+    # час, и без свежих строк оно ничего не увидит.
+    try:
+        check_iis_alerts(iis_findings())
+    except Exception as e:
+        print(f"[iis] Алерты не отправлены: {e}", flush=True)
 
     try:
         cleanup()

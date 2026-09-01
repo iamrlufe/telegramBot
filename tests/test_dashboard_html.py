@@ -475,3 +475,13 @@ def test_only_silent_brute_force_raises_alarm():
 
     assert "это подбор пароля" in page
     assert "192.0.2.99" in page
+
+
+def test_unique_ips_counted_over_the_day_not_the_last_batch():
+    """Сразу после полуночи в файле десяток строк. Уникальные адреса должны
+    считаться по накопленным за сутки ключам, иначе отчёт скажет «адресов: 6»
+    на сервере, где их полторы сотни."""
+    page = _with_iis([_iis(uniq=145)])
+
+    assert "Уникальных адресов за сутки" in page
+    assert "145" in page

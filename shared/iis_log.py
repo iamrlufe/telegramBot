@@ -194,3 +194,40 @@ def read_httperr_and_config(server: dict, state: dict = None,
         state_out = {}
     data["state"] = {k: int(v) for k, v in state_out.items()}
     return data
+
+
+# ─── Правило перебора паролей ────────────────────────────────
+
+# Перебор паролей 1С. Измеренная норма живого сервера — до 26 входов
+# в СУТКИ с адреса, поэтому 25 за ЧАС это двадцатикратное превышение.
+LOGIN_BRUTE_PER_HOUR = 25
+
+# Столько же входов даст и сломавшийся клиент, который переподключается по
+# кругу. Отличие простое: у настоящего клиента после входов идёт работа, а у
+# подбирающего пароль — только login. Если запросов с адреса не больше чем
+# втрое от числа входов, работы за ними нет.
+LOGIN_BRUTE_RATIO = 3
+
+
+def detect_brute_force(logins: list, requests: list) -> list:
+    """Подбор пароля 1С по входам за последний час.
+
+    Порог взят с живого сервера: там до 26 входов в СУТКИ с адреса, значит
+    25 за ЧАС — двадцатикратное превышение.
+
+    Столько же входов даёт и сломавшийся клиент, который переподключается по
+    кругу, поэтому мало превышения. У настоящего клиента после входа идёт
+    работа — обычные запросы к базе; у подбирающего пароль нет ничего, кроме
+    login. Это и разделяет случаи.
+    """
+    by_ip = {row["parts"][0]: row["count"] for row in requests or []}
+    found = []
+    for row in logins or []:
+        base, ip = row["parts"][0], row["parts"][1]
+        if row["count"] < LOGIN_BRUTE_PER_HOUR:
+            continue
+        total = by_ip.get(ip, 0)
+        found.append({"base": base, "ip": ip, "count": row["count"],
+                      "requests": total,
+                      "working": total > row["count"] * LOGIN_BRUTE_RATIO})
+    return found

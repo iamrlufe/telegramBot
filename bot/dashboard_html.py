@@ -32,6 +32,7 @@ from db import (
 from ping_tools import load_targets
 from log_store import read_snapshot
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
+from iis_log import detect_brute_force, LOGIN_BRUTE_PER_HOUR
 from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
 from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
@@ -199,17 +200,6 @@ def collect_dashboard_data(hours: int = 24) -> dict:
 
 # ─── IIS ─────────────────────────────────────────────────────
 
-# Перебор паролей 1С. Измеренная норма живого сервера — до 26 входов
-# в СУТКИ с адреса, поэтому 25 за ЧАС это двадцатикратное превышение.
-LOGIN_BRUTE_PER_HOUR = 25
-
-# Столько же входов даст и сломавшийся клиент, который переподключается по
-# кругу. Отличие простое: у настоящего клиента после входов идёт работа, а у
-# подбирающего пароль — только login. Если запросов с адреса не больше чем
-# втрое от числа входов, работы за ними нет.
-LOGIN_BRUTE_RATIO = 3
-
-
 def _pairs(rows: list, parts: int) -> list:
     """Ключи вида 'ip|ua' → разобранные части плюс счётчик."""
     out = []
@@ -225,30 +215,6 @@ def _total(events: dict, name: str) -> int:
         if row["item"] == name:
             return row["count"]
     return 0
-
-
-def detect_brute_force(logins: list, requests: list) -> list:
-    """Подбор пароля 1С по входам за последний час.
-
-    Порог взят с живого сервера: там до 26 входов в СУТКИ с адреса, значит
-    25 за ЧАС — двадцатикратное превышение.
-
-    Столько же входов даёт и сломавшийся клиент, который переподключается по
-    кругу, поэтому мало превышения. У настоящего клиента после входа идёт
-    работа — обычные запросы к базе; у подбирающего пароль нет ничего, кроме
-    login. Это и разделяет случаи.
-    """
-    by_ip = {row["parts"][0]: row["count"] for row in requests or []}
-    found = []
-    for row in logins or []:
-        base, ip = row["parts"][0], row["parts"][1]
-        if row["count"] < LOGIN_BRUTE_PER_HOUR:
-            continue
-        total = by_ip.get(ip, 0)
-        found.append({"base": base, "ip": ip, "count": row["count"],
-                      "requests": total,
-                      "working": total > row["count"] * LOGIN_BRUTE_RATIO})
-    return found
 
 
 def collect_iis() -> list:
@@ -297,7 +263,10 @@ def collect_iis() -> list:
             "requests": _total(events, "requests"),
             "alien": _total(events, "alien"),
             "slow": _total(events, "slow"),
-            "uniq": own_facts.get("uniq_ips") or 0,
+            # Считается по накопленным за сутки ключам, а не берётся из
+            # последнего прохода: сразу после полуночи в файле десяток строк,
+            # и «уникальных адресов: 6» было бы неправдой.
+            "uniq": len(events.get("ip") or []),
             "codes": _pairs(events.get("code"), 1),
             "pubs": pubs,
             "dead": dead,
@@ -1173,7 +1142,6 @@ def _iis_server(server: dict) -> str:
                       "Каталог логов IIS",
                       f'старейший файл от {server["oldest_log"]} — автоочистки нет'
                       if server["oldest_log"] else "автоочистки нет")
-    ports = {r["parts"][0]: r["count"] for r in server["codes"]}
     cards.append(_iis_card(STATUS_GOOD, "Нагрузка и хозяйство",
         f'{_num(server["requests"])} запросов', extra=extra, body=body))
 

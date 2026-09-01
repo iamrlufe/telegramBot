@@ -14,6 +14,7 @@ from service_details import load_service_details, load_platform_details
 from disk_health import format_disk_health, load_disk_health
 from backup_files import disk_of_path
 from backup_verify import path_str
+from iis_store import iis_findings
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
 from linux_check import PSEUDO_MOUNT_PREFIXES
 from onec_logs import (
@@ -828,6 +829,10 @@ def collect_problems() -> list:
             f"🚨 backup не прошёл RESTORE VERIFYONLY\n   {backup_path}: {detail}",
             key=f"verify:{server_name}:{backup_path}")
 
+    for server_name, item in iis_findings():
+        add(item["level"], "iis", server_name, item["text"],
+            hint=item.get("hint"), key=item["key"])
+
     return problems
 
 
@@ -839,6 +844,7 @@ KIND_TITLES = {
     "backup":       ("💾", "Бэкапы"),
     "verify":       ("🧪", "Проверка бэкапов"),
     "onec":         ("📋", "Журналы 1С"),
+    "iis":          ("🌐", "IIS"),
     "backup_stale": ("⏱", "Метрики бэкапов устарели"),
     "stale":        ("⏱", "Данные устарели"),
 }

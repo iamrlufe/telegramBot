@@ -18,6 +18,7 @@ import json
 import threading
 
 from pgconn import get_conn
+from iis_log import detect_brute_force
 
 _ready = False
 _ready_lock = threading.Lock()
@@ -198,3 +199,58 @@ def forget_server(server_name: str):
         cur = conn.cursor()
         for table in ("iis_events", "iis_state", "iis_facts"):
             cur.execute(f"DELETE FROM {table} WHERE server_name = %s", (server_name,))
+
+
+# ─── Находки для сводки проблем и алертов ────────────────────
+
+def iis_findings() -> list:
+    """Находки IIS для сводки проблем: [(сервер, {level, text, key, hint})].
+
+    Три вещи, ради которых стоит идти на сервер: сканер получил успешный
+    ответ, идёт подбор пароля, публикации были недоступны. Всё остальное из
+    IIS-сводки — фон, ему место в дашборде, а не в тревоге.
+    """
+    try:
+        day = read_events(24)
+        hour = read_events(1)
+    except Exception as e:
+        print(f"[iis] Сводка недоступна: {e}", flush=True)
+        return []
+
+    found = []
+    for server_name, events in day.items():
+        for row in (events.get("hit") or [])[:5]:
+            status, uri = (str(row["item"]).split("|") + ["", ""])[:2]
+            found.append((server_name, {
+                "level": "crit",
+                "text": f"🔴 сканер получил ответ {status} на {uri}",
+                "hint": "посторонний путь ответил успехом",
+                "key": f"iis_hit:{server_name}:{uri}",
+            }))
+
+        down = [row for row in (events.get("herr") or [])
+                if row["item"] in ("QueueFull", "AppOffline", "Connections_Refused")]
+        for row in down:
+            found.append((server_name, {
+                "level": "crit",
+                "text": f"🔴 публикации были недоступны: {row['item']} × {row['count']}",
+                "hint": row["item"],
+                "key": f"iis_down:{server_name}:{row['item']}",
+            }))
+
+    for server_name, events in hour.items():
+        logins = [{"parts": (str(r["item"]).split("|") + ["", ""])[:2],
+                   "count": r["count"]} for r in events.get("login") or []]
+        requests = [{"parts": [str(r["item"])], "count": r["count"]}
+                    for r in events.get("ip") or []]
+        for item in detect_brute_force(logins, requests):
+            if item["working"]:
+                continue
+            found.append((server_name, {
+                "level": "crit",
+                "text": (f"🔴 подбор пароля 1С: {item['ip']} → {item['base']}, "
+                         f"{item['count']} входов за час"),
+                "hint": f"{item['count']} входов за час с {item['ip']}",
+                "key": f"iis_brute:{server_name}:{item['ip']}",
+            }))
+    return found

@@ -25,6 +25,7 @@ SMART_STATE_FILE = "/app/data/smart_alert_state.json"
 TIME_DRIFT_STATE_FILE = "/app/data/time_drift_state.json"
 SNAPSHOT_STATE_FILE = "/app/data/snapshot_alert_state.json"
 BACKUP_FAIL_STATE_FILE = "/app/data/backup_fail_state.json"
+IIS_STATE_FILE = "/app/data/iis_alert_state.json"
 
 TIME_DRIFT_ALERT_SEC = 120   # алерт при дрейфе больше 2 минут
 TIME_DRIFT_OK_SEC = 60       # восстановление при дрейфе меньше минуты
@@ -276,6 +277,7 @@ def purge_server_state(server_name: str):
         DISK_FORECAST_STATE_FILE, DISK_TEMP_STATE_FILE, RAID_STATE_FILE,
         "/app/data/backup_alert_state.json",
         BACKUP_FAIL_STATE_FILE,
+        IIS_STATE_FILE,
     ]
     purge_acks_for_server(server_name)
     prefix = f"{server_name}:"
@@ -1192,3 +1194,66 @@ def check_service_alert(server_name: str, service: dict):
         reply_markup=service_alert_kb(server_name, service_name) if is_problem else None,
         ack_key=f"service:{server_name}:{service_name}" if is_problem else None,
     )
+
+
+# ─── IIS ─────────────────────────────────────────────────────
+
+# Сколько часов помнить уже отправленную находку. Сканер долбится сутками,
+# и без памяти алерт уходил бы каждый час на одно и то же.
+IIS_KEEP_HOURS = _int_env("IIS_ALERT_KEEP_HOURS", 12)
+
+# Сколько находок показывать в сообщении: остальное — в карточке сервера.
+IIS_IN_MESSAGE = 5
+
+
+def check_iis_alerts(findings: list):
+    """Алерт по находкам IIS: [(сервер, {level, text, key, hint})].
+
+    Шлётся только новое. Ключ находки устойчивый (сервер + путь либо адрес),
+    поэтому один и тот же сканирующий адрес не будит каждый час, а
+    появившийся новый — будит сразу.
+
+    Сюда попадают ровно три вещи: сканер получил успешный ответ, идёт подбор
+    пароля, публикации были недоступны. Остальная сводка IIS живёт в
+    дашборде и в карточке сервера — будить ею незачем.
+    """
+    if not findings:
+        return
+
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=IIS_KEEP_HOURS)).isoformat()
+    by_server = {}
+    for server_name, item in findings:
+        if is_muted(server_name):
+            continue
+        by_server.setdefault(server_name, []).append(item)
+
+    for server_name, items in by_server.items():
+        with _state_lock:
+            state = load_json(IIS_STATE_FILE)
+            seen = {key: when for key, when in (state.get(server_name) or {}).items()
+                    if when > cutoff}
+            fresh = [i for i in items if i.get("key") and i["key"] not in seen]
+            if not fresh:
+                state[server_name] = seen
+                save_json(IIS_STATE_FILE, state)
+                continue
+            for item in fresh:
+                seen[item["key"]] = now.isoformat()
+            state[server_name] = seen
+            save_json(IIS_STATE_FILE, state)
+
+        lines = ["🌐 IIS: ТРЕБУЕТ ВНИМАНИЯ",
+                 f"🖥 Сервер: {server_name}",
+                 f"Новых находок: {len(fresh)}",
+                 ""]
+        for item in fresh[:IIS_IN_MESSAGE]:
+            lines.append(item["text"])
+        if len(fresh) > IIS_IN_MESSAGE:
+            lines.append(f"… и ещё {len(fresh) - IIS_IN_MESSAGE}")
+        lines.append("")
+        lines.append("Разбор — кнопка 🌐 IIS в карточке сервера.")
+
+        send_or_defer("\n".join(lines),
+                      reply_markup=server_alert_kb(server_name),
+                      ack_key=f"iis:{server_name}")
