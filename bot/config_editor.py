@@ -1033,7 +1033,13 @@ def path_details(field: str, item) -> list:
         lines.append(
             f"   🗓 недельно: {weekday_short(schedule[0])} {schedule[1]:02d}:00"
         )
-        lines.append("   ⏱ порог возраста: не применяется (недельная копия)")
+        # «Не применяется» без продолжения читалось как «возраст не
+        # проверяется вовсе», и пропущенный дедлайн в карточке выглядел
+        # необъяснимым красным.
+        lines.append(
+            f"   ⏱ порог возраста не применяется — вместо него проверяется "
+            f"пропуск срока {weekday_short(schedule[0])} {schedule[1]:02d}:00"
+        )
     else:
         hours = data.get("alert_hours")
         lines.append(

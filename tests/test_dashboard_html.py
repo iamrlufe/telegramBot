@@ -253,9 +253,19 @@ def _backup_server(name, state, counts, items):
 
 
 def _backup_item(state, path="E:\\Backups", btype="SQL", files=10, age_h=2.0,
-                 size_gb=1.0, free_pct=50.0, missing=False, error=""):
+                 size_gb=1.0, free_pct=50.0, missing=False, error="", weekly=None):
     return {"type": btype, "path": path, "state": state, "files": files, "age_h": age_h,
-            "size_gb": size_gb, "free_pct": free_pct, "missing": missing, "error": error}
+            "size_gb": size_gb, "free_pct": free_pct, "missing": missing,
+            "error": error, "weekly": weekly}
+
+
+def _with_backups(servers):
+    data = _data([_server("a.example.local")])
+    data["logs"] = {"win": [], "sql": []}
+    data["backups"] = {"servers": servers,
+                       "totals": {"crit": 1, "warn": 0, "ok": 0}, "size_gb": 1.0}
+    data["iis"] = []
+    return dh.render_dashboard(data)
 
 
 def _full(servers=(), logs=None, backups=None):
@@ -490,3 +500,35 @@ def test_unique_ips_counted_over_the_day_not_the_last_batch():
 
     assert "Уникальных адресов за сутки" in page
     assert "145" in page
+
+
+# ─── Недельные копии в отчёте ────────────────────────────────
+
+def test_weekly_backup_row_explains_why_it_is_red():
+    """У недельной копии порог возраста не применяется, и красная строка
+    «свежий 3 дн назад» без пояснения противоречит настройке. Причина —
+    пропущенный срок, и она должна быть написана."""
+    page = _with_backups([_backup_server(
+        "sql-01.example.local", "crit", {"crit": 1, "warn": 0, "ok": 0},
+        [_backup_item("crit", path="F:\\backup\\FULL", age_h=72.0,
+                      weekly=("mon", 9))])])
+
+    assert "недельная копия пн 09:00: срок пропущен" in page
+
+
+def test_healthy_weekly_backup_names_the_schedule():
+    page = _with_backups([_backup_server(
+        "sql-01.example.local", "ok", {"crit": 0, "warn": 0, "ok": 1},
+        [_backup_item("ok", path="F:\\backup\\FULL", age_h=20.0,
+                      weekly=("mon", 9))])])
+
+    assert "недельная копия пн 09:00" in page
+    assert "срок пропущен" not in page
+
+
+def test_daily_backup_says_nothing_about_schedule():
+    page = _with_backups([_backup_server(
+        "sql-01.example.local", "warn", {"crit": 0, "warn": 1, "ok": 0},
+        [_backup_item("warn", path="F:\\backup\\daily", age_h=26.0)])])
+
+    assert "недельная копия" not in page

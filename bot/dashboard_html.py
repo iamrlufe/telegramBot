@@ -38,6 +38,7 @@ from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
     BACKUP_STATUS_MISSING,
 )
+from backup_schedule import schedule_for, weekday_short
 
 ALMATY = ZoneInfo("Asia/Almaty")
 
@@ -378,7 +379,13 @@ def collect_backups() -> dict:
         total_disk = float(row.get("disk_total_gb") or 0)
         if total_disk > 0 and row.get("disk_free_gb") is not None:
             free_pct = float(row["disk_free_gb"]) / total_disk * 100
+        # Недельная копия оценивается по пропуску срока, а не по возрасту
+        # файла: без расписания рядом красная строка «свежий 3 дн назад»
+        # выглядит противоречащей настройке «порог возраста не применяется».
+        weekly = schedule_for(schedule_map, row["server_name"],
+                              row.get("backup_type"), row.get("backup_path"))
         by_server[row["server_name"]].append({
+            "weekly": weekly,
             "type": (row.get("backup_type") or "").upper(),
             "path": row.get("backup_path") or "",
             "state": state,
@@ -900,6 +907,12 @@ def _backup_card(server: dict) -> str:
             if item["free_pct"] is not None and item["free_pct"] < DISK_WARN_FREE:
                 bits.append(f'на диске свободно {item["free_pct"]:.0f}%')
             detail = " · ".join(bits)
+        if item["weekly"]:
+            day, hour = item["weekly"]
+            plan = f"{weekday_short(day)} {hour:02d}:00"
+            detail += (f' · недельная копия {plan}: срок пропущен'
+                       if item["state"] == "crit"
+                       else f' · недельная копия {plan}')
         rows.append(
             f'<div class="lrow"><i class="dotc" style="--c:{color};margin-top:5px"></i>'
             f'<span class="t">{html.escape(item["type"])}</span>'
