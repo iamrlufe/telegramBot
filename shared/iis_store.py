@@ -18,7 +18,7 @@ import json
 import threading
 
 from pgconn import get_conn
-from iis_log import detect_brute_force
+from iis_log import detect_brute_force, parse_hit
 
 _ready = False
 _ready_lock = threading.Lock()
@@ -220,7 +220,10 @@ def iis_findings() -> list:
     found = []
     for server_name, events in day.items():
         for row in (events.get("hit") or [])[:5]:
-            uri, ip, _ua = (str(row["item"]).split("|") + ["", "", ""])[:3]
+            parsed = parse_hit(row["item"])
+            if not parsed:
+                continue
+            uri, ip, _ua = parsed
             found.append((server_name, {
                 "level": "crit",
                 "text": f"🔴 сервер отдал {uri} — запрос с {ip}",

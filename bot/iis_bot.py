@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
-from iis_log import detect_brute_force, is_cloudflare
+from iis_log import detect_brute_force, is_cloudflare, parse_hit
 from geoip import resolve as geo_resolve, tag as geo_tag
 from iis_store import read_events, read_facts
 from tg_utils import safe_edit_message
@@ -53,12 +53,35 @@ def period_name(hours: int) -> str:
     return "24 часа" if hours <= PERIOD_SHORT_HOURS else "7 дней"
 
 
+def _block_button(server_name: str):
+    """Кнопка блокировки прямо здесь: адреса сканеров видно в этом разделе,
+    и заставлять переписывать их руками в другом — работа впустую.
+
+    Появляется только там, где раздел блокировок вообще включён. Сломанный
+    конфиг не должен уносить всё меню, поэтому ошибка чтения означает
+    отсутствие кнопки, а не отсутствие раздела.
+    """
+    try:
+        from firewall import has_firewall
+        from firewall_bot import fw_token
+        from refresh import load_server
+
+        if not has_firewall(load_server(server_name)):
+            return None
+    except Exception:
+        return None
+    return [InlineKeyboardButton(
+        "🛡 Заблокировать сканеров",
+        callback_data=f"fw_pick:{fw_token(server_name)}")]
+
+
 def iis_menu_kb(server_name: str, hours: int) -> InlineKeyboardMarkup:
     def cb(section: str) -> str:
         return f"iis_{section}:{iis_token(server_name, hours)}"
 
     other = PERIOD_LONG_HOURS if hours <= PERIOD_SHORT_HOURS else PERIOD_SHORT_HOURS
-    return InlineKeyboardMarkup([
+    block = _block_button(server_name)
+    return InlineKeyboardMarkup([row for row in [
         [
             InlineKeyboardButton("🔎 Сканирование", callback_data=cb("scan")),
             InlineKeyboardButton("🔑 Вход в 1С", callback_data=cb("login")),
@@ -71,12 +94,13 @@ def iis_menu_kb(server_name: str, hours: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📚 Публикации", callback_data=cb("pubs")),
             InlineKeyboardButton("🚧 HTTPERR", callback_data=cb("herr")),
         ],
+        block,
         [InlineKeyboardButton(
             f"🕒 Период: {period_name(other)}",
             callback_data=f"iis_menu:{iis_token(server_name, other)}",
         )],
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"server:{server_name}")],
-    ])
+    ] if row])
 
 
 # ─── Разбор данных ───────────────────────────────────────────
@@ -87,6 +111,17 @@ def _rows(events: dict, category: str, parts: int = 1) -> list:
         chunks = str(row["item"]).split("|")
         chunks += [""] * (parts - len(chunks))
         out.append((chunks[:parts], row["count"]))
+    return out
+
+
+def hit_rows(events: dict) -> list:
+    """Находки сканера: разбор ключа отсеивает старый формат с редиректами
+    и безобидные пути, попавшие в базу до появления фильтра."""
+    out = []
+    for row in events.get("hit") or []:
+        parsed = parse_hit(row["item"])
+        if parsed:
+            out.append((list(parsed), row["count"]))
     return out
 
 
@@ -115,7 +150,7 @@ def _empty(title: str, hours: int) -> str:
 
 def format_scan(events: dict, hours: int, geo: dict = None) -> str:
     alien = _total(events, "alien")
-    hits = _rows(events, "hit", 3)
+    hits = hit_rows(events)
     scan = _rows(events, "scan", 2)
     if not alien and not scan:
         return _empty("🔎 Сканирование извне", hours)

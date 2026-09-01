@@ -247,3 +247,121 @@ def test_firewall_is_windows_only():
     assert "firewall" in WINDOWS_ONLY_FIELDS
     assert "firewall" in TOGGLE_FIELDS
     assert "firewall" in WIZARD_ORDER
+
+
+# ─── Кандидаты на блокировку ─────────────────────────────────
+
+def _events(**categories):
+    return {name: [{"item": item, "count": count} for item, count in rows]
+            for name, rows in categories.items()}
+
+
+def test_candidate_from_successful_hit():
+    """Первый повод: сервер отдал содержимое по постороннему пути."""
+    events = _events(hit=[("/shell.php|203.0.113.5|curl", 3)])
+    found = firewall_bot.candidates(events, {}, SERVER, [], [])
+    assert [i["address"] for i in found] == ["203.0.113.5"]
+    assert "/shell.php" in found[0]["reason"]
+
+
+def test_candidate_from_scan_volume():
+    events = _events(scan=[("203.0.113.5|curl", 900)])
+    found = firewall_bot.candidates(events, {}, SERVER, [], [])
+    assert found[0]["address"] == "203.0.113.5"
+    assert "900" in found[0]["reason"]
+
+
+def test_quiet_address_is_not_offered():
+    """Одиночные запросы к /.env шлёт кто угодно — блокировать не за что."""
+    events = _events(scan=[("203.0.113.5|curl", 3)])
+    assert firewall_bot.candidates(events, {}, SERVER, [], []) == []
+
+
+def test_candidate_from_brute_force():
+    hour = _events(login=[("base|203.0.113.9", 40)],
+                   ip=[("203.0.113.9", 41)])
+    found = firewall_bot.candidates({}, hour, SERVER, [], [])
+    assert found[0]["address"] == "203.0.113.9"
+    assert "подбор пароля" in found[0]["reason"]
+
+
+def test_working_client_is_not_a_candidate():
+    """40 входов даёт и сломавшийся клиент, но после входа он работает."""
+    hour = _events(login=[("base|203.0.113.9", 40)],
+                   ip=[("203.0.113.9", 5000)])
+    assert firewall_bot.candidates({}, hour, SERVER, [], []) == []
+
+
+def test_cloudflare_node_is_never_offered():
+    """Предложить узел прокси значит предложить выключить сайт."""
+    events = _events(scan=[("104.16.0.5|curl", 5000)])
+    assert firewall_bot.candidates(events, {}, SERVER, [], []) == []
+
+
+def test_own_and_internal_addresses_are_not_offered():
+    events = _events(scan=[("127.0.0.1|curl", 5000),
+                           ("192.0.2.11|curl", 5000),
+                           ("10.20.30.5|curl", 5000)])
+    assert firewall_bot.candidates(events, {}, SERVER, [], []) == []
+
+
+def test_already_blocked_and_whitelisted_are_skipped():
+    events = _events(scan=[("203.0.113.5|curl", 900),
+                           ("203.0.113.6|curl", 800)])
+    found = firewall_bot.candidates(events, {}, SERVER,
+                                    ["203.0.113.5"], ["203.0.113.6"])
+    assert found == []
+
+
+def test_hit_beats_volume_in_order():
+    """Отданное содержимое важнее объёма: разбирать начинают сверху."""
+    events = _events(hit=[("/shell.php|203.0.113.5|curl", 2)],
+                     scan=[("203.0.113.7|curl", 9000),
+                           ("203.0.113.5|curl", 10)])
+    found = firewall_bot.candidates(events, {}, SERVER, [], [])
+    assert [i["address"] for i in found] == ["203.0.113.5", "203.0.113.7"]
+
+
+def test_address_offered_once():
+    events = _events(hit=[("/a.php|203.0.113.5|curl", 2),
+                          ("/b.php|203.0.113.5|curl", 2)],
+                     scan=[("203.0.113.5|curl", 900)])
+    found = firewall_bot.candidates(events, {}, SERVER, [], [])
+    assert len(found) == 1
+
+
+def test_candidate_list_is_capped():
+    events = _events(scan=[(f"203.0.113.{i}|curl", 900) for i in range(1, 40)])
+    assert len(firewall_bot.candidates(events, {}, SERVER, [], [])) == \
+        firewall_bot.PICK_LIMIT
+
+
+# ─── Экран выбора ────────────────────────────────────────────
+
+def test_pick_text_marks_chosen():
+    items = [{"address": "203.0.113.5", "reason": "сервер отдал /shell.php",
+              "level": 0, "count": 5}]
+    text = firewall_bot.pick_text("mail-01", items, {0}, {})
+    assert "☑️ 203.0.113.5" in text
+    assert "Выбрано: 1 из 1" in text
+
+
+def test_pick_text_shows_country():
+    items = [{"address": "203.0.113.5", "reason": "900 запросов",
+              "level": 1, "count": 900}]
+    text = firewall_bot.pick_text("mail-01", items, set(),
+                                  {"203.0.113.5": "🇳🇱 Amsterdam"})
+    assert "🇳🇱 Amsterdam" in text
+
+
+def test_empty_pick_explains_the_rules():
+    text = firewall_bot.pick_text("mail-01", [], set(), {})
+    assert "Некого предлагать" in text
+    assert "Cloudflare" in text
+
+
+def test_term_button_cycles():
+    assert firewall_bot.next_days(3) == 7
+    assert firewall_bot.next_days(7) == 30
+    assert firewall_bot.next_days(30) is None
+    assert firewall_bot.next_days(None) == 3

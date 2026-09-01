@@ -225,3 +225,41 @@ def test_single_row_normalized(monkeypatch):
     data = iis_log.read_site_logs(SERVER, {})
 
     assert data["alienuris"] == [{"k": "/index.php", "n": 5}]
+
+
+# ─── Разбор находок: старый формат ключа ─────────────────────
+
+def test_hit_key_current_format():
+    assert iis_log.parse_hit("/shell.php|203.0.113.5|curl") == (
+        "/shell.php", "203.0.113.5", "curl")
+
+
+def test_legacy_key_with_status_is_realigned():
+    """Восемь дней в базе живут ключи со старым порядком полей. Без разбора
+    код ответа встаёт на место пути и раздел показывает «200 302»."""
+    assert iis_log.parse_hit("200|/shell.php|203.0.113.5|curl") == (
+        "/shell.php", "203.0.113.5", "curl")
+
+
+def test_legacy_redirect_is_not_a_finding():
+    """Раньше писались 301 и 302 — ими сервер ничего не отдал."""
+    assert iis_log.parse_hit("302|/index.php|203.0.113.5|curl") is None
+    assert iis_log.parse_hit("301|/index.php|203.0.113.5|curl") is None
+
+
+def test_innocent_paths_are_not_findings():
+    """robots.txt и sitemap.xml попали в базу до появления фильтра — за
+    ними ходят поисковые роботы, а не взломщики."""
+    for uri in ("/robots.txt", "/sitemap.xml", "/favicon.ico",
+                "/iisstart.htm", "/.well-known/x"):
+        assert iis_log.parse_hit(f"200|{uri}|203.0.113.5|curl") is None, uri
+        assert iis_log.parse_hit(f"{uri}|203.0.113.5|curl") is None, uri
+
+
+def test_root_is_not_a_finding():
+    assert iis_log.parse_hit("/|203.0.113.5|curl") is None
+
+
+def test_broken_key_does_not_raise():
+    assert iis_log.parse_hit("") is None
+    assert iis_log.parse_hit(None) is None

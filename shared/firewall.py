@@ -116,17 +116,25 @@ INSIDE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 _INSIDE = None
 
 
-def warn_reason(target: str) -> str:
-    """Предупреждение, при котором блокировать всё же можно."""
+def is_inside(target: str) -> bool:
+    """Адрес или сеть — из своих. Блокировать можно, но предлагать не надо."""
     global _INSIDE
 
+    if not target:
+        return False
     net = _network(target)
     if _INSIDE is None:
         _INSIDE = [ipaddress.ip_network(n) for n in INSIDE_NETS]
-    for inside in _INSIDE:
-        if net.version == inside.version and net.subnet_of(inside):
-            return ("⚠️ Это адрес внутренней сети — скорее всего, свой офис "
-                    "или филиал, а не сканер извне.")
+    return any(net.version == inside.version and net.subnet_of(inside)
+               for inside in _INSIDE)
+
+
+def warn_reason(target: str) -> str:
+    """Предупреждение, при котором блокировать всё же можно."""
+    net = _network(target)
+    if is_inside(target):
+        return ("⚠️ Это адрес внутренней сети — скорее всего, свой офис "
+                "или филиал, а не сканер извне.")
     if net.num_addresses > 256:
         return f"⚠️ Под блокировку попадёт {net.num_addresses} адресов."
     return ""

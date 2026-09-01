@@ -33,7 +33,7 @@ from ping_tools import load_targets
 from log_store import read_snapshot
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
 from geoip import resolve as geo_resolve
-from iis_log import detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
+from iis_log import parse_hit, detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
 from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
 from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
@@ -271,7 +271,13 @@ def collect_iis() -> list:
             _pairs(hour.get(name, {}).get("ip"), 1),
         )
 
-        hits = _pairs(events.get("hit"), 3)
+        # Разбор, а не простое деление ключа: в базе восемь дней живут
+        # записи старого формата, где первым полем шёл код ответа и
+        # писались редиректы.
+        hits = [{"parts": list(parsed), "count": row["count"]}
+                for row, parsed in (
+                    (r, parse_hit(r["item"])) for r in events.get("hit") or [])
+                if parsed]
         herr = _pairs(events.get("herr"), 1)
         down_reasons = [h for h in herr
                         if h["parts"][0] in ("QueueFull", "AppOffline",
