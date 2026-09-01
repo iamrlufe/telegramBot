@@ -228,8 +228,9 @@ def validate_config(servers) -> None:
             if bah < 1 or bah > 720:
                 raise ValueError(f"Сервер «{name}»: backup_alert_hours должно быть от 1 до 720")
 
-        for flag in ("dbsize", "exchange", "firewall", "verify_backup",
-                     "backup_size_check", "verify_ssl", "legacy_tls"):
+        for flag in ("dbsize", "exchange", "firewall", "zimbra",
+                     "verify_backup", "backup_size_check", "verify_ssl",
+                     "legacy_tls"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
 
@@ -410,6 +411,19 @@ FIELD_DEFS = {
                   "раздел появится и без этого флага.",
         "kind": "bool",
     },
+    "zimbra": {
+        "label": "Почта Zimbra",
+        "prompt": "Это почтовый сервер Zimbra или Postfix? (да/нет)\n"
+                  "Открывает кнопку 📬 Почта (Zimbra) в карточке: кто "
+                  "отправляет, кто заходит, что не доставлено, что отбито "
+                  "на входе.\n"
+                  "Если среди сервисов уже есть zimbra или postfix, раздел "
+                  "появится и без этого флага.\n\n"
+                  "Учётке нужен доступ на чтение /var/log/mail.log (группа "
+                  "adm) и /opt/zimbra/log/audit.log (группа zimbra) либо "
+                  "правило sudo без пароля на cat и zcat.",
+        "kind": "bool",
+    },
     "firewall": {
         "label": "Блокировка IP",
         "prompt": "Разрешить боту блокировать адреса на этом сервере? (да/нет)\n"
@@ -501,7 +515,8 @@ FIELD_DEFS = {
 WIZARD_ORDER = [
     "name", "host", "type", "username", "password", "services",
     "backups_sql", "backups_1c", "backups_veeam", "onec_logs",
-    "dbsize", "exchange", "firewall", "retention_days", "backup_alert_hours",
+    "dbsize", "exchange", "firewall", "zimbra", "retention_days",
+    "backup_alert_hours",
     "backup_size_check",
     "verify_backup", "reg_file",
     "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
@@ -521,6 +536,10 @@ WINDOWS_ONLY_FIELDS = {
     "verify_backup", "reg_file",
 }
 
+# Поля только для Linux: почтовые журналы Zimbra читаются по SSH, и на
+# Windows-сервере такому флагу взяться неоткуда.
+LINUX_ONLY_FIELDS = {"zimbra"}
+
 # Поля только для vmware: TLS до vCenter и пороги по снапшотам.
 # На остальных типах их показывать незачем.
 VMWARE_ONLY_FIELDS = {
@@ -530,7 +549,7 @@ VMWARE_ONLY_FIELDS = {
 # Чего у VMware нет: бэкапы, MSSQL, журналы 1С и реестр Windows.
 # Каталогов с копиями там тоже нет — датастор не файловая система,
 # доступная монитору, поэтому пути бэкапов исключаются целиком.
-VMWARE_EXCLUDED_FIELDS = WINDOWS_ONLY_FIELDS | {
+VMWARE_EXCLUDED_FIELDS = WINDOWS_ONLY_FIELDS | LINUX_ONLY_FIELDS | {
     "backups_sql", "backups_1c", "backups_veeam",
     "backup_alert_hours", "backup_size_check",
 }
@@ -558,7 +577,8 @@ def build_wizard_order(type_value) -> list:
         return list(LINUX_WIZARD_ORDER)
     if type_value == "vmware":
         return list(VMWARE_WIZARD_ORDER)
-    return [key for key in WIZARD_ORDER if key not in VMWARE_ONLY_FIELDS]
+    return [key for key in WIZARD_ORDER
+            if key not in VMWARE_ONLY_FIELDS and key not in LINUX_ONLY_FIELDS]
 
 
 # Популярные systemd-юниты: выбор кнопками при типе linux
@@ -623,7 +643,7 @@ EDIT_FIELDS = [
     ["reg_file"],
     ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
-TOGGLE_FIELDS = ["dbsize", "exchange", "firewall", "verify_backup",
+TOGGLE_FIELDS = ["dbsize", "exchange", "firewall", "zimbra", "verify_backup",
                  "backup_size_check"]
 
 # Флаги, отсутствие которых в конфиге означает «включено», а не «выключено».
@@ -1410,7 +1430,9 @@ def edit_fields_kb(server: dict):
         elif server_type == "vmware":
             row_keys = [key for key in row_keys if key not in VMWARE_EXCLUDED_FIELDS]
         else:
-            row_keys = [key for key in row_keys if key not in VMWARE_ONLY_FIELDS]
+            row_keys = [key for key in row_keys
+                        if key not in VMWARE_ONLY_FIELDS
+                        and key not in LINUX_ONLY_FIELDS]
         if not row_keys:
             continue
         keyboard.append([
@@ -1442,6 +1464,13 @@ def edit_fields_kb(server: dict):
             InlineKeyboardButton(
                 f"Проверка размера: {'✅' if server.get('backup_size_check') else '❌'}",
                 callback_data="cfg_toggle:backup_size_check"
+            ),
+        ])
+    if server_type == "linux":
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📬 Почта Zimbra: {'✅' if server.get('zimbra') else '❌'}",
+                callback_data="cfg_toggle:zimbra"
             ),
         ])
     if server_type == "vmware":
@@ -2928,6 +2957,60 @@ HELP_GEO = """🌍 СТРАНА И ГОРОД ПО IP
 запросов не требуют."""
 
 
+HELP_ZIMBRA = """📬 ПОЧТА (ZIMBRA)
+
+Кнопка у Linux-сервера с флагом «📬 Почта Zimbra» либо со службой
+zimbra/postfix среди сервисов.
+
+Два источника, и это не прихоть. В postfix-логе Zimbra НЕТ записей
+об аутентификации: люди работают через веб и mailboxd, а postfix
+получает готовое письмо — sasl_username= там не встречается ни разу.
+Кто и откуда заходил, знает только /opt/zimbra/log/audit.log.
+
+━━━━━━━━━━━━━━━━━━━━
+📑 РАЗДЕЛЫ
+
+📤 Отправители — сколько писем и на сколько адресов ушло от каждого,
+  и КАК отправлено: через веб, напрямую изнутри или снаружи.
+🔑 Входы — учётки, адреса со странами, подбор пароля, входы из-за
+  границы. Админ-консоль (:7073) считается отдельно.
+📦 Очередь — сколько писем в очереди сейчас, что не доставлено и
+  почему. Over quota видно здесь.
+🚫 Отбитые — письма, не принятые на входе. Тысячи в сутки тут норма:
+  значит атака отбивается ДО приёма письма.
+
+━━━━━━━━━━━━━━━━━━━━
+✉️ ПОЧЕМУ ПИСЕМ МЕНЬШЕ, ЧЕМ СТРОК В ЛОГЕ
+
+Одно письмо проходит через амавис двумя очередями и даёт 2-3 записи
+from=. Счёт идёт по уникальным message-id, поэтому число здесь втрое
+меньше того, что даёт наивный grep по логу — и оно верное.
+
+━━━━━━━━━━━━━━━━━━━━
+🔔 ЧТО ПОПАДАЕТ В АЛЕРТЫ
+
+Три вещи и только они:
+🔴 удачный вход не из домашней страны — пароль уже знают;
+🔴 подбор пароля: неудачные попытки с адреса на одну учётку;
+🔴 письма своей учётки сданы С БЕЛОГО АДРЕСА — здесь все пишут через
+  веб, а служебные учётки сдают почту с внутренних адресов; отправка
+  снаружи не описывается ни тем, ни другим.
+
+Всплеск отправки и раздутая очередь идут как 🟠. Отбитые на входе не
+будят никогда — это признак работающей защиты, а не проблемы.
+
+Пороги — в .env (ZIMBRA_*). Алерты проходят через общий механизм:
+mute, тихие часы, «Принято», утренняя сводка.
+
+━━━━━━━━━━━━━━━━━━━━
+🔐 ПРАВА НА СЕРВЕРЕ
+
+/var/log/mail.log принадлежит syslog:adm, audit.log — zimbra:zimbra.
+Учётке мониторинга нужна группа adm и zimbra либо правило sudo без
+пароля на cat и zcat. Без прав раздел скажет, чего не хватает, а не
+покажет пустой отчёт."""
+
+
 HELP_SECTIONS = {
     "start":   ("🚀 С чего начать",        HELP_START),
     "menu":    ("📂 Меню и команды",       HELP_MENU),
@@ -2943,6 +3026,7 @@ HELP_SECTIONS = {
     "sqljobs": ("🕒 Джобы SQL Agent",     HELP_SQLJOBS),
     "winlog":  ("📜 Логи Windows",         HELP_WINLOG),
     "exchange": ("📧 Почта",                HELP_EXCHANGE),
+    "zimbra":  ("📬 Почта Zimbra",         HELP_ZIMBRA),
     "iis":     ("🌐 IIS",                  HELP_IIS),
     "geo":     ("🌍 Страна по IP",        HELP_GEO),
     "firewall": ("🛡 Блокировка IP",     HELP_FIREWALL),

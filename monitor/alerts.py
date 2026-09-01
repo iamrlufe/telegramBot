@@ -26,6 +26,7 @@ TIME_DRIFT_STATE_FILE = "/app/data/time_drift_state.json"
 SNAPSHOT_STATE_FILE = "/app/data/snapshot_alert_state.json"
 BACKUP_FAIL_STATE_FILE = "/app/data/backup_fail_state.json"
 IIS_STATE_FILE = "/app/data/iis_alert_state.json"
+ZIMBRA_STATE_FILE = "/app/data/zimbra_alert_state.json"
 
 TIME_DRIFT_ALERT_SEC = 120   # алерт при дрейфе больше 2 минут
 TIME_DRIFT_OK_SEC = 60       # восстановление при дрейфе меньше минуты
@@ -1206,16 +1207,14 @@ IIS_KEEP_HOURS = _int_env("IIS_ALERT_KEEP_HOURS", 12)
 IIS_IN_MESSAGE = 5
 
 
-def check_iis_alerts(findings: list):
-    """Алерт по находкам IIS: [(сервер, {level, text, key, hint})].
+def _findings_alert(findings: list, state_file: str, title: str,
+                    hint: str, prefix: str):
+    """Общий механизм «шлём только новое» для сводок с находками.
 
-    Шлётся только новое. Ключ находки устойчивый (сервер + путь либо адрес),
-    поэтому один и тот же сканирующий адрес не будит каждый час, а
-    появившийся новый — будит сразу.
-
-    Сюда попадают ровно три вещи: сканер получил успешный ответ, идёт подбор
-    пароля, публикации были недоступны. Остальная сводка IIS живёт в
-    дашборде и в карточке сервера — будить ею незачем.
+    Ключ находки устойчивый (сервер + путь либо адрес), поэтому один и тот
+    же сканирующий адрес не будит каждый час, а появившийся новый — будит
+    сразу. Одинаково нужен и IIS, и почте Zimbra: разница только в тексте
+    и в файле состояния.
     """
     if not findings:
         return
@@ -1230,20 +1229,20 @@ def check_iis_alerts(findings: list):
 
     for server_name, items in by_server.items():
         with _state_lock:
-            state = load_json(IIS_STATE_FILE)
+            state = load_json(state_file)
             seen = {key: when for key, when in (state.get(server_name) or {}).items()
                     if when > cutoff}
             fresh = [i for i in items if i.get("key") and i["key"] not in seen]
             if not fresh:
                 state[server_name] = seen
-                save_json(IIS_STATE_FILE, state)
+                save_json(state_file, state)
                 continue
             for item in fresh:
                 seen[item["key"]] = now.isoformat()
             state[server_name] = seen
-            save_json(IIS_STATE_FILE, state)
+            save_json(state_file, state)
 
-        lines = ["🌐 IIS: ТРЕБУЕТ ВНИМАНИЯ",
+        lines = [title,
                  f"🖥 Сервер: {server_name}",
                  f"Новых находок: {len(fresh)}",
                  ""]
@@ -1252,8 +1251,31 @@ def check_iis_alerts(findings: list):
         if len(fresh) > IIS_IN_MESSAGE:
             lines.append(f"… и ещё {len(fresh) - IIS_IN_MESSAGE}")
         lines.append("")
-        lines.append("Разбор — кнопка 🌐 IIS в карточке сервера.")
+        lines.append(hint)
 
         send_or_defer("\n".join(lines),
                       reply_markup=server_alert_kb(server_name),
-                      ack_key=f"iis:{server_name}")
+                      ack_key=f"{prefix}:{server_name}")
+
+
+def check_iis_alerts(findings: list):
+    """Алерт по находкам IIS: [(сервер, {level, text, key, hint})].
+
+    Сюда попадают ровно три вещи: сканер получил успешный ответ, идёт подбор
+    пароля, публикации были недоступны. Остальная сводка IIS живёт в
+    дашборде и в карточке сервера — будить ею незачем.
+    """
+    _findings_alert(findings, IIS_STATE_FILE, "🌐 IIS: ТРЕБУЕТ ВНИМАНИЯ",
+                    "Разбор — кнопка 🌐 IIS в карточке сервера.", "iis")
+
+
+def check_zimbra_alerts(findings: list):
+    """Алерт по находкам почты Zimbra.
+
+    Три повода и только они: удачный вход не из домашней страны, подбор
+    пароля, письма своей учётки сданы с белого адреса. Объём отправки,
+    очередь и отбитые на входе — фон: их место в разделе, а не в тревоге.
+    """
+    _findings_alert(findings, ZIMBRA_STATE_FILE, "📬 ПОЧТА: ТРЕБУЕТ ВНИМАНИЯ",
+                    "Разбор — кнопка 📬 Почта (Zimbra) в карточке сервера.",
+                    "zimbra")

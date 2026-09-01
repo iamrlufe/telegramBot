@@ -1,0 +1,536 @@
+"""
+shared/zimbra_log.py
+
+Почтовый сервер Zimbra: кто отправляет, кто заходит, что не доставлено.
+
+Два источника, и это не прихоть. В postfix-логе Zimbra **нет** записей об
+аутентификации: пользователи работают через mailboxd (веб, IMAP,
+ActiveSync), а postfix получает уже готовое письмо, поэтому `sasl_username=`
+там не встречается ни разу. Кто и откуда заходил, знает только
+`/opt/zimbra/log/audit.log` — там `account=`, `oip=` и причина отказа.
+
+Счёт писем — по уникальным `message-id`, а не по строкам `from=`. Одно
+письмо проходит через амавис двумя очередями:
+
+    pickup   88B25A009C: uid=0 from=<root>
+    cleanup  88B25A009C: message-id=<X>
+    qmgr     88B25A009C: from=<...>, nrcpt=1
+    cleanup  F1216A0087: message-id=<X>        ← та же почта, новая очередь
+    smtp     88B25A009C: ... status=sent (queued as F1216A0087)
+
+На живом сервере это даёт троекратное расхождение: 15628 строк `from=`
+против 5338 очередей и вдвое меньшего числа настоящих писем. Ключ
+`message-id` не зависит от того, как настроен обвес: сменится топология —
+счёт останется верным.
+
+Считает сам сервер одним проходом awk: суточный mail.log это 25 МБ, и
+тянуть его в бота незачем.
+"""
+import os
+
+from linux_check import run_ssh
+
+# Где искать. Первый существующий и непустой и берётся: на Zimbra
+# /var/log/zimbra.log обычно пустышка, оставшаяся с установки, а живой лог —
+# обычный mail.log. Пустой файл вместо живого означал бы отчёт «проблем нет»
+# на пустом месте.
+MAIL_LOGS = ("/var/log/mail.log", "/var/log/maillog", "/var/log/zimbra.log")
+AUDIT_LOGS = ("/opt/zimbra/log/audit.log",)
+
+# postqueue у Zimbra не в PATH: он лежит в своём префиксе, и у root его
+# без полного пути нет. Отсюда «в очереди 0 писем» там, где их сотни.
+POSTQUEUE_PATHS = ("/opt/zimbra/common/sbin/postqueue",
+                   "/usr/sbin/postqueue", "postqueue")
+
+# Сколько групп отдавать в каждом списке: сводка, а не выгрузка.
+TOP = 20
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+# Порог всплеска отправки. Считается в письмах, а не в строках лога,
+# поэтому число меньше привычного втрое.
+SEND_ALERT = _int_env("ZIMBRA_SEND_ALERT", 2000)
+
+# Писем в очереди. Здоровая очередь на живом сервере — единицы.
+QUEUE_ALERT = _int_env("ZIMBRA_QUEUE_ALERT", 300)
+
+# Неудачных входов с одного адреса за сутки.
+AUTH_FAIL_ALERT = _int_env("ZIMBRA_AUTH_FAIL_ALERT", 50)
+
+# Страна, из которой входы считаются штатными.
+HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
+
+
+def _reader(path: str) -> str:
+    """Читалка файла с повышением прав, только если оно нужно.
+
+    mail.log принадлежит syslog:adm, audit.log — zimbra:zimbra, и учётка
+    мониторинга обычно не в этих группах. `sudo -n` не спрашивает пароль:
+    если правила нет, команда честно падает, и текст ошибки скажет, чего
+    не хватает, вместо пустого отчёта.
+    """
+    return (f'if [ -r "{path}" ]; then cat "{path}"; '
+            f'else sudo -n cat "{path}"; fi')
+
+
+def _pick_script(paths) -> str:
+    """Первый существующий непустой файл из списка."""
+    items = " ".join(f'"{p}"' for p in paths)
+    return (f'for f in {items}; do '
+            f'if [ -s "$f" ]; then echo "$f"; break; fi; done')
+
+
+# ─── Разбор mail.log ─────────────────────────────────────────
+
+# Awk без mktime и systime: на Ubuntu по умолчанию стоит mawk, а этих
+# функций там нет — скрипт с ними падает на живом сервере, хотя локально
+# на gawk проходит. Поэтому начало каждых суток окна считает shell (`date`)
+# и передаёт таблицей, а awk только складывает часы, минуты и секунды.
+#
+# Метка syslog — «Aug 30 06:26:23», без года. Разбирать её в awk и гадать
+# год не нужно: ключ «Aug 30» ищется в готовой таблице, и всё, чего в
+# таблице нет, к окну не относится по определению.
+_MAIL_AWK = r'''
+function grab(line, key, endch,   p, q, s) {
+  p = index(line, key); if (p == 0) return ""
+  s = substr(line, p + length(key)); q = index(s, endch)
+  if (q > 0) s = substr(s, 1, q - 1)
+  return s
+}
+function short(s) { return length(s) > 90 ? substr(s, 1, 90) : s }
+NR == FNR { p = index($0, "|"); day[substr($0, 1, p - 1)] = substr($0, p + 1); next }
+{
+  k = substr($0, 1, 6)
+  if (!(k in day)) next
+  split($3, t, ":")
+  ts = day[k] + t[1] * 3600 + t[2] * 60 + t[3]
+  if (ts < cut) next
+  prog = $5; qid = $6; sub(/:$/, "", qid)
+
+  # Откуда письмо попало в очередь. smtpd видит клиента, pickup — локальную
+  # сдачу через sendmail (крон и системные письма).
+  if (index(prog, "/smtpd[") && index($0, ": client=")) {
+    c = grab($0, "client=", "]"); b = index(c, "[")
+    qip[qid] = (b > 0 ? substr(c, b + 1) : c)
+  }
+  else if (index(prog, "/pickup[") && index($0, "uid=")) qip[qid] = "local"
+
+  else if (index(prog, "/cleanup[") && index($0, "message-id=<"))
+    qmid[qid] = grab($0, "message-id=<", ">")
+
+  # Единица счёта — письмо, а не строка: клеймим message-id первой же
+  # очередью, а переинжект амависа приходит позже и ничего не подменяет.
+  else if (index(prog, "/qmgr[") && index($0, "from=<")) {
+    mid = qmid[qid]
+    if (mid != "" && !(mid in claimed)) {
+      claimed[mid] = 1
+      f = grab($0, "from=<", ">"); if (f == "") f = "<>"
+      n = grab($0, "nrcpt=", " ") + 0; if (n < 1) n = 1
+      ip = qip[qid]; if (ip == "") ip = "local"
+      sent[f] += 1; rcpt[f] += n; origin[f "\t" ip] += 1
+      msgs += 1; rcpts += n
+    }
+  }
+
+  if (index($0, "status=deferred")) {
+    defer += 1
+    r = grab($0, "said: ", "(")
+    if (r == "") { r = grab($0, "status=deferred (", ")") }
+    if (r != "") dreason[short(r)] += 1
+    to = grab($0, "to=<", ">"); if (to != "") dto[to] += 1
+  }
+  else if (index($0, "status=bounced")) {
+    bounce += 1
+    to = grab($0, "to=<", ">"); if (to != "") bto[to] += 1
+  }
+  else if (index($0, "status=sent") && index(prog, "/lmtp[")) {
+    to = grab($0, "to=<", ">"); a = index(to, "@")
+    if (a > 0) ldom[substr(to, a + 1)] += 1
+  }
+
+  if (index($0, "NOQUEUE: reject")) {
+    reject += 1
+    # Причина лежит ПОСЛЕ адреса клиента, а первая «]: » в строке — это
+    # конец «postfix/smtpd[30468]: ». Отсчёт от «reject: » снимает
+    # неоднозначность.
+    p = index($0, "reject: ")
+    r = substr($0, p + 8)
+    q = index(r, "]: "); if (q > 0) r = substr(r, q + 3)
+    sc = index(r, ";"); if (sc > 0) r = substr(r, 1, sc - 1)
+    # Адрес получателя выкидывается: с ним каждая строка уникальна, и
+    # группировка по причинам рассыпается на тысячи строк по одной.
+    lt = index(r, "<"); g = index(r, ">: ")
+    if (lt > 0 && g > lt) r = substr(r, 1, lt - 1) substr(r, g + 3)
+    gsub(/  +/, " ", r)
+    if (r != "") rreason[short(r)] += 1
+    c = grab($0, " from ", "]"); b = index(c, "[")
+    if (b > 0) rip[substr(c, b + 1)] += 1
+  }
+}
+END {
+  printf "T\t%d\t%d\t%d\t%d\t%d\n", msgs, rcpts, defer, bounce, reject
+  for (k in sent)    printf "S\t%s\t%d\t%d\n", k, sent[k], rcpt[k]
+  for (k in origin)  printf "X\t%s\t%d\n", k, origin[k]
+  for (k in dreason) printf "DF\t%s\t%d\n", k, dreason[k]
+  for (k in dto)     printf "DR\t%s\t%d\n", k, dto[k]
+  for (k in bto)     printf "BR\t%s\t%d\n", k, bto[k]
+  for (k in rreason) printf "RJ\t%s\t%d\n", k, rreason[k]
+  for (k in rip)     printf "RI\t%s\t%d\n", k, rip[k]
+  for (k in ldom)    printf "LD\t%s\t%d\n", k, ldom[k]
+}
+'''
+
+
+_MAIL_SH = r'''
+set -u
+rd() { if [ -r "$1" ]; then cat "$1"; else sudo -n cat "$1"; fi; }
+LOG=""
+for f in __LOGS__; do if [ -s "$f" ]; then LOG="$f"; break; fi; done
+if [ -z "$LOG" ]; then printf 'ERR\tЛог почты не найден: __LOGS__\n'; exit 0; fi
+if [ ! -r "$LOG" ] && ! sudo -n true 2>/dev/null; then
+  printf 'ERR\tНет прав на чтение %s. Добавь учётку в группу adm или разреши sudo -n cat\n' "$LOG"; exit 0
+fi
+printf 'LOG\t%s\n' "$LOG"
+CUT=$(date -d "-__HOURS__ hours" +%s)
+TMP=$(mktemp)
+i=0
+while [ "$i" -lt __DAYS__ ]; do
+  printf '%s|%s\n' "$(date -d "-$i day" '+%b %e')" \
+                   "$(date -d "$(date -d "-$i day" '+%Y-%m-%d') 00:00:00" +%s)"
+  i=$((i + 1))
+done > "$TMP"
+FILES="$LOG"
+if [ -f "$LOG.1" ] && [ "$(date -r "$LOG.1" +%s)" -gt "$CUT" ]; then FILES="$LOG.1 $LOG"; fi
+Q=""
+for q in __POSTQUEUE__; do
+  if [ -x "$q" ] || command -v "$q" >/dev/null 2>&1; then
+    Q=$( { "$q" -p 2>/dev/null || sudo -n "$q" -p 2>/dev/null; } | tail -1 \
+         | sed -n 's/.* in \([0-9][0-9]*\) Request.*/\1/p' )
+    if [ -n "$Q" ]; then break; fi
+    if { "$q" -p 2>/dev/null || sudo -n "$q" -p 2>/dev/null; } | grep -q "is empty"; then Q=0; break; fi
+  fi
+done
+printf 'Q\t%s\n' "${Q:-?}"
+for f in $FILES; do rd "$f"; done | awk -v cut="$CUT" '__AWK__' "$TMP" -
+rm -f "$TMP"
+'''
+
+
+def _mail_script(hours: int, logs=MAIL_LOGS) -> str:
+    return (_MAIL_SH
+            .replace("__LOGS__", " ".join(logs))
+            .replace("__HOURS__", str(int(hours)))
+            .replace("__DAYS__", str(int(hours) // 24 + 2))
+            .replace("__POSTQUEUE__", " ".join(POSTQUEUE_PATHS))
+            .replace("__AWK__", _MAIL_AWK))
+
+
+def _rows(text: str) -> dict:
+    """Помеченные строки вывода → словарь списков.
+
+    Формат плоский намеренно: собирать JSON в awk — это ручное
+    экранирование кавычек в адресах и текстах ошибок SMTP, где кавычки как
+    раз встречаются.
+    """
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 2:
+            continue
+        out.setdefault(parts[0], []).append(parts[1:])
+    return out
+
+
+def _top(rows, key_parts: int = 1, limit: int = TOP) -> list:
+    """[(ключи…, число)] по убыванию."""
+    items = []
+    for row in rows or []:
+        if len(row) < key_parts + 1:
+            continue
+        try:
+            count = int(row[key_parts])
+        except ValueError:
+            continue
+        items.append((row[:key_parts], count))
+    items.sort(key=lambda i: -i[1])
+    return items[:limit]
+
+
+def _senders(rows) -> list:
+    """[{sender, messages, recipients}] по убыванию писем.
+
+    Получателей отдельной колонкой: письмо на пятьдесят адресов и
+    пятьдесят писем — разные вещи, а по числу писем они неотличимы.
+    """
+    out = []
+    for row in rows or []:
+        if len(row) < 3:
+            continue
+        try:
+            out.append({"sender": row[0], "messages": int(row[1]),
+                        "recipients": int(row[2])})
+        except ValueError:
+            continue
+    out.sort(key=lambda i: -i["messages"])
+    return out[:TOP]
+
+
+def read_mail(server: dict, hours: int = 24) -> dict:
+    """Сводка mail.log за окно. Возвращает счётчики, а не строки."""
+    output = run_ssh(
+        server["host"], _mail_script(hours, _log_paths(server)),
+        server.get("username"), server.get("password"),
+        port=int(server.get("ssh_port") or 22),
+        key_path=server.get("ssh_key"),
+        timeout=300,
+    )
+    rows = _rows(output)
+    if rows.get("ERR"):
+        raise Exception(rows["ERR"][0][0])
+
+    totals = (rows.get("T") or [["0", "0", "0", "0", "0"]])[0]
+    queue = (rows.get("Q") or [["?"]])[0][0]
+    return {
+        "log": (rows.get("LOG") or [[""]])[0][0],
+        "queue": int(queue) if str(queue).isdigit() else None,
+        "messages": int(totals[0]), "recipients": int(totals[1]),
+        "deferred": int(totals[2]), "bounced": int(totals[3]),
+        "rejected": int(totals[4]),
+        "senders": _senders(rows.get("S")),
+        "origins": _top(rows.get("X"), 2, limit=200),
+        "defer_reasons": _top(rows.get("DF"), 1),
+        "defer_to": _top(rows.get("DR"), 1),
+        "bounce_to": _top(rows.get("BR"), 1),
+        "reject_reasons": _top(rows.get("RJ"), 1),
+        "reject_ips": _top(rows.get("RI"), 1),
+        "local_domains": [row[0][0] for row in _top(rows.get("LD"), 1, 50)],
+    }
+
+
+def _log_paths(server: dict, key: str = "mail_log", default=MAIL_LOGS):
+    """Путь из конфига, если задан. Иначе — обычные места по порядку."""
+    own = (server.get(key) or "").strip()
+    return (own,) + tuple(default) if own else tuple(default)
+
+
+# ─── Разбор audit.log ────────────────────────────────────────
+
+# Здесь метка времени в ISO («2026-09-01 00:15:45,087»), поэтому окно
+# режется обычным сравнением строк: ISO сортируется лексикографически, и
+# ни mktime, ни таблицы суток не нужны.
+#
+# Ротация суточная, в 02:50, поэтому последние 24 часа почти всегда лежат в
+# двух файлах: текущем и вчерашнем .gz. Читать только текущий значит терять
+# всю ночь — ровно то время, когда идёт подбор пароля.
+_AUDIT_AWK = r'''
+function grab(line, key, endch,   p, q, s) {
+  p = index(line, key); if (p == 0) return ""
+  s = substr(line, p + length(key)); q = index(s, endch)
+  if (q > 0) s = substr(s, 1, q - 1)
+  return s
+}
+{
+  if (substr($0, 1, 19) < cut) next
+  if (index($0, "cmd=Auth") == 0) next
+  acct = grab($0, "account=", ";")
+  if (acct == "") acct = grab($0, "name=", ";")
+  if (acct == "") next
+  ip = grab($0, "oip=", ";")
+  if (ip == "") ip = "?"
+  proto = grab($0, "protocol=", ";")
+  if (proto == "") proto = "?"
+  if (index($0, "/service/admin/")) proto = proto "/admin"
+  ok = index($0, "error=") ? 0 : 1
+  k = acct "\t" ip "\t" proto "\t" ok
+  n[k] += 1
+  when = substr($0, 1, 19)
+  if (when > last[k]) last[k] = when
+  if (ok) { good += 1 } else { bad += 1 }
+}
+END {
+  printf "T\t%d\t%d\n", good, bad
+  for (k in n) printf "A\t%s\t%d\t%s\n", k, n[k], last[k]
+}
+'''
+
+_AUDIT_SH = r'''
+set -u
+rd() {
+  case "$1" in
+    *.gz) if [ -r "$1" ]; then zcat "$1"; else sudo -n zcat "$1"; fi ;;
+    *)    if [ -r "$1" ]; then cat "$1";  else sudo -n cat "$1";  fi ;;
+  esac
+}
+LOG=""
+for f in __LOGS__; do if [ -s "$f" ]; then LOG="$f"; break; fi; done
+if [ -z "$LOG" ]; then printf 'ERR\tЖурнал входов Zimbra не найден: __LOGS__\n'; exit 0; fi
+if [ ! -r "$LOG" ] && ! sudo -n true 2>/dev/null; then
+  printf 'ERR\tНет прав на чтение %s. Нужна группа zimbra или sudo -n cat\n' "$LOG"; exit 0
+fi
+printf 'LOG\t%s\n' "$LOG"
+CUT=$(date -d "-__HOURS__ hours" '+%Y-%m-%d %H:%M:%S')
+FILES=""
+i=1
+while [ "$i" -le __DAYS__ ]; do
+  g="$LOG.$(date -d "-$i day" '+%Y-%m-%d').gz"
+  if [ -f "$g" ]; then FILES="$FILES $g"; fi
+  i=$((i + 1))
+done
+FILES="$FILES $LOG"
+for f in $FILES; do rd "$f"; done | awk -v cut="$CUT" '__AWK__'
+'''
+
+
+def _audit_script(hours: int, logs=AUDIT_LOGS) -> str:
+    return (_AUDIT_SH
+            .replace("__LOGS__", " ".join(logs))
+            .replace("__HOURS__", str(int(hours)))
+            .replace("__DAYS__", str(int(hours) // 24 + 1))
+            .replace("__AWK__", _AUDIT_AWK))
+
+
+def read_audit(server: dict, hours: int = 24) -> dict:
+    """Входы в почту: учётка, адрес, протокол, успех, когда последний раз."""
+    output = run_ssh(
+        server["host"], _audit_script(hours, _log_paths(server, "audit_log",
+                                                        AUDIT_LOGS)),
+        server.get("username"), server.get("password"),
+        port=int(server.get("ssh_port") or 22),
+        key_path=server.get("ssh_key"),
+        timeout=180,
+    )
+    rows = _rows(output)
+    if rows.get("ERR"):
+        raise Exception(rows["ERR"][0][0])
+
+    totals = (rows.get("T") or [["0", "0"]])[0]
+    events = []
+    for row in rows.get("A") or []:
+        if len(row) < 6:
+            continue
+        account, ip, proto, ok, count, last = row[:6]
+        events.append({"account": account, "ip": ip, "protocol": proto,
+                       "ok": ok == "1", "count": int(count), "last": last})
+    events.sort(key=lambda e: -e["count"])
+    return {
+        "log": (rows.get("LOG") or [[""]])[0][0],
+        "ok": int(totals[0]), "failed": int(totals[1]),
+        "events": events,
+    }
+
+
+# ─── Правила ─────────────────────────────────────────────────
+
+# Отправка через mailboxd приходит в postfix с петли, локальная сдача
+# (крон, системные письма) — через pickup. И то и другое — «через веб» в
+# том смысле, что письмо родилось на самом сервере.
+WEB_ORIGINS = ("local", "127.0.0.1", "::1", "localhost")
+
+
+def origin_kind(ip: str) -> str:
+    """Откуда письмо попало в очередь: web | inside | outside.
+
+    Разделение задано тем, как здесь работают: все пользователи пишут через
+    веб, и только несколько учёток сдают почту напрямую — с внутренних
+    узлов. Отправка с белого адреса не описывается ни тем, ни другим, и
+    это единственный случай, который стоит тревоги.
+    """
+    from geoip import is_private
+
+    address = (ip or "").strip().lower()
+    if address in WEB_ORIGINS:
+        return "web"
+    if is_private(address):
+        return "inside"
+    return "outside"
+
+
+def local_domain(address: str, domains) -> bool:
+    at = (address or "").rfind("@")
+    return at > 0 and address[at + 1:].lower() in {d.lower() for d in domains or []}
+
+
+def outside_senders(origins, local_domains) -> list:
+    """Свои адреса, письма от которых пришли с белого IP.
+
+    Ради этого правила и разбирается происхождение письма: угнанную учётку
+    видно ровно так — почта от своего адреса, а сдана снаружи.
+    """
+    found = []
+    for (sender, ip), count in origins or []:
+        if not local_domain(sender, local_domains):
+            continue
+        if origin_kind(ip) != "outside":
+            continue
+        found.append({"sender": sender, "ip": ip, "count": count})
+    found.sort(key=lambda i: -i["count"])
+    return found
+
+
+def foreign_logins(events, geo_codes, home: str = None) -> list:
+    """Удачные входы не из домашней страны.
+
+    Только удачные: неудачная попытка из-за границы — это перебор, у него
+    своё правило. Удачный вход оттуда означает, что пароль уже знают.
+    """
+    home = (home or HOME_COUNTRY).upper()
+    found = []
+    for event in events or []:
+        if not event.get("ok"):
+            continue
+        code = (geo_codes or {}).get(event["ip"], "")
+        if not code or code.upper() == home:
+            continue
+        found.append(dict(event, country=code.upper()))
+    found.sort(key=lambda e: -e["count"])
+    return found
+
+
+def brute_force(events, threshold: int = None) -> list:
+    """Подбор пароля: неудачные попытки с одного адреса на одну учётку.
+
+    Успешные входы с того же адреса учитываются: если человек в итоге
+    вошёл, это забытый пароль, а не подбор.
+    """
+    threshold = threshold or AUTH_FAIL_ALERT
+    good = {(e["account"], e["ip"]) for e in events or [] if e.get("ok")}
+    found = []
+    for event in events or []:
+        if event.get("ok") or event["count"] < threshold:
+            continue
+        key = (event["account"], event["ip"])
+        found.append(dict(event, guessed=key in good,
+                          admin="/admin" in event.get("protocol", "")))
+    found.sort(key=lambda e: -e["count"])
+    return found
+
+
+def heavy_senders(senders, threshold: int = None) -> list:
+    """Всплеск отправки. Порог в письмах, а не в строках лога: со строками
+    он молча означал бы втрое меньше."""
+    threshold = threshold or SEND_ALERT
+    return [item for item in senders or []
+            if item.get("messages", 0) >= threshold]
+
+
+def has_zimbra(server: dict) -> bool:
+    """Почтовый сервер: явный флаг zimbra или служба zimbra/postfix.
+
+    Тот же принцип, что у Exchange: флаг не обязателен, если состав служб
+    и так однозначен.
+    """
+    from server_check import server_type
+
+    if server_type(server) != "linux":
+        return False
+    if server.get("zimbra"):
+        return True
+    services = {str(s).lower() for s in (server.get("services") or [])}
+    return bool(services & {"zimbra", "postfix", "zmconfigd"})

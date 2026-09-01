@@ -35,6 +35,8 @@ from sqllog_bot import has_mssql, sql_token, sqllog_callback
 from winlog_bot import has_winlog, win_token, winlog_callback
 from iis_bot import has_iis, iis_token, iis_callback
 from exchange_bot import has_exchange, ex_token, exchange_callback
+from zimbra_bot import zm_token, zimbra_callback
+from zimbra_log import has_zimbra
 from firewall_bot import (
     has_firewall, fw_token, firewall_callback, handle_firewall_text,
     AWAIT_KEY as FW_AWAIT_KEY,
@@ -766,6 +768,11 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
                 "📧 Почта (Exchange)",
                 callback_data=f"exlog_menu:{ex_token(server_name, 24)}",
             )])
+        if has_zimbra(server):
+            rows.append([InlineKeyboardButton(
+                "📬 Почта (Zimbra)",
+                callback_data=f"zm_menu:{zm_token(server_name, 24)}",
+            )])
         if has_firewall(server):
             rows.append([InlineKeyboardButton(
                 "🛡 Блокировка IP",
@@ -820,6 +827,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("exlog_"):
         await exchange_callback(query, context)
+
+    elif query.data.startswith("zm_"):
+        await zimbra_callback(query, context)
 
     elif query.data.startswith("fw_"):
         await firewall_callback(query, context)

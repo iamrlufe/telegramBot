@@ -15,6 +15,7 @@ from backup_collector import run_backup_cycle
 from log_collector import maybe_run_log_cycle
 from iis_collector import maybe_run_iis_cycle
 from firewall_maintenance import run_firewall_expiry
+from zimbra_collector import maybe_run_zimbra_cycle
 from log_store import forget_server as forget_log_events
 from iis_store import forget_server as forget_iis_data
 from firewall_store import forget_server as forget_firewall_data
@@ -661,6 +662,13 @@ def run_cycle():
         maybe_run_iis_cycle(servers, on_progress=touch_heartbeat)
     except Exception as e:
         print(f"[monitor] Ошибка сбора IIS: {e}", flush=True)
+
+    # Почта Zimbra: подбор пароля и вход из чужой страны идут ночью, и
+    # ждать, пока кто-то откроет раздел, нельзя.
+    try:
+        maybe_run_zimbra_cycle(servers, on_progress=touch_heartbeat)
+    except Exception as e:
+        print(f"[monitor] Ошибка проверки почты: {e}", flush=True)
 
     # Снятие истёкших блокировок IP. Дешёвый шаг: без истёкших строк он не
     # ходит на серверы вовсе.
