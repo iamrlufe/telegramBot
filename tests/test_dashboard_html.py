@@ -368,7 +368,7 @@ def _pr(item, count):
 def _iis(name="web-01.example.local", **over):
     server = {
         "name": name, "requests": 476176, "alien": 889, "slow": 245, "uniq": 145,
-        "codes": [_pr("200.0", 473001)], "pubs": [_pr("agro", 253332)], "dead": [],
+        "alienuris": [_pr("/index.php", 41)], "pubs": [_pr("agro", 253332)], "dead": [],
         "scan": [_pr(["192.0.2.99", "libredtail-http"], 47)], "hits": [],
         "logins": [_pr(["agro", "192.0.2.30"], 26)], "errors": [], "slows": [],
         "hours": [_pr(f"{h:02d}", 100) for h in range(24)],
@@ -413,17 +413,18 @@ def test_iis_picker_switches_by_css_not_script():
 
 def test_successful_scanner_response_is_the_headline():
     """Единственный признак, что сканер что-то нашёл: сервер ответил успехом."""
-    page = _with_iis([_iis(hits=[_pr(["200", "/uploads/x.php", "192.0.2.99", "curl"], 2)],
+    page = _with_iis([_iis(hits=[_pr(["/uploads/x.php", "192.0.2.99", "curl"], 2)],
                            alarms=["сканер получил успешный ответ"])])
 
     assert "/uploads/x.php" in page
-    assert "сканер получил успешный ответ" in page
+    assert "сервер отдал содержимое" in page
 
 
 def test_clean_scan_says_so_plainly():
     page = _with_iis([_iis()])
 
-    assert "Успешных ответов на посторонние пути нет" in page
+    assert "Ничего не отдано" in page
+    assert "редиректы" in page
 
 
 def test_dead_publications_listed():

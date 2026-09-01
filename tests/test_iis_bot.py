@@ -59,8 +59,9 @@ def test_clean_scan_explains_why_redirects_are_not_findings():
     text = iis_bot.format_scan(
         _events(total=[("alien", 889)], scan=[("192.0.2.99|libredtail-http", 47)]), 24)
 
-    assert "Успешных ответов на посторонние пути нет" in text
-    assert "редирект" in text
+    assert "Ничего не отдано" in text
+    assert "Редиректы" in text
+    assert "robots.txt" in text
     assert "192.0.2.99" in text
 
 
@@ -68,10 +69,10 @@ def test_scanner_hit_comes_first():
     """Единственное, ради чего сюда заходят срочно."""
     text = iis_bot.format_scan(
         _events(total=[("alien", 41)],
-                hit=[("200|/uploads/x.php|192.0.2.99|curl", 2)],
+                hit=[("/uploads/x.php|192.0.2.99|curl", 2)],
                 scan=[("192.0.2.99|curl", 41)]), 24)
 
-    assert text.index("СЕРВЕР ОТВЕТИЛ УСПЕХОМ") < text.index("Кто стучится")
+    assert text.index("СЕРВЕР ОТДАЛ СОДЕРЖИМОЕ") < text.index("Кто стучится")
     assert "/uploads/x.php" in text
 
 
@@ -129,14 +130,14 @@ def test_only_three_things_reach_the_alert(monkeypatch):
     """Фон в тревогу не идёт: 404 сканеров и медленные запросы живут
     в дашборде, будить ими незачем."""
     day = {"web-01.example.local": _events(
-        code=[("404.0", 743)], slowuri=[("/agro/e1cib/logForm|192.0.2.30", 16)],
+        alienuri=[("/index.php", 743)], slowuri=[("/agro/e1cib/logForm|192.0.2.30", 16)],
         scan=[("192.0.2.99|curl", 276)])}
 
     assert _findings(monkeypatch, day, {}) == []
 
 
 def test_scanner_hit_becomes_a_finding(monkeypatch):
-    day = {"web-01.example.local": _events(hit=[("200|/uploads/x.php|1|curl", 2)])}
+    day = {"web-01.example.local": _events(hit=[("/uploads/x.php|192.0.2.99|curl", 2)])}
 
     found = _findings(monkeypatch, day, {})
 

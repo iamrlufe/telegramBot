@@ -232,7 +232,11 @@ def collect_iis() -> list:
     for name in sorted(set(day) | set(facts)):
         events = day.get(name, {})
         own_facts = facts.get(name, {})
+        # Публикацией считается путь первого уровня. Вложенные каталоги
+        # (owa/Calendar, EWS/bin у Exchange) — часть приложения, а не
+        # отдельная точка входа, и в «без трафика» им не место.
         apps = [str(a.get("p") or "").strip("/") for a in (own_facts.get("apps") or [])]
+        apps = [a for a in apps if a and "/" not in a]
         pubs = _pairs(events.get("pub"), 1)
         seen = {p["parts"][0].lower() for p in pubs}
         dead = sorted(a for a in apps if a and a.lower() not in seen)
@@ -244,7 +248,7 @@ def collect_iis() -> list:
             _pairs(hour.get(name, {}).get("ip"), 1),
         )
 
-        hits = _pairs(events.get("hit"), 4)
+        hits = _pairs(events.get("hit"), 3)
         herr = _pairs(events.get("herr"), 1)
         down_reasons = [h for h in herr
                         if h["parts"][0] in ("QueueFull", "AppOffline",
@@ -267,7 +271,7 @@ def collect_iis() -> list:
             # последнего прохода: сразу после полуночи в файле десяток строк,
             # и «уникальных адресов: 6» было бы неправдой.
             "uniq": len(events.get("ip") or []),
-            "codes": _pairs(events.get("code"), 1),
+            "alienuris": _pairs(events.get("alienuri"), 1),
             "pubs": pubs,
             "dead": dead,
             "scan": _pairs(events.get("scan"), 2),
@@ -938,6 +942,14 @@ def _backups_pane(backups: dict) -> str:
     )
 
 
+def _is_local(address: str) -> bool:
+    """Свой же сервер: Managed Availability у Exchange проверяет себя с
+    127.0.0.1, ::1 и link-local адресов, и его 500-е — штатный шум."""
+    address = (address or "").strip().lower()
+    return (address in ("127.0.0.1", "::1", "localhost")
+            or address.startswith("fe80:") or address.startswith("::ffff:127."))
+
+
 def _iis_card(color, title, tag, cats="", extra="", body="", open_=False) -> str:
     return (
         f'<details class="logcard"{" open" if open_ else ""}>'
@@ -992,14 +1004,20 @@ def _iis_server(server: dict) -> str:
     )
     if server["hits"]:
         for r in server["hits"][:10]:
-            status, uri, ip, ua = r["parts"]
-            body = _lrow(STATUS_CRIT, status, f"Ответ на {html.escape(uri)}",
+            uri, ip, ua = r["parts"]
+            body = _lrow(STATUS_CRIT, "200", f"Отдан {html.escape(uri)}",
                          f"{html.escape(ip)} · {html.escape(ua)}") + body
-        hit_note = "сканер получил успешный ответ — разобрать вручную"
+        hit_note = "сервер отдал содержимое по постороннему пути — разобрать вручную"
     else:
-        body += _lrow(STATUS_GOOD, "0", "Успешных ответов на посторонние пути нет",
-                      "200 отдаётся только на «/», 301 — редирект с порта 80 на HTTPS")
+        body += _lrow(STATUS_GOOD, "0", "Ничего не отдано",
+                      "находкой считается только ответ 200 на посторонний путь; "
+                      "редиректы и robots.txt со sitemap.xml сюда не идут")
         hit_note = "ничего не нашли"
+    if server["alienuris"]:
+        body += _lrow(STATUS_SERIOUS, "пути",
+                      "Куда стучатся чаще всего",
+                      " · ".join(f'{html.escape(r["parts"][0])} ({r["count"]})'
+                                 for r in server["alienuris"][:10]))
     cards.append(_iis_card(
         STATUS_CRIT if server["hits"] else STATUS_SERIOUS if server["alien"] else STATUS_GOOD,
         "Сканирование извне", f'{_num(server["alien"])} запросов',
@@ -1041,19 +1059,27 @@ def _iis_server(server: dict) -> str:
     # 3. Ошибки приложения
     if server["errors"]:
         total = sum(r["count"] for r in server["errors"])
+        inner = sum(r["count"] for r in server["errors"] if _is_local(r["parts"][1]))
         bases = {r["parts"][0].split("/")[1] for r in server["errors"] if "/" in r["parts"][0]}
         services = sum(r["count"] for r in server["errors"] if "/hs/" in r["parts"][0])
         body = "".join(
-            _lrow(STATUS_CRIT, _num(r["count"]), html.escape(r["parts"][0]),
-                  f'← {html.escape(r["parts"][1])}')
+            _lrow(STATUS_WARN if _is_local(r["parts"][1]) else STATUS_CRIT,
+                  _num(r["count"]), html.escape(r["parts"][0]),
+                  f'← {html.escape(r["parts"][1])}'
+                  + (" · внутренняя проверка сервера" if _is_local(r["parts"][1]) else ""))
             for r in server["errors"][:15]
         )
-        cards.append(_iis_card(STATUS_CRIT, "Ошибки приложения (5xx)",
+        cards.append(_iis_card(STATUS_WARN if inner == total else STATUS_CRIT,
+            "Ошибки приложения (5xx)",
             f"{_num(total)} за сутки",
-            cats='<div class="cats">' + _cat("💥", "5xx", total, STATUS_CRIT)
-                 + _cat("🗄", "баз затронуто", len(bases), STATUS_WARN)
-                 + _cat("🔌", "HTTP-сервисы", services, STATUS_WARN) + '</div>',
-            body=body, open_=True))
+            cats='<div class="cats">'
+                 + _cat("💥", "снаружи", total - inner, STATUS_CRIT)
+                 + _cat("🏠", "свои проверки", inner, STATUS_WARN)
+                 + _cat("🗄", "путей затронуто", len(bases), STATUS_WARN) + '</div>',
+            extra=('<div class="note">запросы с 127.0.0.1, ::1 и fe80:: — это сам '
+                   'сервер проверяет себя; у Exchange такие ошибки штатны</div>'
+                   if inner else ""),
+            body=body, open_=inner != total))
 
     # 4. Медленные
     if server["slow"]:

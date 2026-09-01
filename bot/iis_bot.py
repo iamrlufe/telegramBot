@@ -95,6 +95,14 @@ def _total(events: dict, name: str) -> int:
     return 0
 
 
+def is_local(address: str) -> bool:
+    """Свой же сервер: Managed Availability у Exchange проверяет себя
+    с 127.0.0.1, ::1 и link-local адресов."""
+    address = (address or "").strip().lower()
+    return (address in ("127.0.0.1", "::1", "localhost")
+            or address.startswith("fe80:") or address.startswith("::ffff:127."))
+
+
 def _empty(title: str, hours: int) -> str:
     return (f"{title} за {period_name(hours)}\n\n"
             "Данных нет. Монитор дочитывает логи IIS раз в час — если сервер "
@@ -105,7 +113,7 @@ def _empty(title: str, hours: int) -> str:
 
 def format_scan(events: dict, hours: int) -> str:
     alien = _total(events, "alien")
-    hits = _rows(events, "hit", 4)
+    hits = _rows(events, "hit", 3)
     scan = _rows(events, "scan", 2)
     if not alien and not scan:
         return _empty("🔎 Сканирование извне", hours)
@@ -113,16 +121,25 @@ def format_scan(events: dict, hours: int) -> str:
     lines = [f"🔎 Сканирование извне за {period_name(hours)}",
              f"Посторонних запросов: {alien} · адресов: {len(scan)}", ""]
     if hits:
-        lines.append("🔴 СЕРВЕР ОТВЕТИЛ УСПЕХОМ — разобрать вручную:")
-        for (status, uri, ip, ua), count in hits[:SHOW_LIMIT]:
-            lines.append(f"{status} {uri}")
+        lines.append("🔴 СЕРВЕР ОТДАЛ СОДЕРЖИМОЕ — разобрать вручную:")
+        for (uri, ip, ua), count in hits[:SHOW_LIMIT]:
+            lines.append(f"200 {uri}")
             lines.append(f"   ← {ip} · {ua} · {count} раз")
         lines.append("")
     else:
-        lines.append("✅ Успешных ответов на посторонние пути нет.")
-        lines.append("Ответы 200 на «/» и 301 с порта 80 сюда не считаются: "
-                     "это стартовая страница IIS и редирект на HTTPS, они "
-                     "отдаются на любой путь.")
+        lines.append("✅ Ничего не отдано.")
+        lines.append("Находкой считается только ответ 200 на посторонний путь. "
+                     "Редиректы (301/302) не считаются: сервер ничего не отдал, "
+                     "а на корень и на любой путь по 80-му порту редирект "
+                     "приходит всегда. robots.txt, sitemap.xml и favicon.ico "
+                     "тоже не находки — за ними ходят поисковые роботы.")
+        lines.append("")
+
+    alien_uris = _rows(events, "alienuri", 1)
+    if alien_uris:
+        lines.append("Куда стучатся:")
+        for parts, count in alien_uris[:SHOW_LIMIT]:
+            lines.append(f"{count:>6}  {parts[0]}")
         lines.append("")
 
     lines.append("Кто стучится:")
@@ -166,11 +183,18 @@ def format_errors(events: dict, hours: int) -> str:
                 "Ошибок приложения нет.")
 
     total = sum(count for _parts, count in errors)
+    inner = sum(count for (_uri, ip), count in errors if is_local(ip))
     lines = [f"💥 Ошибки 5xx за {period_name(hours)} — {total}",
-             "Это ошибки самого приложения, а не IIS.", ""]
+             "Это ошибки самого приложения, а не IIS."]
+    if inner:
+        lines.append(f"Из них свои проверки: {inner} — сервер обращается сам "
+                     f"к себе с 127.0.0.1, ::1 или fe80::. У Exchange такие "
+                     f"ошибки штатны.")
+    lines.append("")
     for (uri, ip), count in errors[:SHOW_LIMIT]:
-        lines.append(f"{count:>4}  {uri}")
-        lines.append(f"      ← {ip}")
+        mark = "🏠" if is_local(ip) else "🔴"
+        lines.append(f"{mark} {count:>4}  {uri}")
+        lines.append(f"        ← {ip}")
     return "\n".join(lines)
 
 
@@ -191,6 +215,9 @@ def format_slow(events: dict, hours: int) -> str:
 def format_pubs(events: dict, facts: dict, hours: int) -> str:
     pubs = _rows(events, "pub", 1)
     apps = [str(a.get("p") or "").strip("/") for a in (facts.get("apps") or [])]
+    # Вложенные каталоги (owa/Calendar, EWS/bin) — часть приложения, а не
+    # отдельная публикация: в «без трафика» им не место.
+    apps = [a for a in apps if a and "/" not in a]
     seen = {parts[0].lower() for parts, _count in pubs}
     dead = sorted(a for a in apps if a and a.lower() not in seen)
 

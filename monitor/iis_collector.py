@@ -65,7 +65,7 @@ def _rows_from_site(data: dict) -> list:
         ("total", "slow", data.get("slow") or 0),
     ]
     lists = {
-        "code": "codes", "port": "ports", "pub": "pubs", "scan": "scan",
+        "alienuri": "alienuris", "pub": "pubs", "scan": "scan",
         "hit": "hits", "login": "logins", "ip": "ips", "error": "errors",
         "slowuri": "slows", "hour": "hours",
     }

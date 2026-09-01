@@ -59,15 +59,15 @@ def test_interval_respected(monkeypatch):
 def test_counters_mapped_to_categories():
     rows = ic._rows_from_site({
         "total": 476176, "alien": 889, "slow": 245,
-        "codes": [{"k": "404.0", "n": 743}],
+        "alienuris": [{"k": "/index.php", "n": 743}],
         "logins": [{"k": "agro|192.0.2.30", "n": 26}],
-        "hits": [{"k": "200|/x.php|192.0.2.99|curl", "n": 2}],
+        "hits": [{"k": "/x.php|192.0.2.99|curl", "n": 2}],
     })
 
     assert ("total", "requests", 476176) in rows
-    assert ("code", "404.0", 743) in rows
+    assert ("alienuri", "/index.php", 743) in rows
     assert ("login", "agro|192.0.2.30", 26) in rows
-    assert ("hit", "200|/x.php|192.0.2.99|curl", 2) in rows
+    assert ("hit", "/x.php|192.0.2.99|curl", 2) in rows
 
 
 def test_httperr_reasons_and_details_separated():

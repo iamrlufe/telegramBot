@@ -40,6 +40,15 @@ TOP = 25
 # и хвост предыдущих после полуночи.
 WINDOW_HOURS = 36
 
+# Пути, которые любой нормальный сайт отдаёт кому угодно. Находкой сканера
+# они быть не могут: за ними приходят поисковые роботы, а не взломщики.
+INNOCENT = r"^/(robots|sitemap|favicon|apple-touch|index\.|\.well-known)"
+
+# Долгие соединения по замыслу протокола: уведомления OWA, RPC-over-HTTP и
+# MAPI держатся минутами. Считать их «медленными запросами» бессмысленно —
+# на Exchange они дают десятки тысяч ложных срабатываний в сутки.
+LONG_POLL = r"(ev\.owa2|rpcproxy|emsmdb|PushNotif|ActiveSync|subscri|notific)"
+
 
 def _script(state: dict, slow_ms: int, top: int) -> str:
     state_json = json.dumps({k: int(v) for k, v in (state or {}).items()})
@@ -49,7 +58,7 @@ Import-Module WebAdministration
 $ap=@(Get-WebApplication|%{{$_.path.Trim('/').ToLower()}})
 $st=@{{}}
 (ConvertFrom-Json '{state_json}').PSObject.Properties|%{{$st[$_.Name]=[int64]$_.Value}}
-$co=@{{}};$pt=@{{}};$pb=@{{}};$al=@{{}};$hit=@{{}};$lg=@{{}};$ips=@{{}};$e5=@{{}};$sl=@{{}};$hr=@{{}}
+$au=@{{}};$pb=@{{}};$al=@{{}};$hit=@{{}};$lg=@{{}};$ips=@{{}};$e5=@{{}};$sl=@{{}};$hr=@{{}}
 $tot=0;$alt=0;$slt=0;$ns=@{{}};$dirs=@()
 foreach($s in Get-ChildItem IIS:\\Sites){{
 $b=[Environment]::ExpandEnvironmentVariables($s.logFile.directory)
@@ -71,8 +80,6 @@ while(($l=$sr.ReadLine()) -ne $null){{
 if($l.StartsWith('#')){{continue}}
 $p=$l -split ' ';$tot++
 $s2=$p[$map['sc-status']];$c=$p[$map['c-ip']];$u=$p[$map['cs-uri-stem']];$a=$p[$map['cs(User-Agent)']]
-$co[$s2+'.'+$p[$map['sc-substatus']]]=1+$co[$s2+'.'+$p[$map['sc-substatus']]]
-$pt[$p[$map['s-port']]]=1+$pt[$p[$map['s-port']]]
 $ips[$c]=1+$ips[$c]
 $hr[$p[$map['time']].Substring(0,2)]=1+$hr[$p[$map['time']].Substring(0,2)]
 $g=($u -split '/')[1];if($g){{$g=$g.ToLower()}}
@@ -81,16 +88,17 @@ $pb[$g]=1+$pb[$g]
 if($u -like '*/e1cib/login' -and $s2 -eq '402'){{$lg[$g+'|'+$c]=1+$lg[$g+'|'+$c]}}
 }}else{{
 $alt++;$al[$c+'|'+$a]=1+$al[$c+'|'+$a]
-if(($s2 -eq '200' -or $s2 -eq '301' -or $s2 -eq '302') -and $u -ne '/' -and $p[$map['s-port']] -ne '80'){{
-$hit[$s2+'|'+$u+'|'+$c+'|'+$a]=1+$hit[$s2+'|'+$u+'|'+$c+'|'+$a]}}}}
+$au[$u]=1+$au[$u]
+if($s2 -eq '200' -and $u -ne '/' -and $u -notmatch '{INNOCENT}'){{
+$hit[$u+'|'+$c+'|'+$a]=1+$hit[$u+'|'+$c+'|'+$a]}}}}
 if($s2 -like '5*'){{$e5[$u+'|'+$c]=1+$e5[$u+'|'+$c]}}
 $t=0;[void][int]::TryParse($p[$map['time-taken']],[ref]$t)
-if($t -gt {slow_ms}){{$slt++;$sl[$u+'|'+$c]=1+$sl[$u+'|'+$c]}}
+if($t -gt {slow_ms} -and $u -notmatch '{LONG_POLL}'){{$slt++;$sl[$u+'|'+$c]=1+$sl[$u+'|'+$c]}}
 }}
 $ns[$k]=$fs.Position;$sr.Close();$fs.Close()}}}}
 function T($h){{@($h.GetEnumerator()|Sort-Object Value -Descending|Select-Object -First {top}|%{{@{{k=$_.Key;n=$_.Value}}}})}}
 Out-B64 @{{total=$tot;alien=$alt;slow=$slt;uniq=$ips.Count;state=$ns;
-codes=(T $co);ports=(T $pt);pubs=(T $pb);scan=(T $al);hits=(T $hit);logins=(T $lg);
+alienuris=(T $au);pubs=(T $pb);scan=(T $al);hits=(T $hit);logins=(T $lg);
 ips=(T $ips);errors=(T $e5);slows=(T $sl);hours=(T $hr)}}
 """
 
@@ -104,7 +112,7 @@ def read_site_logs(server: dict, state: dict = None, slow_ms: int = SLOW_MS,
     data = ps_json(raw) or {}
     if isinstance(data, list):
         data = data[0] if data else {}
-    for key in ("codes", "ports", "pubs", "scan", "hits", "logins", "ips",
+    for key in ("alienuris", "pubs", "scan", "hits", "logins", "ips",
                 "errors", "slows", "hours"):
         rows = data.get(key) or []
         if isinstance(rows, dict):

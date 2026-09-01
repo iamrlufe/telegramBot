@@ -138,12 +138,31 @@ def test_publications_taken_from_iis_config():
     assert "Get-WebApplication" in iis_log._script({}, 10000, 25)
 
 
-def test_redirect_from_port_80_is_not_a_finding():
-    """На порту 80 стоит редирект на HTTPS: он отдаёт 301 на любой путь,
-    включая несуществующий. Считать это находкой сканера нельзя."""
+def test_only_served_content_counts_as_a_finding():
+    """Редирект ничего не отдал: на корень и на любой путь по 80-му порту
+    он приходит всегда, а на сайте за IIS — ещё и 302 на /index.php.
+    Находкой считается только ответ 200."""
     compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
 
-    assert "$p[$map['s-port']] -ne '80'" in compact
+    assert "$s2 -eq '200'" in compact
+    assert "-eq '301'" not in compact
+    assert "-eq '302'" not in compact
+
+
+def test_files_any_site_serves_are_not_findings():
+    """За robots.txt и sitemap.xml приходят поисковые роботы, а не взломщики."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    assert "robots" in compact and "sitemap" in compact and "favicon" in compact
+
+
+def test_long_polling_paths_are_not_slow_requests():
+    """Уведомления OWA и RPC-over-HTTP держатся минутами по замыслу
+    протокола: на Exchange это давало десятки тысяч ложных «медленных»."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    assert "ev" in compact and "owa2" in compact
+    assert "rpcproxy" in compact
 
 
 def test_idle_connections_excluded_from_httperr_details():
@@ -164,7 +183,7 @@ def test_slow_threshold_is_configurable(monkeypatch):
 def test_single_row_normalized(monkeypatch):
     """PowerShell отдаёт одиночный элемент объектом, а не массивом."""
     _scripts(monkeypatch, {"total": 1, "state": {},
-                           "codes": {"k": "200.0", "n": 5}})
+                           "alienuris": {"k": "/index.php", "n": 5}})
     data = iis_log.read_site_logs(SERVER, {})
 
-    assert data["codes"] == [{"k": "200.0", "n": 5}]
+    assert data["alienuris"] == [{"k": "/index.php", "n": 5}]
