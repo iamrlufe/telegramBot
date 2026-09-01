@@ -17,7 +17,7 @@ from collections import OrderedDict
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
-from iis_log import detect_brute_force
+from iis_log import detect_brute_force, is_cloudflare
 from iis_store import read_events, read_facts
 from tg_utils import safe_edit_message
 
@@ -143,8 +143,19 @@ def format_scan(events: dict, hours: int) -> str:
         lines.append("")
 
     lines.append("Кто стучится:")
+    proxied = False
     for (ip, ua), count in scan[:SHOW_LIMIT]:
-        lines.append(f"{count:>6}  {ip}  {ua or '—'}")
+        mark = ""
+        if is_cloudflare(ip):
+            mark = "  (узел Cloudflare)"
+            proxied = True
+        lines.append(f"{count:>6}  {ip}{mark}  {ua or '—'}")
+    if proxied:
+        lines.append("")
+        lines.append("Часть трафика приходит через Cloudflare: в логе виден "
+                     "адрес узла прокси, а не посетителя. Настоящий адрес "
+                     "появится, если в логировании сайта завести поле для "
+                     "заголовка X-Forwarded-For — модуль подхватит его сам.")
     return "\n".join(lines)
 
 

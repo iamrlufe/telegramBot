@@ -27,7 +27,7 @@ shared/iis_log.py
 """
 import json
 
-from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
+from winrm_client import run_ps, ps_json, ps_fits, PS_OUT_B64_HELPER
 
 # Запрос дольше этого — медленный. 10 секунд: обычный вызов 1С укладывается
 # в сотни миллисекунд, а на этой границе жалобы «тормозит» уже реальны.
@@ -49,12 +49,49 @@ INNOCENT = r"^/(robots|sitemap|favicon|apple-touch|index\.|\.well-known)"
 # на Exchange они дают десятки тысяч ложных срабатываний в сутки.
 LONG_POLL = r"(ev\.owa2|rpcproxy|emsmdb|PushNotif|ActiveSync|subscri|notific)"
 
+# Имя поля с реальным адресом клиента. Появляется в логе, только если в
+# настройках сайта заведено пользовательское поле для заголовка
+# X-Forwarded-For: за обратным прокси (Cloudflare, ARR, nginx) в c-ip лежит
+# адрес прокси, а не посетителя, и разбор по адресам слепнет.
+XFF = "x-forwarded-for"
+
+
+# Сколько файлов имеет смысл передавать в скрипт. В окно попадают текущий
+# и вчерашний, третий — запас на почасовую ротацию.
+STATE_FILES = 3
+
+
+def _trim_state(state: dict, keep: int = STATE_FILES) -> str:
+    """Свежие смещения первыми: у файлов имена вида u_exГГММДД.log, поэтому
+    сортировка по имени — это сортировка по дате."""
+    items = sorted((state or {}).items())[-keep:] if keep else []
+    return json.dumps({k: int(v) for k, v in items})
+
+
+def _fit(build, state: dict) -> str:
+    """Собирает скрипт, ужимая состояние, пока он не влезет в командную
+    строку WinRM (8192 символа).
+
+    Ужимать безопасно: потерянное смещение означает лишь, что файл прочтётся
+    заново или будет пропущен как старый, а не влезший скрипт не выполнится
+    вовсе.
+    """
+    for keep in range(STATE_FILES, -1, -1):
+        script = build(_trim_state(state, keep))
+        if ps_fits(script):
+            return script
+    return script
+
 
 def _script(state: dict, slow_ms: int, top: int) -> str:
-    state_json = json.dumps({k: int(v) for k, v in (state or {}).items()})
+    return _fit(lambda state_json: _site_script(state_json, slow_ms, top), state)
+
+
+def _site_script(state_json: str, slow_ms: int, top: int) -> str:
     return PS_OUT_B64_HELPER + f"""
 $ErrorActionPreference='SilentlyContinue'
 Import-Module WebAdministration
+function M($l){{$n=($l -replace '^#Fields:\\s*','') -split ' ';$h=@{{}};for($i=0;$i -lt $n.Count;$i++){{$h[$n[$i]]=$i}};$h}}
 $ap=@(Get-WebApplication|%{{$_.path.Trim('/').ToLower()}})
 $st=@{{}}
 (ConvertFrom-Json '{state_json}').PSObject.Properties|%{{$st[$_.Name]=[int64]$_.Value}}
@@ -73,13 +110,14 @@ if($off -gt $f.Length){{$off=0}}
 $fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader($fs)
 $map=@{{}}
 while($map.Count -eq 0 -and ($l=$sr.ReadLine()) -ne $null){{
-if($l.StartsWith('#Fields:')){{$n=($l -replace '^#Fields:\\s*','') -split ' ';for($i=0;$i -lt $n.Count;$i++){{$map[$n[$i]]=$i}}}}}}
+if($l.StartsWith('#Fields:')){{$map=M $l}}}}
 if($map.Count -eq 0){{$sr.Close();$fs.Close();continue}}
 if($off -gt 0){{$fs.Position=$off;$sr.DiscardBufferedData()}}
 while(($l=$sr.ReadLine()) -ne $null){{
-if($l.StartsWith('#')){{continue}}
+if($l.StartsWith('#')){{if($l.StartsWith('#Fields:')){{$map=M $l}};continue}}
 $p=$l -split ' ';$tot++
 $s2=$p[$map['sc-status']];$c=$p[$map['c-ip']];$u=$p[$map['cs-uri-stem']];$a=$p[$map['cs(User-Agent)']]
+if($map.ContainsKey('{XFF}')){{$x=$p[$map['{XFF}']];if($x -and $x -ne '-'){{$c=($x -split ',')[0].Trim()}}}}
 $ips[$c]=1+$ips[$c]
 $hr[$p[$map['time']].Substring(0,2)]=1+$hr[$p[$map['time']].Substring(0,2)]
 $g=($u -split '/')[1];if($g){{$g=$g.ToLower()}}
@@ -136,10 +174,14 @@ HTTPERR_DIR = r"C:\Windows\System32\LogFiles\HTTPERR"
 
 
 def _extra_script(state: dict, top: int) -> str:
-    state_json = json.dumps({k: int(v) for k, v in (state or {}).items()})
+    return _fit(lambda state_json: _httperr_script(state_json, top), state)
+
+
+def _httperr_script(state_json: str, top: int) -> str:
     return PS_OUT_B64_HELPER + f"""
 $ErrorActionPreference='SilentlyContinue'
 Import-Module WebAdministration
+function M($l){{$n=($l -replace '^#Fields:\\s*','') -split ' ';$h=@{{}};for($i=0;$i -lt $n.Count;$i++){{$h[$n[$i]]=$i}};$h}}
 $ap=@(Get-WebApplication|%{{@{{p=$_.path.Trim('/');pool=$_.applicationPool}}}})
 $pl=@(Get-ChildItem IIS:\\AppPools|%{{@{{n=$_.name;s=[string]$_.state}}}})
 $st=@{{}}
@@ -153,11 +195,11 @@ if($off -gt $f.Length){{$off=0}}
 $fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader($fs)
 $map=@{{}}
 while($map.Count -eq 0 -and ($l=$sr.ReadLine()) -ne $null){{
-if($l.StartsWith('#Fields:')){{$n=($l -replace '^#Fields:\\s*','') -split ' ';for($i=0;$i -lt $n.Count;$i++){{$map[$n[$i]]=$i}}}}}}
+if($l.StartsWith('#Fields:')){{$map=M $l}}}}
 if($map.Count -eq 0){{$sr.Close();$fs.Close();continue}}
 if($off -gt 0){{$fs.Position=$off;$sr.DiscardBufferedData()}}
 while(($l=$sr.ReadLine()) -ne $null){{
-if($l.StartsWith('#')){{continue}}
+if($l.StartsWith('#')){{if($l.StartsWith('#Fields:')){{$map=M $l}};continue}}
 $p=$l -split ' ';$tot++
 $r=$p[$map['s-reason']];$rs[$r]=1+$rs[$r]
 if($r -ne '{IDLE_REASON}'){{
@@ -239,3 +281,39 @@ def detect_brute_force(logins: list, requests: list) -> list:
                       "requests": total,
                       "working": total > row["count"] * LOGIN_BRUTE_RATIO})
     return found
+
+
+# ─── Обратные прокси ─────────────────────────────────────────
+
+# Сети Cloudflare (ipv4 и ipv6, https://www.cloudflare.com/ips/). Если домен
+# проксируется через них, IIS видит адрес узла Cloudflare, а не посетителя:
+# разбор «кто стучится» по такому адресу бессмыслен, и об этом надо сказать,
+# а не выдавать узел прокси за источник.
+#
+# Список статичный намеренно: ходить за ним в интернет ради подписи в отчёте
+# незачем, а меняется он раз в несколько лет. Устаревание не ломает ничего —
+# просто пропадёт пометка.
+CLOUDFLARE_NETS = (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+)
+
+_CF_NETWORKS = None
+
+
+def is_cloudflare(address: str) -> bool:
+    """Адрес принадлежит сети Cloudflare — значит это узел прокси."""
+    global _CF_NETWORKS
+    import ipaddress
+
+    if _CF_NETWORKS is None:
+        _CF_NETWORKS = [ipaddress.ip_network(net) for net in CLOUDFLARE_NETS]
+    try:
+        parsed = ipaddress.ip_address((address or "").strip())
+    except ValueError:
+        return False
+    return any(parsed in net for net in _CF_NETWORKS)

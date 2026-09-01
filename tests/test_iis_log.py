@@ -113,7 +113,34 @@ def test_fields_parsed_by_name(monkeypatch):
     iis_log.read_site_logs(SERVER, {})
 
     assert "#Fields:" in scripts[0]
-    assert "$map[$n[$i]]=$i" in winrm_client.compact_ps(scripts[0])
+    assert "$h[$n[$i]]=$i" in winrm_client.compact_ps(scripts[0])
+
+
+def test_field_set_change_mid_file_is_picked_up():
+    """IIS дописывает новую строку #Fields прямо в середину файла, когда
+    меняют набор колонок. Пропустить её значит разбирать остаток файла по
+    старым позициям — и молча подставлять чужие значения."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    assert "if($l.StartsWith('#')){if($l.StartsWith('#Fields:')){$map=M $l}" in compact
+
+
+def test_real_client_address_taken_from_forwarded_header():
+    """За Cloudflare в c-ip лежит адрес узла прокси. Если в логировании сайта
+    заведено поле для X-Forwarded-For, брать надо его."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    assert "x-forwarded-for" in compact
+    assert "-split ','" in compact
+
+
+def test_script_shrinks_state_until_it_fits():
+    """Смещений может накопиться много (почасовая ротация). Не влезший скрипт
+    не выполнится вовсе, а потерянное смещение стоит одного перечитывания."""
+    many = {f"u_ex2609{i:02d}.log": 123456789 for i in range(40)}
+
+    assert winrm_client.ps_fits(iis_log._script(many, 10000, 25))
+    assert winrm_client.ps_fits(iis_log._extra_script(many, 25))
 
 
 def test_header_read_before_seek():

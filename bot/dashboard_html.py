@@ -32,7 +32,7 @@ from db import (
 from ping_tools import load_targets
 from log_store import read_snapshot
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
-from iis_log import detect_brute_force, LOGIN_BRUTE_PER_HOUR
+from iis_log import detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
 from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
 from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
@@ -997,9 +997,12 @@ def _iis_server(server: dict) -> str:
     cards = []
 
     # 1. Сканирование
+    proxied = sum(r["count"] for r in server["scan"] if is_cloudflare(r["parts"][0]))
     body = "".join(
         _lrow(STATUS_CRIT if r["count"] > 40 else STATUS_WARN, _num(r["count"]),
-              html.escape(r["parts"][0]), html.escape(r["parts"][1] or "—"))
+              html.escape(r["parts"][0])
+              + (" · узел Cloudflare" if is_cloudflare(r["parts"][0]) else ""),
+              html.escape(r["parts"][1] or "—"))
         for r in server["scan"][:15]
     )
     if server["hits"]:
@@ -1025,7 +1028,11 @@ def _iis_server(server: dict) -> str:
              + _cat("🔎", "посторонних путей", server["alien"], STATUS_SERIOUS)
              + _cat("✓", "нашли", len(server["hits"]), STATUS_CRIT)
              + _cat("🌐", "адресов", len(server["scan"]), STATUS_WARN) + '</div>',
-        extra=f'<div class="note">{hit_note}</div>',
+        extra=f'<div class="note">{hit_note}</div>' + (
+            '<div class="note">часть трафика приходит через Cloudflare: в логе '
+            'виден адрес узла прокси, а не посетителя. Настоящий адрес появится, '
+            'если в логировании сайта завести поле для заголовка '
+            'X-Forwarded-For</div>' if proxied else ""),
         body=body, open_=bool(server["hits"])))
 
     # 2. Вход в 1С

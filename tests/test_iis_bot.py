@@ -188,3 +188,36 @@ def test_finding_keys_are_stable(monkeypatch):
     second = _findings(monkeypatch, {}, hour_b)[0][1]["key"]
 
     assert first == second
+
+
+# ─── Обратный прокси ─────────────────────────────────────────
+
+def test_cloudflare_addresses_recognised():
+    """За прокси в логе виден узел Cloudflare, а не посетитель. Выдавать
+    узел за источник запроса нельзя."""
+    from importlib.util import spec_from_file_location, module_from_spec
+
+    spec = spec_from_file_location("iis_log", ROOT / "shared" / "iis_log.py")
+    iis_log = module_from_spec(spec)
+    spec.loader.exec_module(iis_log)
+
+    assert iis_log.is_cloudflare("104.23.243.101") is True
+    assert iis_log.is_cloudflare("162.158.138.5") is True
+    assert iis_log.is_cloudflare("2606:4700::1") is True
+    assert iis_log.is_cloudflare("192.0.2.30") is False
+    assert iis_log.is_cloudflare("") is False
+
+
+def test_scan_section_marks_proxy_and_explains():
+    text = iis_bot.format_scan(
+        _events(total=[("alien", 41)], scan=[("104.23.243.101|ClaudeBot", 6)]), 24)
+
+    assert "узел Cloudflare" in text
+    assert "X-Forwarded-For" in text
+
+
+def test_direct_addresses_get_no_proxy_note():
+    text = iis_bot.format_scan(
+        _events(total=[("alien", 41)], scan=[("192.0.2.99|curl", 41)]), 24)
+
+    assert "Cloudflare" not in text
