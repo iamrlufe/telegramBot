@@ -197,3 +197,42 @@ CREATE TABLE IF NOT EXISTS log_scans (
     error        TEXT,
     PRIMARY KEY (server_name, source)
 );
+
+-- Сводка IIS. В отличие от журналов Windows здесь НАКОПЛЕНИЕ, а не снимок:
+-- логи читаются по смещению, каждый проход приносит только новые строки,
+-- и сутки складываются из этих кусков суммированием по ключу при чтении.
+CREATE TABLE IF NOT EXISTS iis_events (
+    id          SERIAL PRIMARY KEY,
+    server_name TEXT NOT NULL,
+    category    TEXT NOT NULL,   -- total|code|port|pub|scan|hit|login|ip|error|slowuri|hour|herr|herrd
+    item        TEXT NOT NULL,   -- ключ внутри категории: '404.0', 'agro|192.0.2.30', …
+    count       BIGINT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_iis_events_created
+    ON iis_events (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_iis_events_server
+    ON iis_events (server_name, category);
+
+-- Докуда дочитан каждый файл. Потерять эти строки — значит либо перечитать
+-- 20 ГБ истории, либо пропустить сутки.
+CREATE TABLE IF NOT EXISTS iis_state (
+    server_name TEXT NOT NULL,
+    source      TEXT NOT NULL,   -- site | httperr
+    file_name   TEXT NOT NULL,
+    position    BIGINT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (server_name, source, file_name)
+);
+
+-- Публикации, пулы, объём каталога логов: меняются редко, хранятся снимком.
+CREATE TABLE IF NOT EXISTS iis_facts (
+    server_name TEXT NOT NULL,
+    fact        TEXT NOT NULL,
+    value       TEXT,
+    error       TEXT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (server_name, fact)
+);

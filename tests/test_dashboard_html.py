@@ -357,3 +357,121 @@ def test_server_without_logs_gets_no_badges():
     page = _full([_server("a.example.local")])
 
     assert '<div class="badges">' not in page
+
+
+# ─── Вкладка IIS ─────────────────────────────────────────────
+
+def _pr(item, count):
+    return {"parts": item if isinstance(item, list) else [item], "count": count}
+
+
+def _iis(name="web-01.example.local", **over):
+    server = {
+        "name": name, "requests": 476176, "alien": 889, "slow": 245, "uniq": 145,
+        "codes": [_pr("200.0", 473001)], "pubs": [_pr("agro", 253332)], "dead": [],
+        "scan": [_pr(["192.0.2.99", "libredtail-http"], 47)], "hits": [],
+        "logins": [_pr(["agro", "192.0.2.30"], 26)], "errors": [], "slows": [],
+        "hours": [_pr(f"{h:02d}", 100) for h in range(24)],
+        "herr": [_pr("Timer_ConnectionIdle", 10595)], "herrd": [], "brute": [],
+        "pools": [{"n": "DefaultAppPool", "s": "Started"}],
+        "logs_mb": 20831.9, "oldest_log": "2025-10-24", "error": "", "alarms": [],
+    }
+    server.update(over)
+    return server
+
+
+def _with_iis(servers):
+    data = _data([_server("a.example.local")])
+    data["logs"] = {"win": [], "sql": []}
+    data["backups"] = {"servers": [], "totals": {}, "size_gb": 0}
+    data["iis"] = servers
+    return dh.render_dashboard(data)
+
+
+def test_iis_tab_appears_only_with_data():
+    """На инфраструктуре без IIS вкладка не нужна."""
+    assert 'id="v-iis"' not in _with_iis([])
+    assert 'id="v-iis"' in _with_iis([_iis()])
+
+
+def test_iis_server_picker_only_for_several_servers():
+    """IIS-серверов может быть много; при одном переключатель — лишний шум."""
+    one = _with_iis([_iis()])
+    two = _with_iis([_iis(), _iis("web-02.example.local")])
+
+    assert '<div class="srvchips">' not in one
+    assert '<div class="srvchips">' in two
+    assert 'id="s-1"' in two
+
+
+def test_iis_picker_switches_by_css_not_script():
+    page = _with_iis([_iis(), _iis("web-02.example.local")])
+
+    assert "#s-1:checked~.wrap .iis-1{display:block}" in page
+    assert "<script" not in page
+
+
+def test_successful_scanner_response_is_the_headline():
+    """Единственный признак, что сканер что-то нашёл: сервер ответил успехом."""
+    page = _with_iis([_iis(hits=[_pr(["200", "/uploads/x.php", "192.0.2.99", "curl"], 2)],
+                           alarms=["сканер получил успешный ответ"])])
+
+    assert "/uploads/x.php" in page
+    assert "сканер получил успешный ответ" in page
+
+
+def test_clean_scan_says_so_plainly():
+    page = _with_iis([_iis()])
+
+    assert "Успешных ответов на посторонние пути нет" in page
+
+
+def test_dead_publications_listed():
+    """Публикация без трафика — открытая наружу точка входа без присмотра."""
+    page = _with_iis([_iis(dead=["copy_ivan", "ut2021"])])
+
+    assert "Публикации без трафика" in page
+    assert "copy_ivan" in page
+
+
+def test_iis_text_is_escaped():
+    page = _with_iis([_iis(scan=[_pr(["192.0.2.99", "<script>alert(1)</script>"], 5)])])
+
+    assert "<script>alert(1)" not in page
+    assert "&lt;script&gt;" in page
+
+
+# ─── Правило перебора паролей ────────────────────────────────
+
+def test_brute_force_needs_a_burst():
+    """26 входов в сутки — норма живого сервера, порог считается за час."""
+    below = dh.detect_brute_force([_pr(["agro", "192.0.2.30"], 24)], [])
+    above = dh.detect_brute_force([_pr(["agro", "192.0.2.99"], 180)], [])
+
+    assert below == []
+    assert len(above) == 1
+    assert above[0]["ip"] == "192.0.2.99"
+
+
+def test_reconnecting_client_is_not_called_an_attack():
+    """Сломавшийся клиент переподключается по кругу и даёт столько же входов.
+    Отличие: после входа он работает в базе, а подбирающий пароль — нет."""
+    working = dh.detect_brute_force(
+        [_pr(["agro", "192.0.2.30"], 60)], [_pr("192.0.2.30", 4000)]
+    )
+    silent = dh.detect_brute_force(
+        [_pr(["agro", "192.0.2.99"], 60)], [_pr("192.0.2.99", 61)]
+    )
+
+    assert working[0]["working"] is True
+    assert silent[0]["working"] is False
+
+
+def test_only_silent_brute_force_raises_alarm():
+    page = _with_iis([_iis(
+        brute=[{"base": "agro", "ip": "192.0.2.99", "count": 180,
+                "requests": 181, "working": False}],
+        alarms=["перебор паролей с 192.0.2.99"])])
+
+    assert "это подбор пароля" in page
+    assert "192.0.2.99" in page

@@ -31,6 +31,7 @@ from db import (
 )
 from ping_tools import load_targets
 from log_store import read_snapshot
+from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
 from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
 from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
@@ -190,9 +191,135 @@ def collect_dashboard_data(hours: int = 24) -> dict:
         "servers": servers,
         "logs": logs,
         "backups": collect_backups(),
+        "iis": collect_iis(),
         "hours": hours,
         "generated_at": datetime.now(ALMATY).strftime("%d.%m.%Y %H:%M"),
     }
+
+
+# ─── IIS ─────────────────────────────────────────────────────
+
+# Перебор паролей 1С. Измеренная норма живого сервера — до 26 входов
+# в СУТКИ с адреса, поэтому 25 за ЧАС это двадцатикратное превышение.
+LOGIN_BRUTE_PER_HOUR = 25
+
+# Столько же входов даст и сломавшийся клиент, который переподключается по
+# кругу. Отличие простое: у настоящего клиента после входов идёт работа, а у
+# подбирающего пароль — только login. Если запросов с адреса не больше чем
+# втрое от числа входов, работы за ними нет.
+LOGIN_BRUTE_RATIO = 3
+
+
+def _pairs(rows: list, parts: int) -> list:
+    """Ключи вида 'ip|ua' → разобранные части плюс счётчик."""
+    out = []
+    for row in rows or []:
+        chunks = str(row["item"]).split("|")
+        chunks += [""] * (parts - len(chunks))
+        out.append({"parts": chunks[:parts], "count": row["count"]})
+    return out
+
+
+def _total(events: dict, name: str) -> int:
+    for row in events.get("total") or []:
+        if row["item"] == name:
+            return row["count"]
+    return 0
+
+
+def detect_brute_force(logins: list, requests: list) -> list:
+    """Подбор пароля 1С по входам за последний час.
+
+    Порог взят с живого сервера: там до 26 входов в СУТКИ с адреса, значит
+    25 за ЧАС — двадцатикратное превышение.
+
+    Столько же входов даёт и сломавшийся клиент, который переподключается по
+    кругу, поэтому мало превышения. У настоящего клиента после входа идёт
+    работа — обычные запросы к базе; у подбирающего пароль нет ничего, кроме
+    login. Это и разделяет случаи.
+    """
+    by_ip = {row["parts"][0]: row["count"] for row in requests or []}
+    found = []
+    for row in logins or []:
+        base, ip = row["parts"][0], row["parts"][1]
+        if row["count"] < LOGIN_BRUTE_PER_HOUR:
+            continue
+        total = by_ip.get(ip, 0)
+        found.append({"base": base, "ip": ip, "count": row["count"],
+                      "requests": total,
+                      "working": total > row["count"] * LOGIN_BRUTE_RATIO})
+    return found
+
+
+def collect_iis() -> list:
+    """Сводка IIS по серверам из базы. Живьём логи не читаются: их дочитывает
+    монитор по смещению раз в IIS_SCAN_MINUTES."""
+    try:
+        day = read_iis_events(24)
+        hour = read_iis_events(1)
+        facts = read_iis_facts()
+    except Exception as e:
+        print(f"[dashboard] Сводка IIS недоступна: {e}", flush=True)
+        return []
+
+    servers = []
+    for name in sorted(set(day) | set(facts)):
+        events = day.get(name, {})
+        own_facts = facts.get(name, {})
+        apps = [str(a.get("p") or "").strip("/") for a in (own_facts.get("apps") or [])]
+        pubs = _pairs(events.get("pub"), 1)
+        seen = {p["parts"][0].lower() for p in pubs}
+        dead = sorted(a for a in apps if a and a.lower() not in seen)
+
+        # Перебор считается по последнему часу, а не по суткам: 25 входов за
+        # день — норма, за час — уже подбор.
+        brute = detect_brute_force(
+            _pairs(hour.get(name, {}).get("login"), 2),
+            _pairs(hour.get(name, {}).get("ip"), 1),
+        )
+
+        hits = _pairs(events.get("hit"), 4)
+        herr = _pairs(events.get("herr"), 1)
+        down_reasons = [h for h in herr
+                        if h["parts"][0] in ("QueueFull", "AppOffline",
+                                             "Connections_Refused")]
+        alarms = []
+        if hits:
+            alarms.append("сканер получил успешный ответ")
+        for item in brute:
+            if not item["working"]:
+                alarms.append(f"перебор паролей с {item['ip']}")
+        if down_reasons:
+            alarms.append("публикации были недоступны")
+
+        servers.append({
+            "name": name,
+            "requests": _total(events, "requests"),
+            "alien": _total(events, "alien"),
+            "slow": _total(events, "slow"),
+            "uniq": own_facts.get("uniq_ips") or 0,
+            "codes": _pairs(events.get("code"), 1),
+            "pubs": pubs,
+            "dead": dead,
+            "scan": _pairs(events.get("scan"), 2),
+            "hits": hits,
+            "logins": _pairs(events.get("login"), 2),
+            "errors": _pairs(events.get("error"), 2),
+            "slows": _pairs(events.get("slowuri"), 2),
+            "hours": sorted(_pairs(events.get("hour"), 1),
+                            key=lambda h: h["parts"][0]),
+            "herr": herr,
+            "herrd": _pairs(events.get("herrd"), 4),
+            "brute": brute,
+            "pools": own_facts.get("pools") or [],
+            "logs_mb": own_facts.get("logs_mb") or 0,
+            "oldest_log": own_facts.get("oldest_log") or "",
+            "error": own_facts.get("_error") or "",
+            "alarms": alarms,
+        })
+
+    servers.sort(key=lambda s: (0 if s["alarms"] else 1, -s["requests"], s["name"]))
+    return servers
 
 
 def _log_group(events: list, scan: dict, source: str) -> dict:
@@ -626,7 +753,7 @@ footer{margin-top:18px;text-align:center;font-size:11.5px;line-height:1.6;color:
 
 /* ─── Вкладки: те же radio + :checked, что у фильтра ─────────── */
 .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:14px;overflow-x:auto}
-.tabs label{flex:none;cursor:pointer;font-size:13.5px;color:var(--ink-3);padding:9px 9px;
+.tabs label{flex:none;cursor:pointer;font-size:13.5px;color:var(--ink-3);padding:9px 7px;
   border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;
   -webkit-user-select:none;user-select:none}
 #v-srv:checked~.wrap label[for="v-srv"],
@@ -672,6 +799,26 @@ footer{margin-top:18px;text-align:center;font-size:11.5px;line-height:1.6;color:
 .lb b{color:var(--c);font-weight:700}
 .bpath{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--ink-3);
   word-break:break-all}
+
+/* ─── Вкладка IIS ────────────────────────────────────────────── */
+#v-iis:checked~.wrap label[for="v-iis"]{color:var(--ink);font-weight:600;border-bottom-color:var(--ink)}
+#v-iis:checked~.wrap .pane-iis{display:block}
+.srvchips{display:flex;gap:7px;margin-bottom:12px;overflow-x:auto;padding-bottom:2px}
+.srvchips label{flex:none;white-space:nowrap;cursor:pointer;font-size:13px;padding:7px 12px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:999px;
+  display:inline-flex;align-items:center;gap:6px;-webkit-user-select:none;user-select:none}
+.srvchips label i{width:7px;height:7px;border-radius:50%;background:var(--c)}
+.iisbox{display:none}
+.bars{margin:2px 0 0 19px}
+.bar2{display:flex;align-items:center;gap:9px;font-size:12.5px;padding:3px 0}
+.bar2 .nm2{flex:none;width:130px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar2 .tr{flex:1;height:7px;border-radius:4px;background:var(--panel-2);overflow:hidden}
+.bar2 .tr i{display:block;height:100%;border-radius:4px;background:var(--cpu)}
+.bar2 .vv{flex:none;width:72px;text-align:right;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.hours{display:flex;align-items:flex-end;gap:2px;height:54px;margin:6px 0 0 19px}
+.hours i{flex:1;background:var(--cpu);border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
+.hoursx{display:flex;justify-content:space-between;font-size:10px;color:var(--ink-3);margin:3px 0 0 19px}
+.note{margin:9px 0 0 19px;font-size:11.5px;color:var(--ink-3)}
 @media (max-width:430px){.kpis{grid-template-columns:repeat(2,1fr)}}
 @media (prefers-reduced-motion:reduce){.ring .value{transition:none}}
 """
@@ -822,6 +969,293 @@ def _backups_pane(backups: dict) -> str:
     )
 
 
+def _iis_card(color, title, tag, cats="", extra="", body="", open_=False) -> str:
+    return (
+        f'<details class="logcard"{" open" if open_ else ""}>'
+        f'<summary><div class="loghead"><i class="dotc" style="--c:{color}"></i>'
+        f'<span class="name">{title}</span>'
+        f'<span class="tag" style="--c:{color};--cbg:{_tint(color, "24")}">{tag}</span></div>'
+        f'{cats}{extra}</summary><div class="rows">{body}</div></details>'
+    )
+
+
+def _cat(icon: str, label: str, count: int, color: str) -> str:
+    css = "cat" if count else "cat zero"
+    return (f'<span class="{css}" style="--c:{color if count else STATUS_GOOD}">'
+            f'{icon} {label} <b>{count}</b></span>')
+
+
+def _lrow(color, left, title, detail="") -> str:
+    tail = f'<span>{detail}</span>' if detail else ""
+    return (f'<div class="lrow"><i class="dotc" style="--c:{color};margin-top:5px"></i>'
+            f'<span class="t">{left}</span>'
+            f'<div class="m"><b>{title}</b>{tail}</div></div>')
+
+
+def _num(value) -> str:
+    return f"{int(value or 0):,}".replace(",", " ")
+
+
+def _bars(rows: list, limit: int = 8) -> str:
+    rows = rows[:limit]
+    if not rows:
+        return ""
+    top = max(r["count"] for r in rows) or 1
+    body = "".join(
+        f'<div class="bar2"><span class="nm2">{html.escape(r["parts"][0])}</span>'
+        f'<span class="tr"><i style="width:{r["count"] / top * 100:.0f}%"></i></span>'
+        f'<span class="vv">{_num(r["count"])}</span></div>'
+        for r in rows
+    )
+    return f'<div class="bars">{body}</div>'
+
+
+def _iis_server(server: dict) -> str:
+    """Разделы одного IIS-сервера. Порядок задан вопросами, ради которых
+    сюда заходят: сначала «нас атакуют?», потом «что сломано»."""
+    cards = []
+
+    # 1. Сканирование
+    body = "".join(
+        _lrow(STATUS_CRIT if r["count"] > 40 else STATUS_WARN, _num(r["count"]),
+              html.escape(r["parts"][0]), html.escape(r["parts"][1] or "—"))
+        for r in server["scan"][:15]
+    )
+    if server["hits"]:
+        for r in server["hits"][:10]:
+            status, uri, ip, ua = r["parts"]
+            body = _lrow(STATUS_CRIT, status, f"Ответ на {html.escape(uri)}",
+                         f"{html.escape(ip)} · {html.escape(ua)}") + body
+        hit_note = "сканер получил успешный ответ — разобрать вручную"
+    else:
+        body += _lrow(STATUS_GOOD, "0", "Успешных ответов на посторонние пути нет",
+                      "200 отдаётся только на «/», 301 — редирект с порта 80 на HTTPS")
+        hit_note = "ничего не нашли"
+    cards.append(_iis_card(
+        STATUS_CRIT if server["hits"] else STATUS_SERIOUS if server["alien"] else STATUS_GOOD,
+        "Сканирование извне", f'{_num(server["alien"])} запросов',
+        cats='<div class="cats">'
+             + _cat("🔎", "посторонних путей", server["alien"], STATUS_SERIOUS)
+             + _cat("✓", "нашли", len(server["hits"]), STATUS_CRIT)
+             + _cat("🌐", "адресов", len(server["scan"]), STATUS_WARN) + '</div>',
+        extra=f'<div class="note">{hit_note}</div>',
+        body=body, open_=bool(server["hits"])))
+
+    # 2. Вход в 1С
+    if server["logins"] or server["brute"]:
+        rows = []
+        for item in server["brute"]:
+            color = STATUS_WARN if item["working"] else STATUS_CRIT
+            note = ("адрес при этом работает в базе — похоже на клиента, "
+                    "который переподключается по кругу") if item["working"] else (
+                    "с адреса идут только входы и ничего больше — это подбор пароля")
+            rows.append(_lrow(color, f'{item["count"]}/ч',
+                              f'{html.escape(item["base"])} ← {html.escape(item["ip"])}', note))
+        for r in server["logins"][:12]:
+            base, ip = r["parts"]
+            rows.append(_lrow(STATUS_GOOD, _num(r["count"]),
+                              f'/{html.escape(base)}/e1cib/login ← {html.escape(ip)}',
+                              "штатный шаг входа платформы 1С"))
+        suspicious = sum(1 for i in server["brute"] if not i["working"])
+        total_logins = sum(r["count"] for r in server["logins"])
+        cards.append(_iis_card(
+            STATUS_CRIT if suspicious else STATUS_GOOD, "Вход в 1С (ответы 402)",
+            f"{_num(total_logins)} за сутки",
+            cats='<div class="cats">'
+                 + _cat("🔑", "входов", total_logins, STATUS_GOOD)
+                 + _cat("🖥", "адресов", len(server["logins"]), STATUS_GOOD)
+                 + _cat("⚠️", "подозрительных", suspicious, STATUS_CRIT) + '</div>',
+            extra=f'<div class="note">перебором считается от {LOGIN_BRUTE_PER_HOUR} '
+                  f'входов в час с одного адреса при отсутствии другой работы</div>',
+            body="".join(rows), open_=bool(suspicious)))
+
+    # 3. Ошибки приложения
+    if server["errors"]:
+        total = sum(r["count"] for r in server["errors"])
+        bases = {r["parts"][0].split("/")[1] for r in server["errors"] if "/" in r["parts"][0]}
+        services = sum(r["count"] for r in server["errors"] if "/hs/" in r["parts"][0])
+        body = "".join(
+            _lrow(STATUS_CRIT, _num(r["count"]), html.escape(r["parts"][0]),
+                  f'← {html.escape(r["parts"][1])}')
+            for r in server["errors"][:15]
+        )
+        cards.append(_iis_card(STATUS_CRIT, "Ошибки приложения (5xx)",
+            f"{_num(total)} за сутки",
+            cats='<div class="cats">' + _cat("💥", "5xx", total, STATUS_CRIT)
+                 + _cat("🗄", "баз затронуто", len(bases), STATUS_WARN)
+                 + _cat("🔌", "HTTP-сервисы", services, STATUS_WARN) + '</div>',
+            body=body, open_=True))
+
+    # 4. Медленные
+    if server["slow"]:
+        body = "".join(
+            _lrow(STATUS_WARN, _num(r["count"]), html.escape(r["parts"][0]),
+                  f'← {html.escape(r["parts"][1])}')
+            for r in server["slows"][:12]
+        )
+        cards.append(_iis_card(STATUS_WARN, "Медленные запросы",
+            f'{_num(server["slow"])} запросов',
+            cats='<div class="cats">'
+                 + _cat("🐢", f"дольше {IIS_SLOW_SECONDS} с", server["slow"], STATUS_WARN)
+                 + '</div>', body=body))
+
+    # 5. Публикации
+    pools = server["pools"] or []
+    stopped = [p for p in pools if str(p.get("s") or "").lower() != "started"]
+    body = ""
+    if server["dead"]:
+        body += _lrow(STATUS_CRIT, str(len(server["dead"])),
+                      "Публикации без трафика за сутки",
+                      " · ".join(html.escape(d) for d in server["dead"]))
+    if pools:
+        body += _lrow(STATUS_CRIT if stopped else STATUS_WARN, str(len(pools)),
+                      "Пулы приложений",
+                      " · ".join(f'{html.escape(str(p.get("n")))}: '
+                                 f'{html.escape(str(p.get("s")))}' for p in pools))
+    live = len(server["pubs"])
+    total_pubs = live + len(server["dead"])
+    cards.append(_iis_card(
+        STATUS_CRIT if server["dead"] else STATUS_GOOD, "Публикации 1С",
+        f"{live} живых из {total_pubs}" if total_pubs else "нет данных",
+        cats='<div class="cats">' + _cat("✓", "с трафиком", live, STATUS_GOOD)
+             + _cat("✕", "без трафика", len(server["dead"]), STATUS_CRIT)
+             + _cat("🧩", "пулов", len(pools), STATUS_WARN) + '</div>',
+        extra=_bars(server["pubs"]), body=body, open_=bool(server["dead"])))
+
+    # 6. HTTPERR
+    if server["herr"]:
+        idle = next((h["count"] for h in server["herr"]
+                     if h["parts"][0] == "Timer_ConnectionIdle"), 0)
+        rest = sum(h["count"] for h in server["herr"]) - idle
+        scanners = sum(h["count"] for h in server["herr"]
+                       if h["parts"][0] in ("Verb", "URL", "Hostname"))
+        down = sum(h["count"] for h in server["herr"]
+                   if h["parts"][0] in ("QueueFull", "AppOffline", "Connections_Refused"))
+        body = "".join(
+            _lrow(STATUS_GOOD if h["parts"][0] == "Timer_ConnectionIdle"
+                  else STATUS_CRIT if h["parts"][0] in ("Verb", "URL", "Hostname",
+                                                        "QueueFull", "AppOffline",
+                                                        "Connections_Refused")
+                  else STATUS_WARN,
+                  _num(h["count"]), html.escape(h["parts"][0]),
+                  HTTPERR_REASONS.get(h["parts"][0], ""))
+            for h in server["herr"][:12]
+        )
+        for r in server["herrd"][:10]:
+            reason, method, uri, ip = r["parts"]
+            body += _lrow(STATUS_WARN, _num(r["count"]),
+                          f'{html.escape(reason)} · {html.escape(method)} {html.escape(uri)}',
+                          f'← {html.escape(ip)}')
+        cards.append(_iis_card(STATUS_CRIT if down else STATUS_WARN,
+            "HTTPERR — мимо лога сайта", f"{_num(rest)} записей",
+            cats='<div class="cats">' + _cat("🚧", "сканеры", scanners, STATUS_CRIT)
+                 + _cat("📉", "связь клиентов", rest - scanners - down, STATUS_WARN)
+                 + _cat("🛑", "недоступность", down, STATUS_CRIT) + '</div>',
+            extra='<div class="note">штатное закрытие простаивающих соединений '
+                  f'({_num(idle)}) в счётчики не входит</div>',
+            body=body, open_=bool(down)))
+
+    # 7. Нагрузка и хозяйство
+    hours = server["hours"]
+    extra = ""
+    if hours:
+        peak = max(h["count"] for h in hours) or 1
+        bars = "".join(f'<i style="height:{h["count"] / peak * 100:.0f}%"></i>'
+                       for h in hours)
+        extra = (f'<div class="hours">{bars}</div>'
+                 '<div class="note">время по логу IIS — UTC; '
+                 'по Алматы это на 5 часов позже</div>')
+    body = _lrow(STATUS_GOOD, _num(server["uniq"]), "Уникальных адресов за сутки",
+                 f'из них сканирующих: {len(server["scan"])}')
+    if server["logs_mb"]:
+        gb = server["logs_mb"] / 1024
+        body += _lrow(STATUS_WARN if gb > 5 else STATUS_GOOD, f"{gb:.1f} ГБ",
+                      "Каталог логов IIS",
+                      f'старейший файл от {server["oldest_log"]} — автоочистки нет'
+                      if server["oldest_log"] else "автоочистки нет")
+    ports = {r["parts"][0]: r["count"] for r in server["codes"]}
+    cards.append(_iis_card(STATUS_GOOD, "Нагрузка и хозяйство",
+        f'{_num(server["requests"])} запросов', extra=extra, body=body))
+
+    return "".join(cards)
+
+
+HTTPERR_REASONS = {
+    "Timer_ConnectionIdle": "штатное закрытие простаивающих keep-alive соединений",
+    "Verb": "несуществующий HTTP-метод — почерк сканеров",
+    "URL": "неразбираемый запрос, например префейс HTTP/2 «PRI *»",
+    "Hostname": "обращение по адресу с неизвестным Host — сканер",
+    "ClientCancel": "клиент оборвал запрос",
+    "Client_Reset": "клиент сбросил соединение",
+    "Connection_Dropped": "обрыв соединения — плохая связь у клиента",
+    "Timer_MinBytesPerSecond": "клиент отдаёт данные медленнее порога",
+    "QueueFull": "очередь пула переполнена — публикации недоступны",
+    "AppOffline": "пул приложений остановлен",
+    "Connections_Refused": "соединения отвергнуты http.sys",
+}
+
+IIS_SLOW_SECONDS = 10
+
+
+def _iis_pane(servers: list) -> tuple:
+    """Возвращает (переключатели, панель): radio обязаны стоять до .wrap,
+    иначе селектор «~» до карточек не достанет."""
+    if not servers:
+        return "", ('<div class="pane pane-iis"><div class="empty" style="display:block">'
+                    'Сводка IIS ещё не собрана. Монитор дочитывает логи раз в час — '
+                    'загляните после следующего цикла.</div></div>')
+
+    radios = "".join(
+        f'<input class="switch" type="radio" name="s" id="s-{i}"'
+        f'{" checked" if i == 0 else ""}>'
+        for i in range(len(servers))
+    )
+    # Переключатель серверов — тот же приём, что вкладки: IIS-серверов может
+    # быть много, а держать их все на одном экране нечитаемо.
+    chips = ""
+    rules = ""
+    if len(servers) > 1:
+        chips = '<div class="srvchips">' + "".join(
+            f'<label for="s-{i}"><i style="--c:'
+            f'{STATUS_CRIT if s["alarms"] else STATUS_GOOD}"></i>'
+            f'{html.escape(s["name"].split(".")[0])}</label>'
+            for i, s in enumerate(servers)
+        ) + '</div>'
+        rules = "<style>" + "".join(
+            f'#s-{i}:checked~.wrap label[for="s-{i}"]{{background:var(--ink);'
+            f'color:var(--surface);border-color:var(--ink)}}'
+            f'#s-{i}:checked~.wrap .iis-{i}{{display:block}}'
+            for i in range(len(servers))
+        ) + "</style>"
+    else:
+        rules = "<style>.iis-0{display:block}</style>"
+
+    boxes = []
+    for i, server in enumerate(servers):
+        tiles = "".join([
+            f'<div class="kpi"><b>{_num(server["requests"])}</b>'
+            f'<span>запросов за сутки</span></div>',
+            f'<div class="kpi" style="--c:{STATUS_SERIOUS}"><b>{_num(server["alien"])}</b>'
+            f'<span>посторонних</span></div>',
+            f'<div class="kpi" style="--c:'
+            f'{STATUS_CRIT if server["hits"] else STATUS_GOOD}">'
+            f'<b>{len(server["hits"])}</b><span>найдено сканерами</span></div>',
+            f'<div class="kpi" style="--c:{STATUS_CRIT}">'
+            f'<b>{_num(sum(r["count"] for r in server["errors"]))}</b>'
+            f'<span>ошибок 5xx</span></div>',
+        ])
+        note = f'{html.escape(server["name"])} · сводка за сутки, дочитывается по смещению'
+        if server["error"]:
+            note += f' · ⚠️ {html.escape(server["error"])}'
+        boxes.append(
+            f'<div class="iisbox iis-{i}"><div class="kpis">{tiles}</div>'
+            f'<div class="hint">{note}</div>{_iis_server(server)}</div>'
+        )
+
+    return radios, ('<div class="pane pane-iis">' + rules + chips
+                    + "".join(boxes) + '</div>')
+
+
 def render_dashboard(data: dict) -> str:
     """Данные → готовый HTML. Отдельно от базы, чтобы тесты проверяли разметку
     без Postgres.
@@ -884,21 +1318,26 @@ def render_dashboard(data: dict) -> str:
 
     logs = data.get("logs") or {"win": [], "sql": []}
     backups = data.get("backups") or {"servers": [], "totals": {}, "size_gb": 0}
+    iis = data.get("iis") or []
+    iis_radios, iis_html = _iis_pane(iis)
     win_hot = sum(1 for g in logs["win"] if g["level"] == "crit")
     sql_hot = sum(1 for g in logs["sql"] if g["level"] == "crit")
     bak_hot = backups.get("totals", {}).get("crit", 0)
+    iis_hot = sum(1 for s in iis if s["alarms"])
 
     tabs = [
-        ("srv", "Серверы", bad, STATUS_CRIT if down else STATUS_SERIOUS),
+        ("srv", "Серверы", 0, STATUS_CRIT),
         ("win", "Windows", win_hot, STATUS_CRIT),
         ("sql", "SQL", sql_hot, STATUS_CRIT),
         ("bak", "Бэкапы", bak_hot, STATUS_CRIT),
     ]
+    if iis:
+        tabs.append(("iis", "IIS", iis_hot, STATUS_CRIT))
     radios += "".join(
         f'<input class="switch" type="radio" name="v" id="v-{key}"'
         f'{" checked" if key == "srv" else ""}>'
         for key, _label, _count, _color in tabs
-    )
+    ) + iis_radios
     tabs_html = "".join(
         f'<label for="v-{key}">{label}'
         + (f'<span class="badge" style="--bg:{color}">{count}</span>' if count else "")
@@ -928,6 +1367,7 @@ def render_dashboard(data: dict) -> str:
                      "SQL Server за сутки: отказы входа, ошибки копирования "
                      "и движка, упавшие джобы Agent.")
         + _backups_pane(backups)
+        + iis_html
         + '<footer>AgentMonitor · автономный HTML-отчёт, работает без сети<br>'
         'данные на момент формирования — обновить можно командой /dashboard</footer>'
         '</div></body></html>'
