@@ -14,8 +14,10 @@ from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
 from log_collector import maybe_run_log_cycle
 from iis_collector import maybe_run_iis_cycle
+from firewall_maintenance import run_firewall_expiry
 from log_store import forget_server as forget_log_events
 from iis_store import forget_server as forget_iis_data
+from firewall_store import forget_server as forget_firewall_data
 from backup_maintenance import run_backup_maintenance
 from db import (
     ensure_time_indexes,
@@ -617,6 +619,7 @@ def run_cycle():
             purge_disk_health(name)
             forget_log_events(name)
             forget_iis_data(name)
+            forget_firewall_data(name)
         except Exception as e:
             print(f"[monitor] Не удалось очистить состояние {name}: {e}", flush=True)
 
@@ -658,6 +661,13 @@ def run_cycle():
         maybe_run_iis_cycle(servers, on_progress=touch_heartbeat)
     except Exception as e:
         print(f"[monitor] Ошибка сбора IIS: {e}", flush=True)
+
+    # Снятие истёкших блокировок IP. Дешёвый шаг: без истёкших строк он не
+    # ходит на серверы вовсе.
+    try:
+        run_firewall_expiry(servers)
+    except Exception as e:
+        print(f"[monitor] Ошибка снятия блокировок IP: {e}", flush=True)
 
     # Ретеншн и RESTORE VERIFYONLY — в своём потоке (maintenance_loop), не здесь:
     # VERIFY может идти до 2 часов, и раньше это останавливало весь цикл

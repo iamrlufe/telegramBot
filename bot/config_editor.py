@@ -227,8 +227,8 @@ def validate_config(servers) -> None:
             if bah < 1 or bah > 720:
                 raise ValueError(f"Сервер «{name}»: backup_alert_hours должно быть от 1 до 720")
 
-        for flag in ("dbsize", "exchange", "verify_backup", "backup_size_check",
-                     "verify_ssl", "legacy_tls"):
+        for flag in ("dbsize", "exchange", "firewall", "verify_backup",
+                     "backup_size_check", "verify_ssl", "legacy_tls"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
 
@@ -409,6 +409,20 @@ FIELD_DEFS = {
                   "раздел появится и без этого флага.",
         "kind": "bool",
     },
+    "firewall": {
+        "label": "Блокировка IP",
+        "prompt": "Разрешить боту блокировать адреса на этом сервере? (да/нет)\n"
+                  "Открывает кнопку 🛡 Блокировка IP в карточке: список "
+                  "заблокированных, блокировка адреса или подсети, снятие, "
+                  "белый список.\n\n"
+                  "Бот блокирует только то, что назвали вы, — сам не "
+                  "блокирует никого.\n"
+                  "Нужны права администратора у учётки WinRM: адреса "
+                  "складываются в правило Windows Firewall.\n\n"
+                  "Выключение флага прячет раздел, но не снимает уже "
+                  "поставленные блокировки — сними их заранее.",
+        "kind": "bool",
+    },
     "retention_days": {
         "label": "Ретеншн (дней)",
         "prompt": "Автоочистка: хранить бэкапы N дней (число, минимум 3).\n"
@@ -486,7 +500,7 @@ FIELD_DEFS = {
 WIZARD_ORDER = [
     "name", "host", "type", "username", "password", "services",
     "backups_sql", "backups_1c", "backups_veeam", "onec_logs",
-    "dbsize", "exchange", "retention_days", "backup_alert_hours",
+    "dbsize", "exchange", "firewall", "retention_days", "backup_alert_hours",
     "backup_size_check",
     "verify_backup", "reg_file",
     "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
@@ -502,8 +516,8 @@ REQUIRED_FIELDS = {"name", "host"}
 # Пути бэкапов и пороги сюда НЕ входят: каталоги на Linux/NAS (Synology)
 # читаются по SSH, и задавать их из бота нужно так же, как на Windows.
 WINDOWS_ONLY_FIELDS = {
-    "onec_logs", "dbsize", "exchange", "retention_days", "verify_backup",
-    "reg_file",
+    "onec_logs", "dbsize", "exchange", "firewall", "retention_days",
+    "verify_backup", "reg_file",
 }
 
 # Поля только для vmware: TLS до vCenter и пороги по снапшотам.
@@ -608,7 +622,8 @@ EDIT_FIELDS = [
     ["reg_file"],
     ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
-TOGGLE_FIELDS = ["dbsize", "exchange", "verify_backup", "backup_size_check"]
+TOGGLE_FIELDS = ["dbsize", "exchange", "firewall", "verify_backup",
+                 "backup_size_check"]
 
 # Флаги, отсутствие которых в конфиге означает «включено», а не «выключено».
 # Для них выключение пишется явным false — иначе ответ «нет» бесследно
@@ -1415,6 +1430,10 @@ def edit_fields_kb(server: dict):
             InlineKeyboardButton(
                 f"Exchange: {'✅' if server.get('exchange') else '❌'}",
                 callback_data="cfg_toggle:exchange"
+            ),
+            InlineKeyboardButton(
+                f"🛡 Блокировка IP: {'✅' if server.get('firewall') else '❌'}",
+                callback_data="cfg_toggle:firewall"
             ),
         ])
         keyboard.append([
@@ -2741,6 +2760,62 @@ HELP_SQLJOBS = """🕒 ДЖОБЫ SQL AGENT
 Расписания берутся из sysjobs/sysschedules — хватает public."""
 
 
+HELP_FIREWALL = """🛡 БЛОКИРОВКА IP
+
+Кнопка появляется у Windows-серверов с флагом «🛡 Блокировка IP»
+(⚙️ Настройка → сервер → переключатель). Учётке WinRM нужны права
+администратора: адреса складываются в правило Windows Firewall.
+
+Бот НЕ блокирует никого сам. Адрес называете вы — посмотрев на
+🌐 IIS → 🔎 Сканирование или на алерт о подборе пароля. Автоматика
+тут дороже пользы: на Exchange один неверно опознанный адрес это
+отрезанный офис, а если сайт за обратным прокси, в логе у всех
+посетителей один и тот же адрес прокси — автоблокировка выключила бы
+сайт целиком.
+
+━━━━━━━━━━━━━━━━━━━━
+📑 ЧТО ЕСТЬ
+
+🚫 Заблокировать — адрес или подсеть, со сроком:
+  192.0.2.10 — на 3 дня (по умолчанию)
+  192.0.2.10 7 — на 7 дней
+  192.0.2.0/24 — подсеть целиком
+  192.0.2.10 навсегда — без срока
+  Блокируется ВЕСЬ входящий трафик с адреса, не только веб.
+✅ Снять — сразу, без подтверждения: разблокировка ничего не ломает.
+⚪ Белый список — адреса, которые бот заблокировать откажется. Сюда
+  стоит занести свой офис и узлы обратного прокси. Занесение снимает
+  блокировку, если она была.
+🔍 Сверить с сервером — отличает «бот считает адрес заблокированным»
+  от «адрес заблокирован»: правило могли снести в оснастке, а сервер
+  пересоздать из образа. Расхождение чинится одной кнопкой.
+
+━━━━━━━━━━━━━━━━━━━━
+⛔ ЧТО БОТ БЛОКИРОВАТЬ ОТКАЖЕТСЯ
+
+Сам сервер (его host, 127.0.0.1, fe80::), узлы Cloudflare, сети
+крупнее /8 и всё из белого списка. Это способы отрезать доступ себе,
+а не сканеру.
+
+━━━━━━━━━━━━━━━━━━━━
+🔧 КАК УСТРОЕНО
+
+Все адреса лежат в ОДНОМ правиле — в wf.msc оно называется
+«AgroTNKbot: блокировка сканеров». По правилу на адрес не делается
+намеренно: сканирование распределённое, адресов набегают сотни, и
+сотни правил Windows перебирает на каждом пакете.
+
+Список хранится в базе бота, а не на сервере: правило не хранит ни
+срока, ни причины, ни автора. Правило каждый раз собирается из списка
+целиком, поэтому любая операция заодно чинит его после ручных правок.
+
+Истёкшие блокировки снимает монитор в обычном цикле и сообщает об
+этом. Кто и что заблокировал — видно в ⚙️ Настройка → 📜 Аудит.
+
+Права: блокировка и снятие доступны только пользователям из
+TELEGRAM_DELETE_USERS — тем же, кому разрешена перезагрузка."""
+
+
 HELP_SECTIONS = {
     "start":   ("🚀 С чего начать",        HELP_START),
     "menu":    ("📂 Меню и команды",       HELP_MENU),
@@ -2757,6 +2832,7 @@ HELP_SECTIONS = {
     "winlog":  ("📜 Логи Windows",         HELP_WINLOG),
     "exchange": ("📧 Почта",                HELP_EXCHANGE),
     "iis":     ("🌐 IIS",                  HELP_IIS),
+    "firewall": ("🛡 Блокировка IP",     HELP_FIREWALL),
     "data":    ("🗄 Данные и конфиг",      HELP_DATA),
 }
 

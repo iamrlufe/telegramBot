@@ -236,3 +236,26 @@ CREATE TABLE IF NOT EXISTS iis_facts (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (server_name, fact)
 );
+
+-- Заблокированные адреса (раздел 🛡 Блокировка IP). Источник истины —
+-- здесь, а не на сервере: правило Windows Firewall не хранит ни срока, ни
+-- причины, ни автора, а пересозданный сервер теряет список целиком.
+-- Правило каждый раз собирается из этих строк.
+CREATE TABLE IF NOT EXISTS fw_blocks (
+    server_name TEXT NOT NULL,
+    address     TEXT NOT NULL,   -- IP или подсеть: '192.0.2.10', '192.0.2.0/24'
+    reason      TEXT,
+    author      TEXT,            -- Telegram user_id того, кто заблокировал
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ,     -- NULL = бессрочно
+    PRIMARY KEY (server_name, address)
+);
+
+-- Адреса, которые бот блокировать откажется: свой офис, узлы прокси.
+CREATE TABLE IF NOT EXISTS fw_whitelist (
+    server_name TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (server_name, address)
+);

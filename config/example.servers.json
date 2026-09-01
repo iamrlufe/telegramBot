@@ -16,7 +16,7 @@
     "verify_backup": true
   },
   {
-    "_comment": "Все поддерживаемые поля Windows-сервера сразу, для справки.",
+    "_comment": "Все поддерживаемые поля Windows-сервера сразу, для справки. firewall=true открывает кнопку 🛡 Блокировка IP и требует прав администратора у учётки WinRM.",
     "name": "app-01.example.local",
     "host": "192.0.2.11",
     "services": [
@@ -55,6 +55,7 @@
       ]
     },
     "exchange": false,
+    "firewall": false,
     "onec_logs": [
       {
         "name": "ЛогиСервера1С",

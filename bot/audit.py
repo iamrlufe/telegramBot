@@ -23,6 +23,10 @@ ACTION_LABELS = {
     "services": "⚙️ сервисы",
     "delete":   "🗑 удалён",
     "reboot":   "♻️ перезагрузка",
+    "fwblock":  "🚫 блокировка IP",
+    "fwunblock": "✅ снята блокировка",
+    "fwwhite":  "⚪ белый список",
+    "fwsync":   "🔄 правило перезаписано",
 }
 
 _table_ready = False

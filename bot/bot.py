@@ -35,6 +35,10 @@ from sqllog_bot import has_mssql, sql_token, sqllog_callback
 from winlog_bot import has_winlog, win_token, winlog_callback
 from iis_bot import has_iis, iis_token, iis_callback
 from exchange_bot import has_exchange, ex_token, exchange_callback
+from firewall_bot import (
+    has_firewall, fw_token, firewall_callback, handle_firewall_text,
+    AWAIT_KEY as FW_AWAIT_KEY,
+)
 from remote_ops import get_top_dirs, restart_service, reboot_server
 from backup_bot import (
     cmd_backup_menu,
@@ -648,8 +652,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text in MENU_LABELS:
         # Кнопка главного меню прерывает активный мастер настройки
+        # и ожидание адреса для блокировки
         context.user_data.pop(CONFIG_STATE_KEY, None)
+        context.user_data.pop(FW_AWAIT_KEY, None)
     elif await handle_config_text(update, context):
+        return
+    elif await handle_firewall_text(update, context):
         return
 
     if context.user_data.pop("awaiting_ping_host", False):
@@ -758,6 +766,11 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
                 "📧 Почта (Exchange)",
                 callback_data=f"exlog_menu:{ex_token(server_name, 24)}",
             )])
+        if has_firewall(server):
+            rows.append([InlineKeyboardButton(
+                "🛡 Блокировка IP",
+                callback_data=f"fw_menu:{fw_token(server_name)}",
+            )])
     except Exception as e:
         print(f"[bot] Логи: сервер {server_name} не прочитан: {e}", flush=True)
 
@@ -807,6 +820,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("exlog_"):
         await exchange_callback(query, context)
+
+    elif query.data.startswith("fw_"):
+        await firewall_callback(query, context)
 
     elif query.data.startswith("cfg_"):
         await config_callback(query, context)
