@@ -250,3 +250,107 @@ def test_duration_decoded_from_msdb_format():
     assert ls.job_seconds(72900) == 7 * 3600 + 29 * 60
     assert ls.job_seconds(132) == 92
     assert ls.job_seconds(None) == 0
+
+
+# ─── Расписания джоб: чего не было ───────────────────────────
+
+from datetime import datetime
+
+# 01.09.2026 — вторник.
+TUESDAY = datetime(2026, 9, 1, 13, 20)
+
+FREQ = {"daily": 4, "weekly": 8, "monthly": 16, "once": 1, "on_start": 64}
+
+
+def _sched(job, ft="daily", fi=1, at=13000, jen=1, sen=1, rf=1, run=0):
+    return {"job": job, "jen": jen, "sen": sen, "ft": FREQ.get(ft, ft),
+            "fi": fi, "st": 1, "si": 0, "rf": rf, "ast": at, "run": run}
+
+
+def test_missed_daily_job_is_named():
+    """Не отработавшая джоба не падает и в истории не появляется вовсе —
+    отличить «не была нужна» от «не запустилась» можно только по расписанию."""
+    events = ls.job_schedule_events([_sched("Ночной FULL")], ran=set(), now=TUESDAY)
+
+    assert len(events) == 1
+    assert "не запускалась" in events[0]["title"]
+    assert "ежедневно в 01:30" in events[0]["detail"]
+
+
+def test_job_that_ran_is_silent():
+    events = ls.job_schedule_events([_sched("Ночной FULL")],
+                                    ran={"Ночной FULL"}, now=TUESDAY)
+
+    assert events == []
+
+
+def test_running_job_is_not_reported_missing():
+    """Запись в sysjobhistory появляется только при завершении: в пять утра
+    семичасовой ночной план ещё не отчитался, но идёт."""
+    events = ls.job_schedule_events([_sched("Ночной FULL", run=1)],
+                                    ran=set(), now=TUESDAY)
+
+    assert events == []
+
+
+def test_grace_before_calling_it_missed():
+    """Джоба стартует не секунда в секунду, а очередь Agent бывает занята."""
+    just_now = datetime(2026, 9, 1, 1, 40)
+
+    assert ls.job_schedule_events([_sched("Ночной FULL")], set(), now=just_now) == []
+    later = datetime(2026, 9, 1, 3, 0)
+    assert ls.job_schedule_events([_sched("Ночной FULL")], set(), now=later)
+
+
+def test_weekly_job_only_on_its_weekday():
+    """Понедельничная копия во вторник не пропущена — её сегодня и не ждут."""
+    monday_only = _sched("Weekly backup", ft="weekly", fi=2, at=90000)
+
+    assert ls.job_schedule_events([monday_only], set(), now=TUESDAY) == []
+    monday = datetime(2026, 8, 31, 13, 0)
+    events = ls.job_schedule_events([monday_only], set(), now=monday)
+    assert "по понедельникам в 09:00" in events[0]["detail"]
+
+
+def test_monthly_job_only_on_its_day():
+    first = _sched("Месячный отчёт", ft="monthly", fi=1, at=30000)
+    fifth = _sched("Месячный отчёт", ft="monthly", fi=5, at=30000)
+
+    assert ls.job_schedule_events([first], set(), now=TUESDAY)
+    assert ls.job_schedule_events([fifth], set(), now=TUESDAY) == []
+
+
+def test_unparsed_schedules_stay_quiet():
+    """Однократные и «при старте Agent» не разбираем: угадывать по ним
+    пропуск значит поднимать ложную тревогу."""
+    for kind in ("once", "on_start"):
+        assert ls.job_schedule_events([_sched("X", ft=kind)], set(), now=TUESDAY) == []
+
+
+def test_disabled_schedule_is_not_a_miss():
+    assert ls.job_schedule_events([_sched("X", sen=0)], set(), now=TUESDAY) == []
+
+
+def test_disabled_job_reported_separately():
+    """Самый тихий случай: не падает, не пропадает, не жалуется."""
+    events = ls.job_schedule_events([_sched("Ночной FULL", jen=0)], set(), now=TUESDAY)
+
+    assert "отключена" in events[0]["title"]
+
+
+def test_backup_job_miss_is_critical():
+    """Молчание бэкапной джобы значит, что копии сегодня не будет."""
+    backup = ls.job_schedule_events([_sched("Weekly backup FULL")], set(), now=TUESDAY)
+    other = ls.job_schedule_events([_sched("Обновление статистики")], set(), now=TUESDAY)
+
+    assert backup[0]["level"] == "crit"
+    assert other[0]["level"] == "warn"
+
+
+def test_several_schedules_one_row():
+    """У джобы бывает несколько расписаний — строка всё равно одна."""
+    events = ls.job_schedule_events(
+        [_sched("Ночной FULL"), _sched("Ночной FULL", ft="weekly", fi=4, at=90000)],
+        set(), now=TUESDAY)
+
+    assert len(events) == 1

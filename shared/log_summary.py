@@ -25,6 +25,7 @@ event_at хранится строкой в том виде, в каком ег�
 и показ по строке работают одинаково.
 """
 import os
+from datetime import datetime, timedelta
 
 from winlog import (
     read_reboots, read_service_failures, read_disk_errors,
@@ -33,8 +34,9 @@ from winlog import (
 )
 from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
-    read_agent_jobs, friendly_sql_error, explain_engine_error,
-    explain_backup_error, summarize_job_message, decode_agent_duration,
+    read_agent_jobs, read_job_schedules, friendly_sql_error,
+    explain_engine_error, explain_backup_error, summarize_job_message,
+    decode_agent_duration,
 )
 
 def _int_env(name: str, default: int) -> int:
@@ -59,6 +61,7 @@ SQL_CATEGORIES = (
     ("engine", "⚠️", "ошибки движка"),
     ("job",    "🕐", "упавшие джобы"),
     ("run",    "▶️", "запуски джоб"),
+    ("miss",   "🗓", "не отработали"),
 )
 
 CATEGORY_TITLES = {
@@ -85,6 +88,23 @@ JOB_LONG_HOURS = _int_env("SQL_JOB_LONG_HOURS", 12)
 # Имена, по которым джоба опознаётся как бэкапная. Тот же приём, что в
 # mssql_log для ошибок копирования: явного признака у джобы нет.
 BACKUP_JOB_MARKERS = ("backup", "бэкап", "копи", "bkp", "dump")
+
+# Сколько ждать после назначенного времени, прежде чем считать запуск
+# пропущенным. Джоба стартует не секунда в секунду, а очередь Agent бывает
+# занята соседней задачей.
+JOB_MISS_GRACE_MINUTES = _int_env("SQL_JOB_MISS_GRACE_MINUTES", 60)
+
+# Как msdb описывает периодичность (freq_type в sysschedules).
+FREQ_ONCE = 1
+FREQ_DAILY = 4
+FREQ_WEEKLY = 8
+FREQ_MONTHLY = 16
+
+# Дни недели в freq_interval недельного расписания — битовая маска, где
+# воскресенье это 1. Ключ здесь — weekday() из Python (понедельник 0).
+WEEKDAY_BITS = {0: 2, 1: 4, 2: 8, 3: 16, 4: 32, 5: 64, 6: 1}
+WEEKDAY_NAMES = ("понедельникам", "вторникам", "средам", "четвергам",
+                 "пятницам", "субботам", "воскресеньям")
 
 # Сколько записей одной категории имеет смысл хранить: в дашборде видно
 # первые несколько, полный разбор всё равно в карточке сервера.
@@ -289,8 +309,18 @@ def sql_events(server: dict, hours: int = 24) -> tuple[list, str]:
                 ) if part),
             ))
         events.extend(job_runs(rows))
+        ran = {row.get("job") for row in rows if row.get("job")}
     except Exception as e:
         problems.append(f"джобы Agent: {friendly_sql_error(e)}")
+        ran = None
+
+    # Расписания — только если историю запусков прочитать удалось: без неё
+    # «не запускалась» будет у всех подряд.
+    if ran is not None:
+        try:
+            events.extend(job_schedule_events(read_job_schedules(server), ran))
+        except Exception as e:
+            problems.append(f"расписания джоб: {friendly_sql_error(e)}")
 
     return events, "; ".join(problems)
 
@@ -351,6 +381,110 @@ def decode_agent_duration_seconds(seconds: int) -> str:
     if minutes:
         return f"{minutes} мин {secs} с"
     return f"{secs} с"
+
+
+def _hhmmss(value) -> tuple:
+    """active_start_time в msdb — целое HHMMSS: 13000 это 01:30:00."""
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value // 10000, (value // 100) % 100, value % 100
+
+
+def schedule_text(row: dict) -> str:
+    """Расписание словами. Пусто — если разобрать не смогли."""
+    hour, minute, _sec = _hhmmss(row.get("ast"))
+    at = f"в {hour:02d}:{minute:02d}"
+    ft, fi, rf = int(row.get("ft") or 0), int(row.get("fi") or 0), int(row.get("rf") or 0)
+    if ft == FREQ_DAILY:
+        return f"ежедневно {at}" if fi <= 1 else f"раз в {fi} дн {at}"
+    if ft == FREQ_WEEKLY:
+        days = [WEEKDAY_NAMES[i] for i, bit in WEEKDAY_BITS.items() if fi & bit]
+        days.sort(key=lambda d: WEEKDAY_NAMES.index(d))
+        every = "" if rf <= 1 else f" раз в {rf} нед"
+        return f"по {', '.join(days)}{every} {at}" if days else ""
+    if ft == FREQ_MONTHLY:
+        return f"{fi}-го числа {at}"
+    return ""
+
+
+def expected_today(row: dict, now) -> bool:
+    """Ждём ли запуск этой джобы сегодня к текущему моменту.
+
+    Разбираются три периодичности: ежедневная, недельная и «N-го числа».
+    Остальные — однократная, «при старте Agent», «в простое» и относительная
+    месячная — сознательно не разбираются: угадывать по ним пропуск значит
+    поднимать ложную тревогу, а молчать честнее.
+    """
+    if not int(row.get("sen") or 0):
+        return False
+
+    ft, fi, rf = int(row.get("ft") or 0), int(row.get("fi") or 0), int(row.get("rf") or 0)
+    if ft == FREQ_DAILY:
+        due = fi <= 1
+    elif ft == FREQ_WEEKLY:
+        due = bool(fi & WEEKDAY_BITS[now.weekday()]) and rf <= 1
+    elif ft == FREQ_MONTHLY:
+        due = now.day == fi
+    else:
+        return False
+    if not due:
+        return False
+
+    # Время уже должно было наступить, и с запасом: джоба стартует не
+    # секунда в секунду, а очередь Agent бывает занята соседней задачей.
+    hour, minute, _sec = _hhmmss(row.get("ast"))
+    planned = now.replace(hour=min(hour, 23), minute=min(minute, 59),
+                          second=0, microsecond=0)
+    return now >= planned + timedelta(minutes=JOB_MISS_GRACE_MINUTES)
+
+
+def job_schedule_events(rows: list, ran: set, now=None) -> list:
+    """Джобы, которые должны были отработать, но не отработали, и выключенные.
+
+    Это то, чего не видно в истории запусков: не отработавшая джоба не падает
+    и в sysjobhistory не появляется вовсе. Отличить «не была нужна» от «не
+    запустилась» можно только по расписанию, и знает его сам сервер.
+
+    Выключенная джоба — отдельный случай и самый тихий: она не падает, не
+    пропадает и не жалуется. Обычно её выключают на время ручной операции
+    и забывают включить обратно.
+    """
+    now = now or datetime.now()
+    ran = {str(name).lower() for name in (ran or set())}
+
+    by_job = {}
+    for row in rows or []:
+        name = row.get("job")
+        if not name:
+            continue
+        entry = by_job.setdefault(name, {"enabled": int(row.get("jen") or 0),
+                                         "running": 0, "due": False, "plan": ""})
+        entry["running"] = max(entry["running"], int(row.get("run") or 0))
+        if expected_today(row, now):
+            entry["due"] = True
+            entry["plan"] = entry["plan"] or schedule_text(row)
+
+    events = []
+    for name, entry in sorted(by_job.items()):
+        level = "crit" if is_backup_job(name) else "warn"
+        if not entry["enabled"]:
+            events.append(_event(
+                "miss", level, "", None, f"Джоба «{name}» отключена",
+                "в списке есть, но выключена — запусков не будет"
+                + (" · бэкапная" if is_backup_job(name) else ""),
+            ))
+            continue
+        if entry["due"] and not entry["running"] and name.lower() not in ran:
+            events.append(_event(
+                "miss", level, "", None, f"Джоба «{name}» не запускалась",
+                " · ".join(part for part in (
+                    f"по расписанию {entry['plan']}" if entry["plan"] else "",
+                    "бэкапная" if is_backup_job(name) else "",
+                ) if part),
+            ))
+    return events
 
 
 def count_by_category(events: list, source: str) -> list:

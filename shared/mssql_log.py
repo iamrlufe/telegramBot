@@ -533,6 +533,46 @@ def count_agent_jobs(server: dict) -> int:
         return 0
 
 
+def read_job_schedules(server: dict) -> list:
+    """Расписания джоб SQL Agent: что и когда сервер собирается запускать.
+
+    Отвечает на вопрос, которого нет в истории запусков: джоба, которая **не
+    отработала**, не падает и не появляется в sysjobhistory — её там просто
+    нет, и по одной истории отличить «не была нужна» от «не запустилась»
+    невозможно. Расписание знает сам сервер, поэтому спрашиваем его.
+
+    Поля freq_* отдаются сырыми и разбираются на нашей стороне: перекладывать
+    декодирование в T-SQL значит писать в запросе десяток CASE, которые потом
+    нечем покрыть тестом.
+
+    LEFT JOIN намеренно: джоба без расписания — обычное дело (запускают
+    руками или из другого джоба), и она должна попасть в выборку со
+    сведениями о себе, а не пропасть.
+
+    Поле run говорит, идёт ли джоба прямо сейчас. Без него долгая ночная
+    задача выглядела бы пропущенной: запись в sysjobhistory появляется
+    только при завершении, и в пять утра семичасовой план ещё не отчитался.
+    Активность берётся из последней сессии Agent — записи прошлых сессий
+    остаются незакрытыми, если служба падала.
+    """
+    tsql = """SET NOCOUNT ON;
+DECLARE @sid INT = (SELECT MAX(session_id) FROM msdb.dbo.syssessions);
+SELECT j.name AS job, j.enabled AS jen,
+       ISNULL(s.enabled, 0) AS sen, ISNULL(s.freq_type, 0) AS ft,
+       ISNULL(s.freq_interval, 0) AS fi, ISNULL(s.freq_subday_type, 0) AS st,
+       ISNULL(s.freq_subday_interval, 0) AS si,
+       ISNULL(s.freq_recurrence_factor, 0) AS rf,
+       ISNULL(s.active_start_time, 0) AS ast,
+       CASE WHEN a.job_id IS NULL THEN 0 ELSE 1 END AS run
+FROM msdb.dbo.sysjobs j
+LEFT JOIN msdb.dbo.sysjobschedules sj ON sj.job_id = j.job_id
+LEFT JOIN msdb.dbo.sysschedules s ON s.schedule_id = sj.schedule_id
+LEFT JOIN (SELECT DISTINCT job_id FROM msdb.dbo.sysjobactivity
+           WHERE session_id = @sid AND start_execution_date IS NOT NULL
+             AND stop_execution_date IS NULL) a ON a.job_id = j.job_id;"""
+    return _run_sql(server, tsql, "job,jen,sen,ft,fi,st,si,rf,ast,run")
+
+
 def read_agent_jobs(server: dict, hours: int = 24, limit: int = 30) -> dict:
     """Сводка запусков + сколько джоб видно, чтобы объяснить пустой список."""
     rows = _agent_job_rows(server, hours=hours, limit=limit)
