@@ -220,11 +220,11 @@ def iis_findings() -> list:
     found = []
     for server_name, events in day.items():
         for row in (events.get("hit") or [])[:5]:
-            status, uri = (str(row["item"]).split("|") + ["", ""])[:2]
+            uri, ip, _ua = (str(row["item"]).split("|") + ["", "", ""])[:3]
             found.append((server_name, {
                 "level": "crit",
-                "text": f"🔴 сканер получил ответ {status} на {uri}",
-                "hint": "посторонний путь ответил успехом",
+                "text": f"🔴 сервер отдал {uri} — запрос с {ip}",
+                "hint": "посторонний путь ответил содержимым",
                 "key": f"iis_hit:{server_name}:{uri}",
             }))
 

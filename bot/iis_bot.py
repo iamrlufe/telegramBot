@@ -232,7 +232,7 @@ def format_pubs(events: dict, facts: dict, hours: int) -> str:
     seen = {parts[0].lower() for parts, _count in pubs}
     dead = sorted(a for a in apps if a and a.lower() not in seen)
 
-    lines = [f"📚 Публикации за {period_name(hours)}",
+    lines = [f"📚 Приложения IIS за {period_name(hours)}",
              f"Всего в конфигурации: {len(apps)} · с трафиком: {len(pubs)}", ""]
     for parts, count in pubs[:SHOW_LIMIT]:
         lines.append(f"{count:>8}  {parts[0]}")
@@ -240,8 +240,9 @@ def format_pubs(events: dict, facts: dict, hours: int) -> str:
     if dead:
         lines.append("")
         lines.append(f"🔴 Без трафика: {len(dead)}")
-        lines.append("Каждая такая публикация — открытая наружу точка входа "
-                     "без присмотра.")
+        lines.append("У публикации 1С это открытая наружу точка входа без "
+                     "присмотра. У Exchange без трафика штатно живут "
+                     "служебные каталоги вроде PushNotifications.")
         lines.append(", ".join(dead))
 
     pools = facts.get("pools") or []

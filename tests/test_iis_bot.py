@@ -221,3 +221,30 @@ def test_direct_addresses_get_no_proxy_note():
         _events(total=[("alien", 41)], scan=[("192.0.2.99|curl", 41)]), 24)
 
     assert "Cloudflare" not in text
+
+
+def test_default_iis_start_page_is_not_a_finding():
+    """Сервер отдаёт iisstart.png на пустом сайте кому угодно — содержимого
+    за ней нет, и будить этим нельзя. На боевом это был первый же алерт."""
+    from importlib.util import spec_from_file_location, module_from_spec
+
+    spec = spec_from_file_location("iis_log", ROOT / "shared" / "iis_log.py")
+    iis_log = module_from_spec(spec)
+    spec.loader.exec_module(iis_log)
+
+    import re
+
+    for path in ("/iisstart.png", "/iisstart.htm", "/robots.txt", "/favicon.ico"):
+        assert re.match(iis_log.INNOCENT, path), path
+    assert not re.match(iis_log.INNOCENT, "/uploads/shell.php")
+
+
+def test_finding_text_names_path_and_address(monkeypatch):
+    """Ключ находки — «путь|адрес|клиент». Разбор отстал от формата, и алерт
+    получился вида «получил ответ /iisstart.png на 173.252.82.10»."""
+    day = {"web-01.example.local": _events(
+        hit=[("/uploads/shell.php|192.0.2.99|curl", 2)])}
+
+    found = _findings(monkeypatch, day, {})
+
+    assert found[0][1]["text"] == "🔴 сервер отдал /uploads/shell.php — запрос с 192.0.2.99"

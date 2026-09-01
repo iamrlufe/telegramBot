@@ -1107,7 +1107,7 @@ def _iis_server(server: dict) -> str:
     body = ""
     if server["dead"]:
         body += _lrow(STATUS_CRIT, str(len(server["dead"])),
-                      "Публикации без трафика за сутки",
+                      "Приложения без трафика за сутки",
                       " · ".join(html.escape(d) for d in server["dead"]))
     if pools:
         body += _lrow(STATUS_CRIT if stopped else STATUS_WARN, str(len(pools)),
@@ -1117,8 +1117,8 @@ def _iis_server(server: dict) -> str:
     live = len(server["pubs"])
     total_pubs = live + len(server["dead"])
     cards.append(_iis_card(
-        STATUS_CRIT if server["dead"] else STATUS_GOOD, "Публикации 1С",
-        f"{live} живых из {total_pubs}" if total_pubs else "нет данных",
+        STATUS_CRIT if server["dead"] else STATUS_GOOD, "Приложения IIS",
+        f"{live} с трафиком из {total_pubs}" if total_pubs else "нет данных",
         cats='<div class="cats">' + _cat("✓", "с трафиком", live, STATUS_GOOD)
              + _cat("✕", "без трафика", len(server["dead"]), STATUS_CRIT)
              + _cat("🧩", "пулов", len(pools), STATUS_WARN) + '</div>',

@@ -428,11 +428,15 @@ def test_clean_scan_says_so_plainly():
 
 
 def test_dead_publications_listed():
-    """Публикация без трафика — открытая наружу точка входа без присмотра."""
+    """Публикация без трафика — открытая наружу точка входа без присмотра.
+
+    Заголовок при этом нейтральный: на Exchange те же карточки показывают
+    виртуальные каталоги OWA и EWS, никакой 1С там нет."""
     page = _with_iis([_iis(dead=["copy_ivan", "ut2021"])])
 
-    assert "Публикации без трафика" in page
+    assert "Приложения без трафика" in page
     assert "copy_ivan" in page
+    assert "Публикации 1С" not in page
 
 
 def test_iis_text_is_escaped():

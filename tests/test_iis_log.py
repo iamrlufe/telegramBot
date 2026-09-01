@@ -89,6 +89,17 @@ def test_script_skips_history_on_first_run(monkeypatch):
     assert "$off=$f.Length" in compact
 
 
+def test_custom_field_logs_are_picked_up():
+    """Как только в логировании заводят пользовательское поле, IIS начинает
+    писать в файл с суффиксом _x: u_ex260901_x.log. Маска обязана его
+    захватывать, иначе после включения X-Forwarded-For сбор молча встанет."""
+    script = iis_log._script({}, 10000, 25)
+
+    assert "u_ex*.log" in script
+    import fnmatch
+    assert fnmatch.fnmatch("u_ex260901_x.log", "u_ex*.log")
+
+
 def test_yesterdays_tail_is_not_lost(monkeypatch):
     """После полуночи у вчерашнего файла остаётся хвост: окно в 36 часов
     покрывает и его."""
