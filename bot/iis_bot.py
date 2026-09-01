@@ -12,12 +12,14 @@ IIS_SCAN_MINUTES. Отсюда и разница в поведении: разд
 
 Кнопка появляется у серверов, где среди `services` есть W3SVC.
 """
+import asyncio
 import itertools
 from collections import OrderedDict
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from iis_log import detect_brute_force, is_cloudflare
+from geoip import resolve as geo_resolve, tag as geo_tag
 from iis_store import read_events, read_facts
 from tg_utils import safe_edit_message
 
@@ -111,7 +113,7 @@ def _empty(title: str, hours: int) -> str:
 
 # ─── Разделы ─────────────────────────────────────────────────
 
-def format_scan(events: dict, hours: int) -> str:
+def format_scan(events: dict, hours: int, geo: dict = None) -> str:
     alien = _total(events, "alien")
     hits = _rows(events, "hit", 3)
     scan = _rows(events, "scan", 2)
@@ -124,7 +126,7 @@ def format_scan(events: dict, hours: int) -> str:
         lines.append("🔴 СЕРВЕР ОТДАЛ СОДЕРЖИМОЕ — разобрать вручную:")
         for (uri, ip, ua), count in hits[:SHOW_LIMIT]:
             lines.append(f"200 {uri}")
-            lines.append(f"   ← {ip} · {ua} · {count} раз")
+            lines.append(f"   ← {ip}{geo_tag(ip, geo)} · {ua} · {count} раз")
         lines.append("")
     else:
         lines.append("✅ Ничего не отдано.")
@@ -149,7 +151,7 @@ def format_scan(events: dict, hours: int) -> str:
         if is_cloudflare(ip):
             mark = "  (узел Cloudflare)"
             proxied = True
-        lines.append(f"{count:>6}  {ip}{mark}  {ua or '—'}")
+        lines.append(f"{count:>6}  {ip}{mark}{geo_tag(ip, geo)}  {ua or '—'}")
     if proxied:
         lines.append("")
         lines.append("Часть трафика приходит через Cloudflare: в логе виден "
@@ -159,7 +161,8 @@ def format_scan(events: dict, hours: int) -> str:
     return "\n".join(lines)
 
 
-def format_login(events: dict, hours: int, brute: list = None) -> str:
+def format_login(events: dict, hours: int, brute: list = None,
+                 geo: dict = None) -> str:
     logins = _rows(events, "login", 2)
     if not logins:
         return _empty("🔑 Вход в 1С", hours)
@@ -172,8 +175,8 @@ def format_login(events: dict, hours: int, brute: list = None) -> str:
 
     for item in brute or []:
         mark = "🟠" if item["working"] else "🔴"
-        lines.append(f"{mark} {item['ip']} → {item['base']}: "
-                     f"{item['count']} входов за час")
+        lines.append(f"{mark} {item['ip']}{geo_tag(item['ip'], geo)} → "
+                     f"{item['base']}: {item['count']} входов за час")
         lines.append("   адрес работает в базе — похоже на клиента, который "
                      "переподключается по кругу"
                      if item["working"] else
@@ -183,11 +186,11 @@ def format_login(events: dict, hours: int, brute: list = None) -> str:
         lines.append("")
 
     for (base, ip), count in logins[:SHOW_LIMIT]:
-        lines.append(f"{count:>5}  {base}  ← {ip}")
+        lines.append(f"{count:>5}  {base}  ← {ip}{geo_tag(ip, geo)}")
     return "\n".join(lines)
 
 
-def format_errors(events: dict, hours: int) -> str:
+def format_errors(events: dict, hours: int, geo: dict = None) -> str:
     errors = _rows(events, "error", 2)
     if not errors:
         return (f"💥 Ошибки 5xx за {period_name(hours)}\n\n"
@@ -205,11 +208,11 @@ def format_errors(events: dict, hours: int) -> str:
     for (uri, ip), count in errors[:SHOW_LIMIT]:
         mark = "🏠" if is_local(ip) else "🔴"
         lines.append(f"{mark} {count:>4}  {uri}")
-        lines.append(f"        ← {ip}")
+        lines.append(f"        ← {ip}{geo_tag(ip, geo)}")
     return "\n".join(lines)
 
 
-def format_slow(events: dict, hours: int) -> str:
+def format_slow(events: dict, hours: int, geo: dict = None) -> str:
     slow = _total(events, "slow")
     rows = _rows(events, "slowuri", 2)
     if not rows:
@@ -219,7 +222,7 @@ def format_slow(events: dict, hours: int) -> str:
     lines = [f"🐢 Медленные запросы за {period_name(hours)} — {slow}", ""]
     for (uri, ip), count in rows[:SHOW_LIMIT]:
         lines.append(f"{count:>4}  {uri}")
-        lines.append(f"      ← {ip}")
+        lines.append(f"      ← {ip}{geo_tag(ip, geo)}")
     return "\n".join(lines)
 
 
@@ -276,7 +279,7 @@ HTTPERR_REASONS = {
 }
 
 
-def format_herr(events: dict, hours: int) -> str:
+def format_herr(events: dict, hours: int, geo: dict = None) -> str:
     reasons = _rows(events, "herr", 1)
     if not reasons:
         return _empty("🚧 HTTPERR", hours)
@@ -296,8 +299,26 @@ def format_herr(events: dict, hours: int) -> str:
         lines.append("Подробности (без штатного простоя соединений):")
         for (reason, method, uri, ip), count in details[:SHOW_LIMIT]:
             lines.append(f"{count:>4}  {reason} · {method} {uri}")
-            lines.append(f"      ← {ip}")
+            lines.append(f"      ← {ip}{geo_tag(ip, geo)}")
     return "\n".join(lines)
+
+
+# В какой части составного ключа лежит адрес. У счётчиков IIS ключ
+# склеен из нескольких полей («путь|адрес|клиент»), и позиция адреса
+# в каждой категории своя.
+IP_AT = {"scan": 0, "hit": 1, "login": 1, "ip": 0, "error": 1,
+         "slowuri": 1, "herrd": 3}
+
+
+def addresses_of(events: dict) -> list:
+    """Все адреса сводки — чтобы спросить страну один раз на весь экран."""
+    found = []
+    for category, index in IP_AT.items():
+        for row in events.get(category) or []:
+            parts = str(row["item"]).split("|")
+            if len(parts) > index:
+                found.append(parts[index])
+    return found
 
 
 SECTIONS = {
@@ -343,6 +364,14 @@ async def iis_callback(query, context):
             reply_markup=iis_menu_kb(server_name, hours))
         return
 
+    # Страна и город одним запросом на весь экран: адресов в сводке
+    # сканирования бывают сотни, построчный опрос был бы неприемлем.
+    try:
+        geo = await asyncio.to_thread(geo_resolve, addresses_of(events))
+    except Exception as e:
+        print(f"[iis] Геоданные недоступны: {str(e)[:120]}", flush=True)
+        geo = {}
+
     if section == "pubs":
         text = format_pubs(events, facts, hours)
     elif section == "login":
@@ -357,9 +386,9 @@ async def iis_callback(query, context):
             [{"parts": parts, "count": count}
              for parts, count in _rows(hour_events, "ip", 1)],
         )
-        text = format_login(events, hours, brute)
+        text = format_login(events, hours, brute, geo)
     else:
-        text = SECTIONS[section](events, hours)
+        text = SECTIONS[section](events, hours, geo)
 
     await safe_edit_message(query, text,
                             reply_markup=iis_menu_kb(server_name, hours))

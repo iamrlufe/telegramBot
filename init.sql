@@ -259,3 +259,23 @@ CREATE TABLE IF NOT EXISTS fw_whitelist (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (server_name, address)
 );
+
+-- Кеш геоданных по IP. Адреса сотрудников меняются редко, а разделы почты
+-- и IIS открывают помногу раз в день: без кеша каждый показ означал бы
+-- обращение к внешнему сервису.
+CREATE TABLE IF NOT EXISTS ip_geo (
+    address      TEXT PRIMARY KEY,
+    country      TEXT,
+    country_code TEXT,            -- 'KZ' — из него собирается эмодзи флага
+    city         TEXT,
+    found        BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Свои метки подсетей: точнее любой геобазы и работают там, где её нет
+-- вовсе. У 10.10.3.87 географии не существует, а «🏢 Офис Астана» — есть.
+CREATE TABLE IF NOT EXISTS ip_labels (
+    network    TEXT PRIMARY KEY,  -- '10.10.3.0/24'
+    label      TEXT NOT NULL,     -- '🏢 Офис Астана'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

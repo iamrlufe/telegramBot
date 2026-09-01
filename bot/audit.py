@@ -27,6 +27,7 @@ ACTION_LABELS = {
     "fwunblock": "✅ снята блокировка",
     "fwwhite":  "⚪ белый список",
     "fwsync":   "🔄 правило перезаписано",
+    "netlabel": "🌍 метка сети",
 }
 
 _table_ready = False

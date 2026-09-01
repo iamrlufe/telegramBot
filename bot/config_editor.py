@@ -33,6 +33,7 @@ from backup_schedule import (WEEKDAY_NAMES, path_schedule, weekday_label,
                              weekday_short)
 import pg_admin
 import audit
+from geoip import add_label, list_labels, remove_label
 
 ALMATY = ZoneInfo("Asia/Almaty")
 
@@ -1338,6 +1339,7 @@ def menu_kb():
         [InlineKeyboardButton("✅ Принятые алерты", callback_data="cfg_acks")],
         [InlineKeyboardButton("🐘 База мониторинга", callback_data="cfg_pgsize")],
         [InlineKeyboardButton("🗑 Очистка истории", callback_data="cfg_pgclean_menu")],
+        [InlineKeyboardButton("🌍 Метки сетей", callback_data="cfg_nets")],
         [InlineKeyboardButton("📜 Аудит изменений", callback_data="cfg_audit")],
         [InlineKeyboardButton("📖 Справка", callback_data="cfg_help")],
     ])
@@ -2816,6 +2818,107 @@ HELP_FIREWALL = """🛡 БЛОКИРОВКА IP
 TELEGRAM_DELETE_USERS — тем же, кому разрешена перезагрузка."""
 
 
+# ─── Метки сетей ─────────────────────────────────────────────
+
+NETS_KEY = "cfg_nets_wait"
+
+
+def nets_text(labels: list) -> str:
+    """Экран меток. Метка полезнее геобазы там, где геобазы бессильны: у
+    10.20.30.5 географии нет вовсе, а «🏢 Главный офис» — есть."""
+    lines = ["🌍 МЕТКИ СЕТЕЙ\n",
+             "Подпись рядом с IP-адресом в разделах 📧 Почта и 🌐 IIS.",
+             "Метка перекрывает данные геосервиса, поэтому её стоит вешать и "
+             "на внешние адреса: у филиала статический IP, и «🏢 Филиал» "
+             "полезнее, чем «🇰🇿 Алматы».\n"]
+    if not labels:
+        lines.append("Меток пока нет. Внутренние адреса показываются как "
+                     "«🏢 локальная сеть», внешние — страной и городом от "
+                     "геосервиса.")
+    else:
+        for item in labels:
+            lines.append(f"{item['network']} — {item['label']}")
+    lines.append("")
+    lines.append("Если совпало несколько сетей, берётся самая узкая: "
+                 "10.0.0.0/8 «Вся сеть» и 10.20.30.0/24 «Главный офис» могут "
+                 "быть заданы обе, и покажется вторая.")
+    return "\n".join(lines)
+
+
+def nets_kb(labels: list) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🗑 {item['network']}",
+                                  callback_data=f"cfg_netdel:{item['network']}")]
+            for item in labels[:20]]
+    rows.append([InlineKeyboardButton("➕ Добавить", callback_data="cfg_netadd")])
+    rows.append([InlineKeyboardButton("◀️ Меню", callback_data="cfg_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def parse_net_label(text: str):
+    """«10.20.30.0/24 = 🏢 Главный офис» → (сеть, метка, ошибка)."""
+    import ipaddress
+
+    raw = (text or "").strip()
+    network, _, label = raw.partition("=")
+    network, label = network.strip(), label.strip()
+    if not network or not label:
+        return "", "", ("Нужны сеть и метка через «=». Например:\n"
+                        "10.20.30.0/24 = 🏢 Главный офис")
+    try:
+        network = str(ipaddress.ip_network(network, strict=False))
+    except ValueError:
+        return "", "", f"«{network}» — это не сеть и не адрес."
+    if len(label) > 40:
+        return "", "", "Метка длиннее 40 символов — она не влезет в строку."
+    return network, label, ""
+
+
+async def show_nets(query):
+    labels = await asyncio.to_thread(list_labels)
+    await safe_edit_message(query, nets_text(labels), nets_kb(labels))
+
+
+HELP_GEO = """🌍 СТРАНА И ГОРОД ПО IP
+
+Рядом с адресом в 📧 Почта и 🌐 IIS показывается, откуда он: флаг,
+город или своя метка. Голый адрес не отвечает на главный вопрос —
+это сотрудник из дома или кто-то посторонний.
+
+━━━━━━━━━━━━━━━━━━━━
+📑 ТРИ ИСТОЧНИКА, В ЭТОМ ПОРЯДКЕ
+
+1. Своя метка подсети (⚙️ Настройка → 🌍 Метки сетей). Перекрывает
+  всё остальное. Точнее геобазы и работает там, где та бессильна: у
+  10.20.30.5 географии нет вовсе, а «🏢 Главный офис» — есть. Метку
+  стоит вешать и на внешние адреса: у филиала статический IP, и
+  «🏢 Филиал» полезнее, чем «🇰🇿 Алматы».
+  Совпало несколько сетей — берётся самая узкая.
+2. Кеш в базе. Ответ живёт 90 дней, неудача — сутки.
+3. ip-api.com — пачкой до 100 адресов за запрос.
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ ЭТО ВНЕШНИЙ СЕРВИС
+
+В ip-api.com уходят IP-адреса тех, кто заходил в почту. Свои адреса
+(10.x, 172.16.x, 192.168.x, 100.64.x) не уходят никогда: у них нет
+географии, и спрашивать нечего — они сразу показываются как
+«🏢 локальная сеть».
+
+Выключается `GEOIP_ENABLED=false` в .env. Тогда остаются метки
+подсетей, и ни один адрес наружу не уходит.
+
+━━━━━━━━━━━━━━━━━━━━
+🔧 ЕСЛИ ПОМЕТКИ НЕТ
+
+Адрес показывается как раньше, без подписи. Это нормальный исход:
+геоданные — украшение, и раздел не должен из-за них ни падать, ни
+ждать. Причина обычно одна из трёх: сервис не знает адрес, не было
+ответа за 4 секунды, или упёрлись в лимит 12 запросов в минуту.
+
+Метки сетей работают всегда — они лежат в своей базе и внешних
+запросов не требуют."""
+
+
 HELP_SECTIONS = {
     "start":   ("🚀 С чего начать",        HELP_START),
     "menu":    ("📂 Меню и команды",       HELP_MENU),
@@ -2832,6 +2935,7 @@ HELP_SECTIONS = {
     "winlog":  ("📜 Логи Windows",         HELP_WINLOG),
     "exchange": ("📧 Почта",                HELP_EXCHANGE),
     "iis":     ("🌐 IIS",                  HELP_IIS),
+    "geo":     ("🌍 Страна по IP",        HELP_GEO),
     "firewall": ("🛡 Блокировка IP",     HELP_FIREWALL),
     "data":    ("🗄 Данные и конфиг",      HELP_DATA),
 }
@@ -3384,6 +3488,29 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cfg_toggle:"):
         await toggle_field(query, context, data.split(":", 1)[1])
 
+    elif data == "cfg_nets":
+        context.user_data.pop(STATE_KEY, None)
+        context.user_data.pop(NETS_KEY, None)
+        await show_nets(query)
+
+    elif data == "cfg_netadd":
+        context.user_data[NETS_KEY] = True
+        await safe_edit_message(
+            query,
+            "🌍 Новая метка сети\n\n"
+            "Пришли одним сообщением: сеть = метка\n\n"
+            "10.20.30.0/24 = 🏢 Главный офис\n"
+            "192.0.2.7 = 🏢 Филиал\n\n"
+            "Одиночный адрес тоже подходит — он станет сетью /32.",
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                "❌ Отмена", callback_data="cfg_nets")]]))
+
+    elif data.startswith("cfg_netdel:"):
+        network = data.split(":", 1)[1]
+        await asyncio.to_thread(remove_label, network)
+        audit.log_config_change(query.from_user, "netlabel", network, "удалена")
+        await show_nets(query)
+
     elif data == "cfg_mute_menu":
         context.user_data.pop(STATE_KEY, None)
         await show_mute_menu(query, context)
@@ -3583,6 +3710,22 @@ async def handle_config_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Обрабатывает текстовый ввод для мастера/редактора.
     Возвращает True если сообщение обработано.
     """
+    if context.user_data.pop(NETS_KEY, False):
+        if not can_configure(update.effective_user):
+            return False
+        network, label, error = parse_net_label(update.message.text)
+        if error:
+            await update.message.reply_text(f"❌ {error}")
+            return True
+        await asyncio.to_thread(add_label, network, label)
+        audit.log_config_change(update.effective_user, "netlabel",
+                                network, label)
+        labels = await asyncio.to_thread(list_labels)
+        await update.message.reply_text(
+            f"✅ {network} — {label}\n\n" + nets_text(labels),
+            reply_markup=nets_kb(labels))
+        return True
+
     state = context.user_data.get(STATE_KEY)
     if not state:
         return False

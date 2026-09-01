@@ -23,6 +23,7 @@ from exchange_log import (
 from winlog import friendly_winlog_error
 from refresh import load_server
 from server_check import server_type
+from geoip import resolve as geo_resolve, tag as geo_tag
 from tg_utils import safe_edit_message, paginate, nav_row
 
 EX_TOKENS: "OrderedDict[str, tuple]" = OrderedDict()
@@ -175,19 +176,21 @@ def _unread_note(data: dict) -> str:
     return f"\n⚠️ Не удалось прочитать файлов журнала: {len(failed)} — данные неполные."
 
 
-def format_owa(data: dict, hours: int) -> tuple:
+def format_owa(data: dict, hours: int, geo: dict = None) -> tuple:
     rows = data.get("rows") or []
     if not rows:
-        return (f"🔓 Входы в OWA за {period_name(hours)}\n\n"
+        return (f"🔓 Активность в OWA за {period_name(hours)}\n\n"
                 "Записей нет. Проверьте, что на сервере включено ведение "
                 "журналов IIS для сайта Default Web Site — раздел читает "
                 f"именно их.{_unread_note(data)}", [])
-    header = (f"🔓 Входы в OWA за {period_name(hours)}\n"
+    header = (f"🔓 Активность в OWA за {period_name(hours)}\n"
               f"Пользователей и адресов: {len(rows)} · "
               f"запросов: {data.get('scanned', 0)}"
-              f"{_unread_note(data)}\n")
+              f"{_unread_note(data)}\n"
+              "Считаются запросы к /owa/, а не входы: одна открытая вкладка "
+              "шлёт их десятками в минуту.\n")
     blocks = [
-        f"{row.get('user')}  ← {row.get('ip')}\n"
+        f"{row.get('user')}  ← {row.get('ip')}{geo_tag(row.get('ip'), geo)}\n"
         f"   {_client_name(row.get('ua'))} · {row.get('count')} обращений · "
         f"последнее {_when(row.get('last'))}"
         for row in rows
@@ -195,7 +198,7 @@ def format_owa(data: dict, hours: int) -> tuple:
     return header, blocks
 
 
-def format_failures(rows: list, hours: int) -> tuple:
+def format_failures(rows: list, hours: int, geo: dict = None) -> tuple:
     if not rows:
         return (f"🔒 Неверный пароль за {period_name(hours)}\n\n"
                 "Неудачных попыток нет.\n\n"
@@ -208,7 +211,8 @@ def format_failures(rows: list, hours: int) -> tuple:
               f"неразличимы.\n")
     blocks = []
     for row in rows:
-        source = row.get("ip") or "адрес не записан"
+        source = ((row.get("ip") or "") + geo_tag(row.get("ip"), geo)
+                  or "адрес не записан")
         detail = row.get("reason") or f"код {row.get('code') or '?'}"
         blocks.append(
             f"{row.get('user') or 'неизвестный логин'}  ← {source}\n"
@@ -217,7 +221,7 @@ def format_failures(rows: list, hours: int) -> tuple:
     return header, blocks
 
 
-def format_eas(data: dict, hours: int) -> tuple:
+def format_eas(data: dict, hours: int, geo: dict = None) -> tuple:
     rows = data.get("rows") or []
     if not rows:
         return (f"📱 Мобильные клиенты за {period_name(hours)}\n\n"
@@ -233,18 +237,26 @@ def format_eas(data: dict, hours: int) -> tuple:
     return header, blocks
 
 
-def format_sources(data: dict, hours: int) -> tuple:
+def format_sources(data: dict, hours: int, geo: dict = None) -> tuple:
     rows = data.get("rows") or []
     if not rows:
         return f"🌍 Адреса за {period_name(hours)}\n\nОбращений нет.", []
     header = (f"🌍 Откуда ходят в почту за {period_name(hours)}\n"
               f"Адресов: {len(rows)}\n")
     blocks = [
-        f"{row.get('ip')}  —  {row.get('count')} обращений\n"
+        f"{row.get('ip')}{geo_tag(row.get('ip'), geo)}"
+        f"  —  {row.get('count')} обращений\n"
         f"   последний: {row.get('user')} · {_when(row.get('last'))}"
         for row in rows
     ]
     return header, blocks
+
+
+def addresses_of(payload) -> list:
+    """Все адреса ответа: у разделов разная форма — словарь со `rows` у
+    логов IIS и просто список у отказов из Security."""
+    rows = payload.get("rows") if isinstance(payload, dict) else payload
+    return [row.get("ip") for row in (rows or []) if isinstance(row, dict)]
 
 
 SECTIONS = {
@@ -306,7 +318,10 @@ async def exchange_callback(query, context):
     try:
         server = await asyncio.to_thread(load_server, server_name)
         rows = await asyncio.to_thread(reader, server, hours)
-        header, blocks = formatter(rows, hours)
+        # Страна и город — одним запросом на весь экран, а не построчно:
+        # сорок адресов иначе означали бы сорок обращений к сервису.
+        geo = await asyncio.to_thread(geo_resolve, addresses_of(rows))
+        header, blocks = formatter(rows, hours, geo)
     except Exception as e:
         header, blocks = (f"⚠️ Не удалось прочитать журналы {server_name}:\n"
                           f"{friendly_winlog_error(e)}"), []

@@ -32,6 +32,7 @@ from db import (
 from ping_tools import load_targets
 from log_store import read_snapshot
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
+from geoip import resolve as geo_resolve
 from iis_log import detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
 from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
 from backup_bot_db import (
@@ -201,6 +202,27 @@ def collect_dashboard_data(hours: int = 24) -> dict:
 
 # ─── IIS ─────────────────────────────────────────────────────
 
+def _geo(address: str, geo: dict) -> str:
+    """« · 🇰🇿 Астана» для подстановки в строку карточки, уже экранированное."""
+    label = (geo or {}).get(str(address or "").strip())
+    return f" · {html.escape(label)}" if label else ""
+
+
+# Где в разобранных ключах лежит адрес. У каждой категории своя позиция.
+_IIS_IP_AT = (("scan", 0), ("hits", 1), ("logins", 1), ("errors", 1),
+              ("slows", 1), ("herrd", 3))
+
+
+def _iis_addresses(server: dict) -> list:
+    found = [item["ip"] for item in server.get("brute") or []]
+    for key, index in _IIS_IP_AT:
+        for row in server.get(key) or []:
+            parts = row.get("parts") or []
+            if len(parts) > index:
+                found.append(parts[index])
+    return found
+
+
 def _pairs(rows: list, parts: int) -> list:
     """Ключи вида 'ip|ua' → разобранные части плюс счётчик."""
     out = []
@@ -293,6 +315,18 @@ def collect_iis() -> list:
         })
 
     servers.sort(key=lambda s: (0 if s["alarms"] else 1, -s["requests"], s["name"]))
+
+    # Страна и город — одним запросом на весь дашборд, а не по карточке:
+    # адресов в сводке сканирования бывают сотни. Дашборд не должен падать
+    # из-за геоданных, поэтому пустой словарь здесь — нормальный исход.
+    try:
+        addresses = [a for item in servers for a in _iis_addresses(item)]
+        geo = geo_resolve(addresses)
+    except Exception as e:
+        print(f"[dashboard] Геоданные недоступны: {str(e)[:120]}", flush=True)
+        geo = {}
+    for item in servers:
+        item["geo"] = geo
     return servers
 
 
@@ -1015,7 +1049,8 @@ def _iis_server(server: dict) -> str:
     body = "".join(
         _lrow(STATUS_CRIT if r["count"] > 40 else STATUS_WARN, _num(r["count"]),
               html.escape(r["parts"][0])
-              + (" · узел Cloudflare" if is_cloudflare(r["parts"][0]) else ""),
+              + (" · узел Cloudflare" if is_cloudflare(r["parts"][0]) else "")
+              + _geo(r["parts"][0], server.get("geo")),
               html.escape(r["parts"][1] or "—"))
         for r in server["scan"][:15]
     )
@@ -1023,7 +1058,8 @@ def _iis_server(server: dict) -> str:
         for r in server["hits"][:10]:
             uri, ip, ua = r["parts"]
             body = _lrow(STATUS_CRIT, "200", f"Отдан {html.escape(uri)}",
-                         f"{html.escape(ip)} · {html.escape(ua)}") + body
+                         f"{html.escape(ip)}{_geo(ip, server.get("geo"))} · "
+                         f"{html.escape(ua)}") + body
         hit_note = "сервер отдал содержимое по постороннему пути — разобрать вручную"
     else:
         body += _lrow(STATUS_GOOD, "0", "Ничего не отдано",
@@ -1058,11 +1094,14 @@ def _iis_server(server: dict) -> str:
                     "который переподключается по кругу") if item["working"] else (
                     "с адреса идут только входы и ничего больше — это подбор пароля")
             rows.append(_lrow(color, f'{item["count"]}/ч',
-                              f'{html.escape(item["base"])} ← {html.escape(item["ip"])}', note))
+                              f'{html.escape(item["base"])} ← '
+                              f'{html.escape(item["ip"])}'
+                              f'{_geo(item["ip"], server.get("geo"))}', note))
         for r in server["logins"][:12]:
             base, ip = r["parts"]
             rows.append(_lrow(STATUS_GOOD, _num(r["count"]),
-                              f'/{html.escape(base)}/e1cib/login ← {html.escape(ip)}',
+                              f'/{html.escape(base)}/e1cib/login ← '
+                              f'{html.escape(ip)}{_geo(ip, server.get("geo"))}',
                               "штатный шаг входа платформы 1С"))
         suspicious = sum(1 for i in server["brute"] if not i["working"])
         total_logins = sum(r["count"] for r in server["logins"])
@@ -1087,6 +1126,7 @@ def _iis_server(server: dict) -> str:
             _lrow(STATUS_WARN if _is_local(r["parts"][1]) else STATUS_CRIT,
                   _num(r["count"]), html.escape(r["parts"][0]),
                   f'← {html.escape(r["parts"][1])}'
+                  + _geo(r["parts"][1], server.get("geo"))
                   + (" · внутренняя проверка сервера" if _is_local(r["parts"][1]) else ""))
             for r in server["errors"][:15]
         )
@@ -1106,7 +1146,8 @@ def _iis_server(server: dict) -> str:
     if server["slow"]:
         body = "".join(
             _lrow(STATUS_WARN, _num(r["count"]), html.escape(r["parts"][0]),
-                  f'← {html.escape(r["parts"][1])}')
+                  f'← {html.escape(r["parts"][1])}'
+                  + _geo(r["parts"][1], server.get("geo")))
             for r in server["slows"][:12]
         )
         cards.append(_iis_card(STATUS_WARN, "Медленные запросы",
