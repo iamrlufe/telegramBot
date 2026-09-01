@@ -164,3 +164,89 @@ def test_counters_sum_collapsed_events():
 
     assert counters["service"]["count"] == 7
     assert counters["service"]["level"] == "crit"
+
+
+# ─── Запуски джоб SQL Agent ──────────────────────────────────
+
+def _run(job, when, duration, status=1):
+    return {"job": job, "when": when, "duration": duration, "status": status}
+
+
+def test_successful_runs_are_listed_not_dropped():
+    """Раньше успешные запуски выбрасывались целиком, и джоба, которая
+    вообще не запускалась, была невидима: она не падает — её просто нет."""
+    events = ls.job_runs([
+        _run("Ночной FULL", "2026-09-01 01:00:00", 1530),
+        _run("Ночной FULL", "2026-09-01 13:00:00", 1500),
+        _run("syspolicy_purge_history", "2026-09-01 02:00:00", 2),
+    ])
+
+    names = {e["title"] for e in events}
+    assert any("Ночной FULL" in n for n in names)
+    assert any("syspolicy" in n for n in names)
+    runs = {e["title"]: e["count"] for e in events}
+    assert runs[next(n for n in names if "Ночной FULL" in n)] == 2
+
+
+def test_long_job_flagged_even_when_successful():
+    """Формально успех, а по существу съеденное ночное окно."""
+    events = ls.job_runs([_run("Daily_Maintence_Plan", "2026-09-01 01:30:00", 130000)])
+
+    assert events[0]["level"] == "warn"
+    assert "слишком долго" in events[0]["title"]
+    assert "13 ч 0 мин" in events[0]["detail"]
+
+
+def test_long_but_expected_job_stays_green():
+    """Порог 12 часов выбран так, чтобы ночной план обслуживания на 7 ч 29 мин
+    не поднимал шум: на больших базах это нормальная длительность."""
+    events = ls.job_runs([_run("Daily_Maintence_Plan", "2026-09-01 01:30:00", 72900)])
+
+    assert events[0]["level"] == "ok"
+    assert "7 ч 29 мин" in events[0]["detail"]
+
+
+def test_short_job_stays_green():
+    events = ls.job_runs([_run("syspolicy_purge_history", "2026-09-01 02:00:00", 2)])
+
+    assert events[0]["level"] == "ok"
+    assert "слишком долго" not in events[0]["title"]
+
+
+def test_threshold_is_configurable(monkeypatch):
+    """На больших базах перестроение индексов идёт часами — порог высокий
+    и настраиваемый."""
+    monkeypatch.setattr(ls, "JOB_LONG_HOURS", 2)
+
+    events = ls.job_runs([_run("Плановое обслуживание", "2026-09-01 01:30:00", 30000)])
+
+    assert events[0]["level"] == "warn"
+
+
+def test_backup_jobs_marked():
+    """Молчание бэкапной джобы значит, что копии сегодня не будет — это
+    надо видеть, не читая имена глазами."""
+    events = ls.job_runs([
+        _run("Weekly backup FULL", "2026-09-01 09:00:00", 3000),
+        _run("Обновление статистики", "2026-09-01 03:00:00", 600),
+    ])
+    marked = {e["title"]: "бэкапная" in e["detail"] for e in events}
+
+    assert marked["Джоба «Weekly backup FULL»"] is True
+    assert marked["Джоба «Обновление статистики»"] is False
+
+
+def test_failures_counted_inside_the_run_row():
+    events = ls.job_runs([
+        _run("Ночной FULL", "2026-09-01 01:00:00", 1530, status=0),
+        _run("Ночной FULL", "2026-09-01 13:00:00", 1500, status=1),
+    ])
+
+    assert "падений: 1" in events[0]["detail"]
+
+
+def test_duration_decoded_from_msdb_format():
+    """msdb хранит длительность целым HHMMSS: 72900 это 7 ч 29 мин."""
+    assert ls.job_seconds(72900) == 7 * 3600 + 29 * 60
+    assert ls.job_seconds(132) == 92
+    assert ls.job_seconds(None) == 0

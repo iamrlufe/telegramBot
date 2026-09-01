@@ -828,14 +828,15 @@ def _log_card(group: dict, source: str) -> str:
 
     cats = "".join(
         f'<span class="cat{"" if c["count"] else " zero"}" '
-        f'style="--c:{STATUS_CRIT if c["level"] == "crit" else STATUS_WARN if c["count"] else STATUS_GOOD}">'
+        f'style="--c:{STATUS_CRIT if c["level"] == "crit" else STATUS_WARN if c["level"] == "warn" else STATUS_GOOD}">'
         f'{c["icon"]} {c["label"]} <b>{c["count"]}</b></span>'
         for c in group["categories"]
     )
 
     rows = []
     for event in group["events"]:
-        row_color = STATUS_CRIT if event["level"] == "crit" else STATUS_WARN
+        row_color = (STATUS_CRIT if event["level"] == "crit"
+                     else STATUS_GOOD if event["level"] == "ok" else STATUS_WARN)
         code = f' <i>код {html.escape(event["event_id"])}</i>' if event["event_id"] else ""
         detail = f'<span>{html.escape(event["detail"])}</span>' if event["detail"] else ""
         rows.append(

@@ -24,6 +24,8 @@ event_at хранится строкой в том виде, в каком ег�
 к чему: часовой пояс удалённой машины монитору неизвестен, а сортировка
 и показ по строке работают одинаково.
 """
+import os
+
 from winlog import (
     read_reboots, read_service_failures, read_disk_errors,
     read_app_errors, read_failed_logons, group_failed_logons,
@@ -32,8 +34,16 @@ from winlog import (
 from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, friendly_sql_error, explain_engine_error,
-    explain_backup_error, summarize_job_message,
+    explain_backup_error, summarize_job_message, decode_agent_duration,
 )
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
 
 # (ключ, иконка, подпись) — порядок задаёт порядок колонок в дашборде.
 WIN_CATEGORIES = (
@@ -48,6 +58,7 @@ SQL_CATEGORIES = (
     ("backup", "💾", "ошибки копирования"),
     ("engine", "⚠️", "ошибки движка"),
     ("job",    "🕐", "упавшие джобы"),
+    ("run",    "▶️", "запуски джоб"),
 )
 
 CATEGORY_TITLES = {
@@ -66,9 +77,34 @@ SERVICE_CRIT_IDS = {7000, 7022, 7023, 7024, 7034}
 # Серия отказов входа — это уже не «кто-то ошибся паролем», а перебор.
 LOGON_BRUTE_FORCE = 20
 
+# Джоба, идущая дольше этого, съедает ночное окно целиком: формально успех,
+# а по существу повод посмотреть. На больших базах перестроение индексов
+# идёт часами, поэтому порог высокий.
+JOB_LONG_HOURS = _int_env("SQL_JOB_LONG_HOURS", 12)
+
+# Имена, по которым джоба опознаётся как бэкапная. Тот же приём, что в
+# mssql_log для ошибок копирования: явного признака у джобы нет.
+BACKUP_JOB_MARKERS = ("backup", "бэкап", "копи", "bkp", "dump")
+
 # Сколько записей одной категории имеет смысл хранить: в дашборде видно
 # первые несколько, полный разбор всё равно в карточке сервера.
 KEEP_PER_CATEGORY = 5
+
+
+def job_seconds(run_duration) -> int:
+    """run_duration в msdb — целое HHMMSS: 72900 это 7 ч 29 мин."""
+    try:
+        value = int(run_duration)
+    except (TypeError, ValueError):
+        return 0
+    return (value // 10000) * 3600 + ((value // 100) % 100) * 60 + value % 100
+
+
+def is_backup_job(name: str) -> bool:
+    """Бэкапная ли джоба — по имени. Явного признака у джобы нет, а знать
+    полезно: молчание бэкапной джобы значит, что копии сегодня не будет."""
+    low = (name or "").lower()
+    return any(marker in low for marker in BACKUP_JOB_MARKERS)
 
 
 def _short(text, limit: int = 200) -> str:
@@ -241,7 +277,8 @@ def sql_events(server: dict, hours: int = 24) -> tuple[list, str]:
 
     try:
         jobs = read_agent_jobs(server, hours=hours)
-        failed = [row for row in jobs.get("rows", []) if str(row.get("status")) == "0"]
+        rows = jobs.get("rows", [])
+        failed = [row for row in rows if str(row.get("status")) == "0"]
         for row in failed[:KEEP_PER_CATEGORY]:
             events.append(_event(
                 "job", "warn", row.get("when"), None,
@@ -251,10 +288,69 @@ def sql_events(server: dict, hours: int = 24) -> tuple[list, str]:
                     summarize_job_message(row.get("msg")),
                 ) if part),
             ))
+        events.extend(job_runs(rows))
     except Exception as e:
         problems.append(f"джобы Agent: {friendly_sql_error(e)}")
 
     return events, "; ".join(problems)
+
+
+def job_runs(rows: list) -> list:
+    """Запуски джоб — по строке на джобу, а не на запуск.
+
+    Успешные запуски раньше выбрасывались целиком: в суточной сводке они
+    только шумели. Но так пропадали два случая, которые как раз важны.
+
+    Джоба, которая **не запускалась вовсе**, не падает — её просто нет, и ни
+    один счётчик этого не показывал. Список запусков делает молчание
+    видимым: вчера четырнадцать, сегодня две.
+
+    И джоба, отработавшая успешно, но **необычно долго**: формально успех, а
+    по существу съеденное ночное окно, в которое не влезли остальные
+    задания. Такие помечаются предупреждением.
+    """
+    by_job = {}
+    for row in rows:
+        name = row.get("job")
+        if not name:
+            continue
+        entry = by_job.setdefault(name, {"runs": 0, "seconds": 0, "last": "",
+                                         "failed": 0})
+        entry["runs"] += 1
+        entry["seconds"] = max(entry["seconds"], job_seconds(row.get("duration")))
+        entry["last"] = max(entry["last"], row.get("when") or "")
+        if str(row.get("status")) == "0":
+            entry["failed"] += 1
+
+    events = []
+    ordered = sorted(by_job.items(), key=lambda i: (-i[1]["seconds"], i[0]))
+    for name, entry in ordered[:KEEP_PER_CATEGORY * 2]:
+        long_run = entry["seconds"] >= JOB_LONG_HOURS * 3600
+        detail = [f"{entry['runs']} запусков"]
+        if entry["seconds"]:
+            detail.append(f"дольше всего {decode_agent_duration_seconds(entry['seconds'])}")
+        if entry["failed"]:
+            detail.append(f"падений: {entry['failed']}")
+        if is_backup_job(name):
+            detail.append("бэкапная")
+        events.append(_event(
+            "run", "warn" if long_run else "ok", entry["last"], None,
+            f"Джоба «{name}»" + (" — идёт слишком долго" if long_run else ""),
+            " · ".join(detail), entry["runs"],
+        ))
+    return events
+
+
+def decode_agent_duration_seconds(seconds: int) -> str:
+    """Секунды в человеческий вид — msdb хранит длительность как HHMMSS,
+    и обратно её удобнее собирать уже из секунд."""
+    hours, rest = divmod(int(seconds or 0), 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {secs} с"
+    return f"{secs} с"
 
 
 def count_by_category(events: list, source: str) -> list:
@@ -269,8 +365,10 @@ def count_by_category(events: list, source: str) -> list:
         bucket["count"] += event.get("count", 1)
         if event["level"] == "crit":
             bucket["level"] = "crit"
-        elif not bucket["level"]:
+        elif event["level"] == "warn" and bucket["level"] != "crit":
             bucket["level"] = "warn"
+        elif not bucket["level"]:
+            bucket["level"] = "ok"
     return [
         {"key": key, "icon": icon, "label": label,
          "count": totals[key]["count"], "level": totals[key]["level"]}
