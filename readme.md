@@ -545,7 +545,7 @@ Windows-специфично и для `vmware` не собирается. Кн�
 ```json
 {
   "name": "SQL01",
-  "host": "192.168.0.80",
+  "host": "192.0.2.80",
   "type": "windows",
   "services": ["MSSQLSERVER", "VeeamBackupSvc"],
   "dbsize": true,

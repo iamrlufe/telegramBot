@@ -23,7 +23,7 @@ AgentMonitor - Модуль резервного копирования
 
 {
   "name": "SQL01",
-  "host": "192.168.0.80",
+  "host": "192.0.2.80",
   "backups": {
     "sql": [
       "R:\\Backups"
