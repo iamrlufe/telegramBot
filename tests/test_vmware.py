@@ -625,10 +625,10 @@ def test_top_line_hides_empty_process_id():
     и «(0)» в карточке выглядит как ошибка."""
     _top_line = _bot_db()._top_line
 
-    line = _top_line(("agrotnk.kz", 0, 10.7, None, 819), by="cpu")
+    line = _top_line(("vm-01.example.local", 0, 10.7, None, 819), by="cpu")
 
     assert "(0)" not in line
-    assert line == "🟢 agrotnk.kz — 10.7% CPU · 819 MB"
+    assert line == "🟢 vm-01.example.local — 10.7% CPU · 819 MB"
 
 
 def test_top_line_keeps_real_process_id():
