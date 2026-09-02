@@ -364,3 +364,75 @@ def test_audit_awk_separates_success_and_admin_console():
     assert by_account["admin@example.local"][3] == "0"
     assert by_account["buh@example.local"][3] == "1"
     assert "old@example.local" not in by_account
+
+
+# ─── Сводка для дашборда ─────────────────────────────────────
+
+def _summary(**over):
+    from zimbra_collector import summary_for
+
+    mail = {"messages": 5338, "queue": 12, "rejected": 2411,
+            "senders": [{"sender": "buh@example.local", "messages": 40,
+                         "recipients": 12}],
+            "defer_reasons": [(["Connection timed out"], 7)]}
+    audit = {"failed": 1284, "ok": 404, "events": EVENTS}
+    mail.update(over.pop("mail", {}))
+    audit.update(over.pop("audit", {}))
+    return summary_for(mail, audit, over.pop("findings", []),
+                       over.pop("geo", {}))
+
+
+def test_summary_has_the_shape_the_dashboard_draws():
+    """Форма общая с Exchange: дашборд рисует kpis/groups/alarms и ничего
+    не знает ни про postfix, ни про mailboxd."""
+    summary = _summary()
+
+    assert {"kpis", "groups", "alarms"} == set(summary)
+    assert all({"value", "label", "level"} <= set(k) for k in summary["kpis"])
+    for group in summary["groups"]:
+        assert {"title", "level", "rows"} <= set(group)
+        assert all({"level", "left", "title"} <= set(r) for r in group["rows"])
+
+
+def test_failed_logins_turn_red_only_where_a_password_is_guessed():
+    """1284 отказа с одного адреса — подбор, а несколько ошибок за сутки —
+    обычная опечатка, и красить их одинаково нельзя."""
+    hot = _summary()
+    calm = _summary(audit={"failed": 3, "events": [
+        {"account": "buh@example.local", "ip": "10.20.30.5", "protocol": "imap",
+         "ok": False, "count": 3, "last": "2026-09-01 09:00:00"}]})
+
+    assert [k["level"] for k in hot["kpis"] if k["label"] == "неудачных входов"] == ["crit"]
+    assert [k["level"] for k in calm["kpis"] if k["label"] == "неудачных входов"] == ["warn"]
+
+
+def test_queue_kpi_warns_only_above_the_threshold():
+    assert [k["level"] for k in _summary()["kpis"] if k["label"] == "в очереди"] == ["ok"]
+    big = _summary(mail={"queue": 5000})
+    assert [k["level"] for k in big["kpis"] if k["label"] == "в очереди"] == ["warn"]
+
+
+def test_only_red_findings_become_alarms():
+    """Жёлтые находки (всплеск отправки, очередь) уже видны плитками, а
+    число в заголовке вкладки должно означать происшествие."""
+    findings = [("mail-01", {"level": "crit", "hint": "1284 неудачных входов",
+                             "text": "🔴 подбор пароля: admin ← 203.0.113.5"}),
+                ("mail-01", {"level": "warn", "hint": "всплеск отправки",
+                             "text": "🟠 buh@example.local: 4000 писем за сутки"})]
+    alarms = _summary(findings=findings)["alarms"]
+
+    # В тревогу идёт текст находки, а не подпись к ней: «1284 неудачных
+    # входов» без имени учётки и адреса читателю ничего не даёт.
+    assert alarms == ["подбор пароля: admin ← 203.0.113.5"]
+
+
+def test_summary_needs_no_second_read_of_the_log():
+    """Сводка собирается из уже прочитанных mail и audit: отдельный проход
+    означал бы ещё один awk по 25 МБ mail.log на каждый цикл."""
+    import inspect
+
+    import zimbra_collector
+
+    source = inspect.getsource(zimbra_collector.collect_server)
+    assert "summary_for(mail, audit" in source
+    assert source.count("read_mail(") == 1

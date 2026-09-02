@@ -198,3 +198,25 @@ def read_owa_failures(server: dict, hours: int = 24, limit: int = 200) -> list:
             item["count"] += 1
             item["last"] = max(item["last"], when)
     return sorted(grouped.values(), key=lambda i: i["count"], reverse=True)
+
+
+def has_exchange(server: dict) -> bool:
+    """Почтовый сервер: явный флаг exchange или служба MSExchange* в сервисах.
+
+    Автоопределение по службам покрывает типовой случай, но следить за
+    службами Exchange в конфиге никто не обязан — поэтому есть и флаг.
+
+    Живёт здесь, а не в разделе бота: тот же вопрос задаёт монитор, когда
+    выбирает, у кого собирать сводку для дашборда, а импортировать bot/ из
+    monitor/ нельзя — это разные контейнеры. Ровно как has_zimbra.
+    """
+    from server_check import server_type
+
+    if server_type(server) != "windows":
+        return False
+    if server.get("exchange"):
+        return True
+    services = server.get("services") or []
+    if isinstance(services, str):
+        services = [services]
+    return any(str(name).lower().startswith("msexchange") for name in services)

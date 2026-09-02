@@ -18,11 +18,11 @@ from collections import OrderedDict
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from exchange_log import (
-    read_owa_logins, read_owa_failures, read_activesync, read_top_sources,
+    has_exchange, read_owa_logins, read_owa_failures, read_activesync,
+    read_top_sources,
 )
 from winlog import friendly_winlog_error
 from refresh import load_server
-from server_check import server_type
 from geoip import resolve as geo_resolve, tag as geo_tag
 from tg_utils import safe_edit_message, paginate, nav_row
 
@@ -46,22 +46,6 @@ def ex_token(server_name: str, hours: int) -> str:
     while len(EX_TOKENS) > EX_TOKENS_MAX:
         EX_TOKENS.popitem(last=False)
     return token
-
-
-def has_exchange(server: dict) -> bool:
-    """Почтовый сервер: явный флаг exchange или служба MSExchange* в сервисах.
-
-    Автоопределение по службам покрывает типовой случай, но следить за
-    службами Exchange в конфиге никто не обязан — поэтому есть и флаг.
-    """
-    if server_type(server) != "windows":
-        return False
-    if server.get("exchange"):
-        return True
-    services = server.get("services") or []
-    if isinstance(services, str):
-        services = [services]
-    return any(str(name).lower().startswith("msexchange") for name in services)
 
 
 def result_token(server_name: str, hours: int, section: str,
