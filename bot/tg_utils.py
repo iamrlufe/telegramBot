@@ -7,6 +7,7 @@ bot/tg_utils.py
 """
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 
 from telegram.error import BadRequest
@@ -72,9 +73,26 @@ def load_muted() -> dict:
 
 
 def save_muted(data: dict):
-    os.makedirs(os.path.dirname(ALERTS_DISABLED_FILE), exist_ok=True)
-    with open(ALERTS_DISABLED_FILE, "w") as f:
-        json.dump(data, f)
+    """Атомарная запись: временный файл рядом, затем os.replace.
+
+    Файл пишет бот, а читает монитор в соседнем контейнере. Прямая запись
+    через open(..., "w") на мгновение оставляет файл усечённым, и монитор,
+    попавший в это окно, получал пустой JSON — то есть считал, что не заглушен
+    никто, и слал алерты по только что заглушенному серверу. Общей блокировки
+    между контейнерами нет, os.replace внутри одной ФС атомарен и закрывает
+    именно эту гонку: читатель видит либо старый файл целиком, либо новый.
+    """
+    directory = os.path.dirname(ALERTS_DISABLED_FILE)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, ALERTS_DISABLED_FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 def mute_expired(value, now: datetime = None) -> bool:

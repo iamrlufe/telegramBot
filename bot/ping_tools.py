@@ -3,8 +3,8 @@ import ipaddress
 import json
 import re
 import subprocess
+from settings import SERVERS_FILE
 
-SERVERS_FILE = "/app/config/servers.json"
 
 
 def load_targets() -> list:

@@ -22,7 +22,6 @@ import os
 import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from pgconn import get_conn
 from db import (
@@ -41,8 +40,8 @@ from backup_bot_db import (
     BACKUP_STATUS_MISSING,
 )
 from backup_schedule import schedule_for, weekday_short
+from settings import ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 # ─── Палитра (та же, что в charts.py) ────────────────────────
 STATUS_GOOD = "#0ca30c"

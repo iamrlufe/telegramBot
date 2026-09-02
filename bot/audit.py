@@ -9,11 +9,10 @@ bot/audit.py
 постоянный след, доступный из бота (📜 Аудит).
 """
 from datetime import timezone
-from zoneinfo import ZoneInfo
 
 from pgconn import get_conn
+from settings import ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 # Человекочитаемые подписи действий для экрана аудита
 ACTION_LABELS = {

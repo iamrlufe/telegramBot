@@ -18,16 +18,14 @@ monitor/backup_maintenance.py
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from backup_files import list_backup_files, delete_backup_files, NO_DELETE_TYPES
 from backup_verify import verify_newest_bak, save_verification, path_str
 from server_check import server_type
 from alerts import send_or_defer
+from settings import SERVERS_FILE, ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
-SERVERS_FILE = "/app/config/servers.json"
 RETENTION_STATE_FILE = "/app/data/last_retention.txt"
 VERIFY_STATE_FILE = "/app/data/last_verify.txt"
 CLEANUP_LOG_FILE = "/app/data/cleanup_log.txt"

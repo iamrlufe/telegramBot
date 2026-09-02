@@ -4,7 +4,6 @@ import json
 import asyncio
 import traceback
 from datetime import datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -58,6 +57,7 @@ from config_editor import (
 from pg_admin import get_pg_stats, cleanup_options_kb
 import audit
 from alerts_ack import ack_alert
+from settings import ALMATY
 from tg_utils import (
     safe_edit_message,
     safe_answer_query,
@@ -87,7 +87,6 @@ ALLOWED_USER_ID = _require_int_env("TELEGRAM_ALLOWED_USER_ID")
 _group_env = os.getenv("TELEGRAM_GROUP_ID")
 GROUP_ID = int(_group_env) if _group_env else None
 NOTIFY_ID = GROUP_ID if GROUP_ID else ALLOWED_USER_ID
-ALMATY = ZoneInfo("Asia/Almaty")
 ALERTS_DISABLED_FILE = "/app/data/alerts_disabled.json"
 
 KEYBOARD = [

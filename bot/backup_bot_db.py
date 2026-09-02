@@ -18,8 +18,8 @@ from backup_files import (
 )
 from backup_verify import path_str
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
+from settings import SERVERS_FILE
 
-SERVERS_FILE = "/app/config/servers.json"
 SYSTEM_DATABASES = {"master", "model", "msdb", "tempdb"}
 COPY_DATABASE_MARKERS = ("copy", "коп", "backup", "bak", "old")
 

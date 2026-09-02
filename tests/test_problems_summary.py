@@ -133,3 +133,48 @@ def test_stale_disk_rows_are_cut_off_by_query():
         assert "INTERVAL '1 hour' * %s" in tail, \
             "выборка дисков без ограничения по свежести"
     assert bot_db.DISK_METRIC_FRESH_HOURS >= 1
+
+
+# ─── Окно по времени в самых частых запросах ─────────────────
+
+def test_server_status_queries_are_bounded_by_time():
+    """DISTINCT ON без WHERE читает server_status целиком — всю историю за
+    RETAIN_DAYS на каждое нажатие «Состояние серверов» и на каждую карточку.
+    Postgres не умеет index skip scan, индекс здесь не спасает."""
+    import re
+
+    source = (ROOT / "bot" / "db.py").read_text(encoding="utf-8")
+    queries = re.findall(
+        r"DISTINCT ON \(server_name\)(.*?)ORDER BY server_name, checked_at DESC",
+        source, re.S
+    )
+    bounded = [q for q in queries if "make_interval(hours => %s)" in q]
+    # по одному ограниченному запросу на список и на карточку; вторая пара —
+    # запасные варианты без окна, они выполняются только при пустом результате
+    assert len(bounded) >= 2, "список серверов или карточка читают всю историю"
+    assert bot_db.STATUS_WINDOW_HOURS >= 24
+
+
+def test_server_card_disks_are_cut_off_by_freshness():
+    """Карточка сервера показывала тома по последней записи любой давности —
+    в отличие от отчёта и сводки проблем, где фильтр уже стоял."""
+    import re
+
+    source = (ROOT / "bot" / "db.py").read_text(encoding="utf-8")
+    queries = re.findall(
+        r"DISTINCT ON \(disk_name\)(.*?)ORDER BY disk_name, created_at DESC",
+        source, re.S
+    )
+    assert queries, "запросы дисков по одному серверу не найдены"
+    for tail in queries:
+        assert "make_interval(hours => %s)" in tail, \
+            "выборка дисков сервера без ограничения по свежести"
+
+
+def test_empty_window_falls_back_to_full_history():
+    """Монитор мог молчать дольше окна — например, контейнер лежал сутки.
+    Список серверов в этом случае обязан показать последнее известное
+    состояние, а не «нет данных»."""
+    source = (ROOT / "bot" / "db.py").read_text(encoding="utf-8")
+    assert source.count("if not rows:") >= 1
+    assert source.count("if not status_row:") >= 1

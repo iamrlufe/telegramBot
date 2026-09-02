@@ -17,13 +17,13 @@ monitor/zimbra_collector.py
 Объём отправки, очередь и отбитые на входе — фон. Отбитых на живом сервере
 тысячи в сутки, и это признак того, что защита работает, а не тревога.
 """
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from alerts import check_zimbra_alerts
 from geoip import resolve as geo_resolve
 from mail_store import save_snapshot
+from settings import int_env
 from zimbra_log import (
     QUEUE_ALERT, SPOOF_ALERT, _origin_rows, brute_force, foreign_logins,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
@@ -33,12 +33,8 @@ from zimbra_log import (
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        print(f"[zimbra] Некорректный {name}={raw!r}, беру {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="zimbra")
 
 
 ZIMBRA_SCAN_MINUTES = _int_env("ZIMBRA_SCAN_MINUTES", 30)

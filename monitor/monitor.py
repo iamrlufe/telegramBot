@@ -34,6 +34,7 @@ from db import (
 )
 from disk_forecast import free_space_trend
 from disk_health import purge_disk_health, save_disk_health
+from settings import SERVERS_FILE, int_env
 from alerts import (
     check_disk_alert,
     check_disk_forecast_alert,
@@ -59,12 +60,10 @@ from alerts import (
     ALMATY,
 )
 
+
 def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        print(f"[monitor] Некорректный {name}, использую {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="monitor")
 
 
 # Основной цикл опроса серверов.
@@ -98,7 +97,6 @@ PING_DOWN_INTERVAL = _int_env("PING_DOWN_INTERVAL_SECONDS", 10)
 # опрос замедлялся — и «7,5 минут» превращались в десять. Время честнее.
 PING_FAIL_SECONDS = _int_env("PING_FAIL_SECONDS", 120)
 
-SERVERS_FILE = "/app/config/servers.json"
 
 DISK_STATE_FILE = "/app/data/disk_alert_state.json"
 SERVER_STATE_FILE = "/app/data/server_alert_state.json"

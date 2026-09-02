@@ -11,6 +11,11 @@ from datetime import datetime
 from pgconn import get_conn
 from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
 
+# WITH CHECKSUM заставляет VERIFYONLY сверять контрольные суммы страниц, а не
+# только заголовок и структуру. Без него битая страница внутри .bak проходит
+# проверку молча и обнаруживается уже при реальном восстановлении. Если бэкап
+# снят без CHECKSUM, MSSQL выдаёт предупреждение и проверяет как раньше —
+# поведение на таких копиях не ломается.
 # RESTORE VERIFYONLY читает весь файл бэкапа — на больших базах это долго
 VERIFY_QUERY_TIMEOUT_SEC = 7200
 VERIFY_READ_TIMEOUT_SEC = 7300
@@ -54,7 +59,7 @@ def verify_newest_bak(host: str, backup_path: str,
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {{
         Invoke-Sqlcmd -ServerInstance "localhost" `
-            -Query "RESTORE VERIFYONLY FROM DISK = N'$escaped'" `
+            -Query "RESTORE VERIFYONLY FROM DISK = N'$escaped' WITH CHECKSUM" `
             -QueryTimeout {VERIFY_QUERY_TIMEOUT_SEC} -ErrorAction Stop | Out-Null
         $sw.Stop()
         Out-B64 @{{

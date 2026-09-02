@@ -37,6 +37,7 @@ shared/zimbra_log.py
 import os
 
 from linux_check import run_ssh
+from settings import int_env
 
 # Где искать. Первый существующий и непустой и берётся: на Zimbra
 # /var/log/zimbra.log обычно пустышка, оставшаяся с установки, а живой лог —
@@ -54,23 +55,15 @@ POSTQUEUE_PATHS = ("/opt/zimbra/common/sbin/postqueue",
 TOP = 20
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        return default
-
-
 # Порог всплеска отправки. Считается в письмах, а не в строках лога,
 # поэтому число меньше привычного втрое.
-SEND_ALERT = _int_env("ZIMBRA_SEND_ALERT", 2000)
+SEND_ALERT = int_env("ZIMBRA_SEND_ALERT", 2000)
 
 # Писем в очереди. Здоровая очередь на живом сервере — единицы.
-QUEUE_ALERT = _int_env("ZIMBRA_QUEUE_ALERT", 300)
+QUEUE_ALERT = int_env("ZIMBRA_QUEUE_ALERT", 300)
 
 # Неудачных входов с одного адреса за сутки.
-AUTH_FAIL_ALERT = _int_env("ZIMBRA_AUTH_FAIL_ALERT", 50)
+AUTH_FAIL_ALERT = int_env("ZIMBRA_AUTH_FAIL_ALERT", 50)
 
 # Страна, из которой входы считаются штатными.
 HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
@@ -79,7 +72,7 @@ HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
 # сказать вслух. Единичные приходят на любой сервер в интернете, и будить
 # из-за них незачем; десятки означают, что адресами домена уже пользуются
 # для фишинга по своим же сотрудникам.
-SPOOF_ALERT = _int_env("ZIMBRA_SPOOF_ALERT", 5)
+SPOOF_ALERT = int_env("ZIMBRA_SPOOF_ALERT", 5)
 
 
 def _reader(path: str) -> str:

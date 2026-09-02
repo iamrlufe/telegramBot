@@ -18,7 +18,6 @@ import asyncio
 import itertools
 from collections import OrderedDict
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -34,8 +33,8 @@ from firewall import (
 )
 from refresh import load_server
 from tg_utils import safe_edit_message
+from settings import ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 FW_TOKENS: "OrderedDict[str, tuple]" = OrderedDict()
 FW_TOKENS_MAX = 500

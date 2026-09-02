@@ -1,12 +1,10 @@
 import json
-import os
 import threading
 import time
 
 import psycopg2
 from collections import defaultdict
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton
 
 from pgconn import get_conn
@@ -21,8 +19,8 @@ from onec_logs import (
     ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, load_onec_thresholds,
 )
 from alerts_ack import ack_hash, ack_key_forever, active_ack_digests
+from settings import SERVERS_FILE, ALMATY, int_env
 
-ALMATY = ZoneInfo("Asia/Almaty")
 STALE_MINUTES = 15
 DISK_WARN_FREE = 20
 DISK_CRIT_FREE = 10
@@ -36,16 +34,9 @@ def is_pseudo_disk(name: str) -> bool:
     return name != "/" and name.startswith(PSEUDO_MOUNT_PREFIXES)
 
 
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
 # Копия недельной давности и вчерашняя лежали в одной жёлтой куче: порог
 # делит «отстал» и «бэкапа фактически нет».
-BACKUP_CRIT_HOURS = _int_env("BACKUP_CRIT_HOURS", 72)
+BACKUP_CRIT_HOURS = int_env("BACKUP_CRIT_HOURS", 72)
 BACKUP_STALE_MINUTES = 30
 
 # Метрика диска, которая перестала обновляться, остаётся в базе навсегда:
@@ -62,11 +53,18 @@ SERVER_BUTTONS_PER_PAGE = 8
 # за месяц на каждое нажатие 🚨 Проблемы.
 PROBLEM_HISTORY_DAYS = 7
 
+# То же ограничение для двух самых нажимаемых запросов — списка серверов и
+# карточки. DISTINCT ON без WHERE читает таблицу целиком (Postgres не умеет
+# index skip scan), то есть всю историю за RETAIN_DAYS на каждое нажатие.
+# Двух суток хватает: монитор пишет строку каждому серверу каждый цикл, даже
+# когда сервер лежит. Пустой результат означает, что молчал сам монитор, —
+# тогда запрос повторяется без окна, чтобы список серверов не исчезал.
+STATUS_WINDOW_HOURS = int_env("STATUS_WINDOW_HOURS", 48)
+
 # Сводка пересчитывалась на каждое нажатие кнопки — пять тяжёлых запросов
 # ради данных, которые обновляются раз в пять минут. Ходьба «сводка →
 # сервер → назад» стоила пятнадцати.
-PROBLEMS_CACHE_SECONDS = _int_env("PROBLEMS_CACHE_SECONDS", 45)
-SERVERS_FILE = "/app/config/servers.json"
+PROBLEMS_CACHE_SECONDS = int_env("PROBLEMS_CACHE_SECONDS", 45)
 
 
 def _make_bar(used_pct: float, width: int = 10) -> str:
@@ -166,9 +164,18 @@ def get_servers_status(page: int = 0) -> tuple:
             SELECT DISTINCT ON (server_name)
                    server_name, status, checked_at
             FROM server_status
+            WHERE checked_at >= NOW() - make_interval(hours => %s)
             ORDER BY server_name, checked_at DESC
-        """)
+        """, (STATUS_WINDOW_HOURS,))
         rows = cur.fetchall()
+        if not rows:
+            cur.execute("""
+                SELECT DISTINCT ON (server_name)
+                       server_name, status, checked_at
+                FROM server_status
+                ORDER BY server_name, checked_at DESC
+            """)
+            rows = cur.fetchall()
 
     if not rows:
         return "⚠️ Нет данных — мониторинг ещё не запускался", []
@@ -227,6 +234,10 @@ def get_servers_status(page: int = 0) -> tuple:
 
 def get_disk_usage(server_name: str, disk_name: str):
     """(free_gb, used_gb) последнего замера диска или None.
+
+    Замер старше DISK_METRIC_FRESH_HOURS не годится: значение по диску,
+    который перестал отвечать, вводит в заблуждение сильнее, чем «нет
+    данных». Тот же порог стоит в отчёте, в сводке проблем и в карточке.
     Имя диска сопоставляется без учёта «:», «\\» и регистра ('E' == 'E:')."""
     norm = str(disk_name or "").rstrip(":\\/").upper()
     with get_conn() as conn:
@@ -235,8 +246,9 @@ def get_disk_usage(server_name: str, disk_name: str):
             SELECT DISTINCT ON (disk_name) disk_name, free_gb, used_gb
             FROM disk_metrics
             WHERE server_name = %s
+              AND created_at >= NOW() - make_interval(hours => %s)
             ORDER BY disk_name, created_at DESC
-        """, (server_name,))
+        """, (server_name, DISK_METRIC_FRESH_HOURS))
         for dn, free, used in cur.fetchall():
             if str(dn).rstrip(":\\/").upper() == norm:
                 return float(free), float(used)
@@ -245,6 +257,9 @@ def get_disk_usage(server_name: str, disk_name: str):
 
 def get_server_disks(server_name: str) -> list:
     """[(disk_name, free_gb, used_gb), ...] по последнему замеру каждого диска.
+
+    Тот же порог свежести, что и в карточке: иначе в меню разбора места
+    предлагались тома, которых на сервере давно нет.
     Нужен для меню «какой диск разобрать» под карточкой сервера."""
     with get_conn() as conn:
         cur = conn.cursor()
@@ -252,8 +267,9 @@ def get_server_disks(server_name: str) -> list:
             SELECT DISTINCT ON (disk_name) disk_name, free_gb, used_gb
             FROM disk_metrics
             WHERE server_name = %s
+              AND created_at >= NOW() - make_interval(hours => %s)
             ORDER BY disk_name, created_at DESC
-        """, (server_name,))
+        """, (server_name, DISK_METRIC_FRESH_HOURS))
         return [(dn, float(free or 0), float(used or 0))
                 for dn, free, used in cur.fetchall() if not is_pseudo_disk(dn)]
 
@@ -287,17 +303,29 @@ def get_server_detail(server_name: str) -> str:
                    status, error, checked_at, cpu_load, ram_total, ram_free, uptime_seconds
             FROM server_status
             WHERE server_name = %s
+              AND checked_at >= NOW() - make_interval(hours => %s)
             ORDER BY server_name, checked_at DESC
-        """, (server_name,))
+        """, (server_name, STATUS_WINDOW_HOURS))
         status_row = cur.fetchone()
+        if not status_row:
+            cur.execute("""
+                SELECT DISTINCT ON (server_name)
+                       status, error, checked_at, cpu_load, ram_total, ram_free,
+                       uptime_seconds
+                FROM server_status
+                WHERE server_name = %s
+                ORDER BY server_name, checked_at DESC
+            """, (server_name,))
+            status_row = cur.fetchone()
 
         cur.execute("""
             SELECT DISTINCT ON (disk_name)
                    disk_name, free_gb, used_gb
             FROM disk_metrics
             WHERE server_name = %s
+              AND created_at >= NOW() - make_interval(hours => %s)
             ORDER BY disk_name, created_at DESC
-        """, (server_name,))
+        """, (server_name, DISK_METRIC_FRESH_HOURS))
         disk_rows = [row for row in cur.fetchall() if not is_pseudo_disk(row[0])]
 
         cur.execute("""

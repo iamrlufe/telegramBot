@@ -12,22 +12,18 @@ LOG_SCAN_MINUTES, и складывается снимком в log_events.
 Журналы читаются реже метрик намеренно: диск заполняется в любую минуту, а
 сводка за сутки от того, что её обновили час назад, не устаревает.
 """
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from log_store import save_snapshot, save_failure
 from log_summary import windows_events, sql_events
 from server_check import server_type
+from settings import int_env
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        print(f"[logs] Некорректный {name}={raw!r}, беру {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="logs")
 
 
 # Час по умолчанию: сводка показывается дважды в сутки, чаще читать журналы

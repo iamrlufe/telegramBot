@@ -5,8 +5,8 @@ from ping_tools import ping_host
 from server_check import check_server, server_type
 from service_details import save_details_from_info
 from winrm_errors import parse_status
+from settings import SERVERS_FILE
 
-SERVERS_FILE = "/app/config/servers.json"
 
 
 def load_server(server_name: str) -> dict:

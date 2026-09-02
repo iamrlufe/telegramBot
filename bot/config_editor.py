@@ -19,7 +19,6 @@ import os
 import re
 import tempfile
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
@@ -34,10 +33,9 @@ from backup_schedule import (WEEKDAY_NAMES, path_schedule, weekday_label,
 import pg_admin
 import audit
 from geoip import add_label, list_labels, remove_label
+from settings import SERVERS_FILE, ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
-SERVERS_FILE = "/app/config/servers.json"
 STATE_KEY = "cfg"          # context.user_data[STATE_KEY]
 EDIT_SERVER_KEY = "cfg_edit_server"
 SKIP_INPUTS = {"-", "—"}
@@ -2215,7 +2213,11 @@ HELP_QUIET = """🔕 ТИШИНА И ДОСТАВКА
 Если группа недоступна (неверный ID, бота удалили из чата), алерт не
 теряется: он придёт в личку владельца с пометкой о проблеме. Если ID
 сменился (группа стала супергруппой), бот подхватит новый ID из ответа
-Telegram, дошлёт туда и напишет в лог, что прописать в .env."""
+Telegram, дошлёт туда и напишет в лог, что прописать в .env.
+
+Если Telegram не ответил вовсе (таймаут, обрыв связи), алерт тоже не
+пропадает: он ложится в ту же очередь, что и ночные, и уходит следующим
+циклом монитора — обычно через 5 минут."""
 
 
 HELP_TIMING = """⏰ РАСПИСАНИЯ И ОТЧЁТЫ
@@ -2436,7 +2438,8 @@ HELP_BACKUPS = f"""💾 БЭКАПЫ
 🧹 Cleanup — удаление старых файлов с предпросмотром и подтверждением.
 🧪 Verify статус — результаты RESTORE VERIFYONLY за 7 дней и ручной
    запуск ▶️ Запустить сейчас (идёт в фоне, до 2 часов на большой базе;
-   ботом можно пользоваться, не дожидаясь).
+   ботом можно пользоваться, не дожидаясь). Проверка идёт WITH CHECKSUM:
+   сверяются контрольные суммы страниц, а не только заголовок файла.
 📋 Дайджест — сводка + тепловая карта свежести + график объёма.
 
 ━━━━━━━━━━━━━━━━━━━━

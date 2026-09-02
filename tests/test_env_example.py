@@ -13,9 +13,11 @@ ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE = ROOT / ".env.example"
 CODE_DIRS = ("bot", "monitor", "shared")
 
-# Переменные читаются и напрямую, и через типизированные обёртки.
+# Переменные читаются и напрямую, и через типизированные обёртки. Обёртки
+# живут в shared/settings.py (int_env, float_env), а модули с собственным
+# префиксом в логе оборачивают их ещё раз — отсюда необязательное «_».
 READERS = re.compile(
-    r'(?:getenv|_int_env|_float_env|_num_env|_require_env|_require_int_env)'
+    r'(?:getenv|_?int_env|_?float_env|_?num_env|_require_env|_require_int_env)'
     r'\(\s*"([A-Z_0-9]+)"'
 )
 

@@ -5,12 +5,12 @@ monitor/backup_collector.py
 Период: каждые 5 минут (совпадает с основным циклом).
 """
 import json
-import os
 import statistics
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from winrm_client import ps_fits, run_ps
 from linux_check import run_ssh
+from settings import SERVERS_FILE, int_env, float_env
 from server_check import server_type
 from alerts import (
     alert_due,
@@ -27,7 +27,6 @@ from backup_schedule import (
     weekly_backup_missed,
 )
 
-SERVERS_FILE = "/app/config/servers.json"
 BACKUP_ALERT_STATE_FILE = "/app/data/backup_alert_state.json"
 
 
@@ -57,20 +56,16 @@ LOG_EXTENSIONS = {".trn"}
 # Приоритет настройки: своё время у конкретного пути (backups.<type>[i].alert_hours)
 # > "backup_alert_hours" у сервера > глобальный BACKUP_ALERT_HOURS (.env).
 # Всё, кроме глобального, редактируется через ⚙️ Настройка в боте.
+
+
 def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        print(f"[backup] Некорректный {name}, использую {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="backup")
 
 
 def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        print(f"[backup] Некорректный {name}, использую {default}", flush=True)
-        return default
+    """settings.float_env с тем же префиксом."""
+    return float_env(name, default, tag="backup")
 
 
 BACKUP_ALERT_HOURS = _int_env("BACKUP_ALERT_HOURS", 25)

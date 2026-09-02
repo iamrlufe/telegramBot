@@ -17,10 +17,9 @@ import os
 import tempfile
 import threading
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from settings import ALMATY
 
 ACK_FILE = "/app/data/alert_ack.json"
-ALMATY = ZoneInfo("Asia/Almaty")
 
 # Сколько держится подавление. Сутки — практичный срок: за это время либо
 # чинят, либо причина уходит сама (старые записи выпадают из логов).

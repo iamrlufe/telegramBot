@@ -1,0 +1,36 @@
+# Тесты и проверка синтаксиса на каждый push и pull request.
+#
+# Раньше единственной проверкой был `pytest` на машине разработчика: сломанный
+# импорт или опечатка в редко вызываемой ветке доезжали до боевого сервера и
+# обнаруживались там. Набор правил ruff узкий намеренно — только то, что
+# гарантированно ломает работу (синтаксис, необъявленные имена, повторные
+# определения). Расширять его есть куда, но шумный линтер, который все
+# привыкают игнорировать, хуже отсутствующего.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Та же версия, что в обоих Dockerfile: расхождение означало бы,
+          # что CI зелёный на синтаксисе, которого нет в контейнере.
+          python-version: "3.12"
+
+      # Тяжёлые зависимости (winrm, telegram, psycopg2, matplotlib) подменяются
+      # заглушками в tests/conftest.py — ставить их незачем.
+      - run: pip install pytest ruff
+
+      - name: ruff (только ошибки, ломающие запуск)
+        run: ruff check --select E9,F63,F7,F82,F811 bot monitor shared tests
+
+      - name: pytest
+        run: pytest

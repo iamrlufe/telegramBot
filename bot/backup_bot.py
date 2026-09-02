@@ -9,9 +9,7 @@ import uuid
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
@@ -42,6 +40,7 @@ from backup_schedule import (
 )
 from tg_utils import safe_edit_message, split_message
 import audit
+from settings import ALMATY
 
 CLEANUP_PENDING_FILE = "/app/data/cleanup_pending.json"
 CLEANUP_PENDING_TTL_MINUTES = 15

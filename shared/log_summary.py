@@ -24,7 +24,6 @@ event_at хранится строкой в том виде, в каком ег�
 к чему: часовой пояс удалённой машины монитору неизвестен, а сортировка
 и показ по строке работают одинаково.
 """
-import os
 from datetime import datetime, timedelta
 
 from winlog import (
@@ -32,19 +31,13 @@ from winlog import (
     read_app_errors, read_failed_logons, group_failed_logons,
     explain_event, friendly_winlog_error,
 )
+from settings import int_env
 from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, read_job_schedules, friendly_sql_error,
     explain_engine_error, explain_backup_error, summarize_job_message,
     decode_agent_duration,
 )
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        return default
 
 
 # (ключ, иконка, подпись) — порядок задаёт порядок колонок в дашборде.
@@ -83,7 +76,7 @@ LOGON_BRUTE_FORCE = 20
 # Джоба, идущая дольше этого, съедает ночное окно целиком: формально успех,
 # а по существу повод посмотреть. На больших базах перестроение индексов
 # идёт часами, поэтому порог высокий.
-JOB_LONG_HOURS = _int_env("SQL_JOB_LONG_HOURS", 12)
+JOB_LONG_HOURS = int_env("SQL_JOB_LONG_HOURS", 12)
 
 # Имена, по которым джоба опознаётся как бэкапная. Тот же приём, что в
 # mssql_log для ошибок копирования: явного признака у джобы нет.
@@ -92,7 +85,7 @@ BACKUP_JOB_MARKERS = ("backup", "бэкап", "копи", "bkp", "dump")
 # Сколько ждать после назначенного времени, прежде чем считать запуск
 # пропущенным. Джоба стартует не секунда в секунду, а очередь Agent бывает
 # занята соседней задачей.
-JOB_MISS_GRACE_MINUTES = _int_env("SQL_JOB_MISS_GRACE_MINUTES", 60)
+JOB_MISS_GRACE_MINUTES = int_env("SQL_JOB_MISS_GRACE_MINUTES", 60)
 
 # Как msdb описывает периодичность (freq_type в sysschedules).
 FREQ_ONCE = 1

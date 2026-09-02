@@ -216,3 +216,137 @@ def test_mark_alert_sent_keeps_level_readable():
     alerts.mark_alert_sent(state, "srv:C", "crit", _now(12))
     assert alerts.alert_level(state["srv:C"]) == "crit"
     assert state["srv:C"]["sent"].startswith("2026-08-29T12:00")
+
+
+# ─── Недоставленный алерт не теряется ────────────────────────
+#
+# Раньше сбой сети в send_telegram только печатался в stdout: сообщение
+# исчезало, и о проблеме на сервере никто не узнавал. Теперь неудачная
+# отправка кладёт текст в ту же очередь, из которой утром уходит сводка.
+
+def test_failed_delivery_goes_to_queue(monkeypatch):
+    monkeypatch.setattr(alerts, "in_quiet_hours", lambda *a, **k: False)
+    queue = {}
+    monkeypatch.setattr(alerts, "load_json", lambda path: dict(queue))
+    monkeypatch.setattr(alerts, "save_json", lambda path, data: queue.update(data))
+    monkeypatch.setattr(alerts, "send_telegram", lambda *a, **k: False)
+
+    alerts.send_or_defer("🚨 Сервер упал")
+
+    items = queue.get("items", [])
+    assert len(items) == 1
+    assert "Сервер упал" in items[0]["text"]
+
+
+def test_successful_delivery_leaves_queue_empty(monkeypatch):
+    monkeypatch.setattr(alerts, "in_quiet_hours", lambda *a, **k: False)
+    queue = {}
+    monkeypatch.setattr(alerts, "load_json", lambda path: dict(queue))
+    monkeypatch.setattr(alerts, "save_json", lambda path, data: queue.update(data))
+    monkeypatch.setattr(alerts, "send_telegram", lambda *a, **k: True)
+
+    alerts.send_or_defer("🚨 Сервер упал")
+
+    assert queue.get("items", []) == []
+
+
+def test_flush_returns_items_to_queue_when_send_fails(monkeypatch):
+    """Очередь очищается до отправки. Если Bot API в этот момент недоступен,
+    накопленное обязано вернуться, а не пропасть вместе с попыткой."""
+    monkeypatch.setattr(alerts, "in_quiet_hours", lambda *a, **k: False)
+    queue = {"items": [{"time": "03:15", "text": "🚨 Диск переполнен"}]}
+    monkeypatch.setattr(alerts, "load_json", lambda path: dict(queue))
+    monkeypatch.setattr(alerts, "save_json",
+                        lambda path, data: queue.update(dict(data)))
+    monkeypatch.setattr(alerts, "send_telegram", lambda *a, **k: False)
+
+    alerts.flush_deferred()
+
+    items = queue.get("items", [])
+    assert len(items) == 1
+    assert "Диск переполнен" in items[0]["text"]
+
+
+def test_flush_clears_queue_when_send_succeeds(monkeypatch):
+    monkeypatch.setattr(alerts, "in_quiet_hours", lambda *a, **k: False)
+    queue = {"items": [{"time": "03:15", "text": "🚨 Диск переполнен"}]}
+    monkeypatch.setattr(alerts, "load_json", lambda path: dict(queue))
+    monkeypatch.setattr(alerts, "save_json",
+                        lambda path, data: queue.update(dict(data)))
+    monkeypatch.setattr(alerts, "send_telegram", lambda *a, **k: True)
+
+    alerts.flush_deferred()
+
+    assert queue.get("items", []) == []
+
+
+def test_stubbed_send_telegram_is_not_treated_as_failure(monkeypatch):
+    """Подменённая заглушка возвращает None. Трактовать это как сбой нельзя —
+    иначе каждый вызов дублировал бы алерт в очередь."""
+    monkeypatch.setattr(alerts, "in_quiet_hours", lambda *a, **k: False)
+    queue = {}
+    monkeypatch.setattr(alerts, "load_json", lambda path: dict(queue))
+    monkeypatch.setattr(alerts, "save_json", lambda path, data: queue.update(data))
+    monkeypatch.setattr(alerts, "send_telegram", lambda *a, **k: None)
+
+    alerts.send_or_defer("🚨 Сервер упал")
+
+    assert queue.get("items", []) == []
+
+
+# ─── send_telegram сообщает об исходе ────────────────────────
+
+class _Response:
+    def __init__(self, ok, status_code=200, text=""):
+        self.ok = ok
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return {}
+
+
+def test_send_telegram_reports_success(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "тест")
+    monkeypatch.setattr(alerts, "_get_notify_id", lambda: "111")
+    monkeypatch.setattr(alerts, "_post_message",
+                        lambda *a, **k: _Response(True))
+
+    assert alerts.send_telegram("текст") is True
+
+
+def test_send_telegram_reports_network_failure(monkeypatch):
+    """Обрыв, таймаут, недоступный DNS — исключение обязано стать False,
+    иначе алерт молча пропадает."""
+    monkeypatch.setenv("TELEGRAM_TOKEN", "тест")
+    monkeypatch.setattr(alerts, "_get_notify_id", lambda: "111")
+
+    def boom(*args, **kwargs):
+        raise OSError("сеть недоступна")
+
+    monkeypatch.setattr(alerts, "_post_message", boom)
+
+    assert alerts.send_telegram("текст") is False
+
+
+def test_send_telegram_reports_rejection(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "тест")
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_ID", raising=False)
+    monkeypatch.setattr(alerts, "_get_notify_id", lambda: "111")
+    monkeypatch.setattr(alerts, "_post_message",
+                        lambda *a, **k: _Response(False, 400, "bad request"))
+
+    assert alerts.send_telegram("текст") is False
+
+
+def test_send_telegram_counts_owner_fallback_as_delivered(monkeypatch):
+    """Группа отвергла, личка приняла — алерт дошёл, в очередь его не нужно."""
+    monkeypatch.setenv("TELEGRAM_TOKEN", "тест")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "999")
+    monkeypatch.setattr(alerts, "_get_notify_id", lambda: "111")
+
+    answers = [_Response(False, 400, "chat not found"), _Response(True)]
+    monkeypatch.setattr(alerts, "_post_message",
+                        lambda *a, **k: answers.pop(0))
+
+    assert alerts.send_telegram("текст") is True

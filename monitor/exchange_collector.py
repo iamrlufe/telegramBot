@@ -16,7 +16,6 @@ monitor/exchange_collector.py
 Security, и его разбирает общий сбор журналов Windows (log_collector) —
 второй источник тревог по тому же событию означал бы двойные сообщения.
 """
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,15 +24,12 @@ from exchange_log import (
 )
 from geoip import resolve as geo_resolve
 from mail_store import save_snapshot
+from settings import int_env
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        print(f"[exchange] Некорректный {name}={raw!r}, беру {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="exchange")
 
 
 EXCHANGE_SCAN_MINUTES = _int_env("EXCHANGE_SCAN_MINUTES", 60)

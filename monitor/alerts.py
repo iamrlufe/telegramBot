@@ -4,7 +4,6 @@ import tempfile
 import threading
 import time as time_module
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -12,8 +11,8 @@ from alerts_ack import (
     ACK_HOURS, is_acked, with_ack_button, purge_acks_for_server,
 )
 from winrm_errors import error_to_status
+from settings import ALMATY, int_env
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 DISK_STATE_FILE = "/app/data/disk_alert_state.json"
 SERVER_STATE_FILE = "/app/data/server_alert_state.json"
@@ -84,6 +83,11 @@ def send_telegram(text: str, reply_markup: dict = None):
     старый TELEGRAM_GROUP_ID начинает отдавать 400, а алерты молча пропадают.
     Поэтому здесь два страховочных слоя: подхват migrate_to_chat_id из ответа
     Bot API и фолбэк в личку владельца, чтобы алерт дошёл в любом случае.
+
+    Возвращает True, если Bot API принял сообщение. False — если отклонил или
+    запрос вовсе не дошёл (таймаут, обрыв, DNS). Раньше сетевой сбой только
+    печатался в stdout, и алерт исчезал бесследно; теперь по False вызывающий
+    код кладёт текст в очередь отложенных и дошлёт его следующим циклом.
     """
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = _get_notify_id()
@@ -134,8 +138,11 @@ def send_telegram(text: str, reply_markup: dict = None):
                     )
                 else:
                     print(f"[alerts] Алерт доставлен в личку {owner_id} (фолбэк)", flush=True)
+                    return True
+        return bool(response.ok)
     except Exception as e:
         print(f"[alerts] Ошибка отправки в Telegram: {_hide_token(str(e), token)}", flush=True)
+        return False
 
 
 def server_alert_kb(server_name: str) -> dict:
@@ -296,18 +303,12 @@ def purge_server_state(server_name: str):
 
 # ─── Повтор напоминаний ──────────────────────────────────────
 
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
 
 # Как часто напоминать о проблеме, которая никуда не делась. Раньше алерт
 # приходил ровно один раз — при смене уровня, — и молчал, пока проблема
 # висит: сообщение легко было пролистать и забыть. 0 отключает повторы,
 # кнопка «Принято» глушит конкретный алерт на ALERT_ACK_HOURS.
-ALERT_REPEAT_HOURS = _int_env("ALERT_REPEAT_HOURS", 3)
+ALERT_REPEAT_HOURS = int_env("ALERT_REPEAT_HOURS", 3)
 
 
 def alert_level(value):
@@ -379,17 +380,31 @@ def send_or_defer(text: str, reply_markup: dict = None, ack_key: str = None):
         reply_markup = with_ack_button(reply_markup, ack_key)
 
     if not in_quiet_hours():
-        send_telegram(text, reply_markup)
+        # `is False` вместо `not`: подменённая в тестах и в firewall_maintenance
+        # заглушка возвращает None, и трактовать это как сбой доставки нельзя.
+        # Очередь наполняет только явный отказ настоящего send_telegram.
+        if send_telegram(text, reply_markup) is False:
+            _queue_deferred(text)
+            print(f"[alerts] Не доставлено, отложено до следующего цикла: "
+                  f"{text.splitlines()[0]}", flush=True)
         return
-    with _state_lock:
-        queue = load_json(DEFERRED_FILE)
-        items = queue.get("items", [])
-        items.append({
-            "time": datetime.now(ALMATY).strftime("%H:%M"),
-            "text": text,
-        })
-        save_json(DEFERRED_FILE, {"items": items[-100:]})
+    _queue_deferred(text)
     print(f"[alerts] Отложено до утра: {text.splitlines()[0]}", flush=True)
+
+
+def _queue_deferred(text: str, items: list = None):
+    """Кладёт текст (или сразу список готовых записей) в очередь отложенных.
+
+    Очередь изначально писалась под тихие часы, но она же — единственное
+    место, где алерт переживает недоступность Bot API. Поэтому запись вынесена
+    из send_or_defer: ею пользуются и тихие часы, и возврат неотправленного
+    из flush_deferred.
+    """
+    with _state_lock:
+        queue = load_json(DEFERRED_FILE).get("items", [])
+        if items is None:
+            items = [{"time": datetime.now(ALMATY).strftime("%H:%M"), "text": text}]
+        save_json(DEFERRED_FILE, {"items": (queue + items)[-100:]})
 
 
 def flush_deferred():
@@ -402,16 +417,24 @@ def flush_deferred():
             return
         save_json(DEFERRED_FILE, {"items": []})
 
+    # Очередь очищена выше: если Bot API сейчас недоступен, накопленное
+    # вернётся в неё целиком, а не пропадёт вместе с попыткой отправки.
     header = f"🌙 За тихие часы накопилось уведомлений: {len(items)}\n"
     chunk = header
+    failed = False
     for item in items:
         block = f"\n— {item.get('time', '?')} —\n{item.get('text', '')}\n"
         if len(chunk) + len(block) > 3800:
-            send_telegram(chunk)
+            failed = send_telegram(chunk) is False or failed
             chunk = "🌙 (продолжение)\n"   # без него вторая часть шла без контекста
         chunk += block
     if chunk.strip():
-        send_telegram(chunk)
+        failed = send_telegram(chunk) is False or failed
+
+    if failed:
+        _queue_deferred(None, items=items)
+        print(f"[alerts] Сводка не ушла, {len(items)} уведомлений возвращены "
+              f"в очередь", flush=True)
 
 
 # ─── Состояние (JSON файлы) ──────────────────────────────────
@@ -1201,7 +1224,7 @@ def check_service_alert(server_name: str, service: dict):
 
 # Сколько часов помнить уже отправленную находку. Сканер долбится сутками,
 # и без памяти алерт уходил бы каждый час на одно и то же.
-IIS_KEEP_HOURS = _int_env("IIS_ALERT_KEEP_HOURS", 12)
+IIS_KEEP_HOURS = int_env("IIS_ALERT_KEEP_HOURS", 12)
 
 # Сколько находок показывать в сообщении: остальное — в карточке сервера.
 IIS_IN_MESSAGE = 5

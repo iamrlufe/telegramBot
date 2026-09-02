@@ -16,26 +16,17 @@ schedule_by_hour, делается не каждый день (например,
 путь остаются проблемой при любом расписании.
 """
 import json
-import os
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-
-ALMATY = ZoneInfo("Asia/Almaty")
-
-DEFAULT_SERVERS_FILE = "/app/config/servers.json"
+from settings import SERVERS_FILE, ALMATY, int_env
 
 
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
+DEFAULT_SERVERS_FILE = SERVERS_FILE
 
 
 # Насколько раньше дедлайна копия ещё считается «за эту неделю». Нужно,
 # потому что задание нередко отрабатывает накануне вечером или заканчивается
 # незадолго до срока: без допуска такая копия выглядела бы пропущенной.
-WEEKLY_GRACE_HOURS = _int_env("BACKUP_WEEKLY_GRACE_HOURS", 24)
+WEEKLY_GRACE_HOURS = int_env("BACKUP_WEEKLY_GRACE_HOURS", 24)
 
 # mon..sun -> datetime.weekday() (Пн=0 .. Вс=6), как и weekly_report() в bot.py
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]

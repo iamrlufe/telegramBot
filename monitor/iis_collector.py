@@ -11,7 +11,6 @@ monitor/iis_collector.py
 тот же принцип, что `dbsize` для MSSQL и `MSExchange*` для почты. Ничего
 дописывать в servers.json не требуется.
 """
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,17 +20,14 @@ from iis_store import (
     load_state, save_state, save_events, save_fact, cleanup, iis_findings,
 )
 from server_check import server_type
+from settings import int_env
 
 IIS_SERVICE = "w3svc"
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        print(f"[iis] Некорректный {name}={raw!r}, беру {default}", flush=True)
-        return default
+    """settings.int_env с префиксом этого модуля в логе о некорректном значении."""
+    return int_env(name, default, tag="iis")
 
 
 IIS_SCAN_MINUTES = _int_env("IIS_SCAN_MINUTES", 60)

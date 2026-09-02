@@ -2,7 +2,6 @@ import os
 import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import matplotlib
 matplotlib.use("Agg")
@@ -12,8 +11,8 @@ import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
 
 from pgconn import get_conn
+from settings import ALMATY
 
-ALMATY = ZoneInfo("Asia/Almaty")
 
 # ─── Палитра (dataviz reference, проверена scripts/validate_palette.js) ──
 SURFACE = "#fcfcfb"          # фон графика
