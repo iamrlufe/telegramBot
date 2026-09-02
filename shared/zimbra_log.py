@@ -3,11 +3,19 @@ shared/zimbra_log.py
 
 Почтовый сервер Zimbra: кто отправляет, кто заходит, что не доставлено.
 
-Два источника, и это не прихоть. В postfix-логе Zimbra **нет** записей об
-аутентификации: пользователи работают через mailboxd (веб, IMAP,
-ActiveSync), а postfix получает уже готовое письмо, поэтому `sasl_username=`
-там не встречается ни разу. Кто и откуда заходил, знает только
-`/opt/zimbra/log/audit.log` — там `account=`, `oip=` и причина отказа.
+Два источника, и это не прихоть. Про входы postfix-лог не знает почти
+ничего: люди работают через mailboxd (веб, IMAP, ActiveSync), а postfix
+получает уже готовое письмо, и `sasl_username=` встречается там
+редко — только когда почту сдают прямой SMTP-сессией. Кто и откуда заходил,
+знает `/opt/zimbra/log/audit.log` — там `account=`, `oip=` и причина отказа.
+
+Но редкость `sasl_username=` не делает его бесполезным: наоборот, его
+ОТСУТСТВИЕ — единственное, чем входящее письмо отличается от отправленного.
+Один и тот же smtpd принимает почту из интернета на 25-й порт и сдачу от
+пользователя на 587-й, строка `client=` у них одинаковая, а отправитель в
+конверте у входящего письма любой — свой домен подделывается свободно.
+Правило, которое смотрит только на адрес, объявляет угнанной учёткой каждое
+такое письмо.
 
 Счёт писем — по уникальным `message-id`, а не по строкам `from=`. Одно
 письмо проходит через амавис двумя очередями:
@@ -67,6 +75,12 @@ AUTH_FAIL_ALERT = _int_env("ZIMBRA_AUTH_FAIL_ALERT", 50)
 # Страна, из которой входы считаются штатными.
 HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
 
+# Писем с подделанным своим отправителем за сутки, после которых стоит
+# сказать вслух. Единичные приходят на любой сервер в интернете, и будить
+# из-за них незачем; десятки означают, что адресами домена уже пользуются
+# для фишинга по своим же сотрудникам.
+SPOOF_ALERT = _int_env("ZIMBRA_SPOOF_ALERT", 5)
+
 
 def _reader(path: str) -> str:
     """Читалка файла с повышением прав, только если оно нужно.
@@ -119,6 +133,11 @@ NR == FNR { p = index($0, "|"); day[substr($0, 1, p - 1)] = substr($0, p + 1); n
   if (index(prog, "/smtpd[") && index($0, ": client=")) {
     c = grab($0, "client=", "]"); b = index(c, "[")
     qip[qid] = (b > 0 ? substr(c, b + 1) : c)
+    # Без sasl_username это НЕ сдача письма, а приём его из интернета:
+    # smtpd обслуживает и 25-й порт, и 587-й, и в логе они неразличимы
+    # ничем другим. Отправитель в конверте при этом любой — подделать
+    # свой же домен ничто не мешает.
+    qauth[qid] = index($0, "sasl_username=") ? 1 : 0
   }
   else if (index(prog, "/pickup[") && index($0, "uid=")) qip[qid] = "local"
 
@@ -134,7 +153,7 @@ NR == FNR { p = index($0, "|"); day[substr($0, 1, p - 1)] = substr($0, p + 1); n
       f = grab($0, "from=<", ">"); if (f == "") f = "<>"
       n = grab($0, "nrcpt=", " ") + 0; if (n < 1) n = 1
       ip = qip[qid]; if (ip == "") ip = "local"
-      sent[f] += 1; rcpt[f] += n; origin[f "\t" ip] += 1
+      sent[f] += 1; rcpt[f] += n; origin[f "\t" ip "\t" (qauth[qid] + 0)] += 1
       msgs += 1; rcpts += n
     }
   }
@@ -304,7 +323,7 @@ def read_mail(server: dict, hours: int = 24) -> dict:
         "deferred": int(totals[2]), "bounced": int(totals[3]),
         "rejected": int(totals[4]),
         "senders": _senders(rows.get("S")),
-        "origins": _top(rows.get("X"), 2, limit=200),
+        "origins": _top(rows.get("X"), 3, limit=200),
         "defer_reasons": _top(rows.get("DF"), 1),
         "defer_to": _top(rows.get("DR"), 1),
         "bounce_to": _top(rows.get("BR"), 1),
@@ -434,13 +453,23 @@ def read_audit(server: dict, hours: int = 24) -> dict:
 WEB_ORIGINS = ("local", "127.0.0.1", "::1", "localhost")
 
 
-def origin_kind(ip: str) -> str:
-    """Откуда письмо попало в очередь: web | inside | outside.
+def origin_kind(ip: str, authed: bool = False) -> str:
+    """Откуда письмо попало в очередь: web | inside | outside | incoming.
 
     Разделение задано тем, как здесь работают: все пользователи пишут через
     веб, и только несколько учёток сдают почту напрямую — с внутренних
-    узлов. Отправка с белого адреса не описывается ни тем, ни другим, и
-    это единственный случай, который стоит тревоги.
+    узлов.
+
+    Белый адрес сам по себе ничего не значит, и это стоило ложных тревог.
+    Postfix обслуживает одним и тем же smtpd и сдачу письма пользователем
+    (587-й порт), и приём почты из интернета (25-й), а в логе строка
+    `client=` у них одинаковая. Отличает их только `sasl_username=`:
+    сессия без него — не отправка, а входящее письмо, и адрес отправителя
+    в конверте там любой, какой захотел приславший.
+
+    Поэтому по умолчанию `authed=False`: неаутентифицированная сессия с
+    белого адреса — это `incoming`, обычная входящая почта. Тревоги стоит
+    только `outside` — сдача письма снаружи по паролю.
     """
     from geoip import is_private
 
@@ -449,7 +478,7 @@ def origin_kind(ip: str) -> str:
         return "web"
     if is_private(address):
         return "inside"
-    return "outside"
+    return "outside" if authed else "incoming"
 
 
 def local_domain(address: str, domains) -> bool:
@@ -457,21 +486,78 @@ def local_domain(address: str, domains) -> bool:
     return at > 0 and address[at + 1:].lower() in {d.lower() for d in domains or []}
 
 
+def letters(count: int) -> str:
+    """«1 письмо», «2 письма», «5 писем».
+
+    Мелочь, но находка с «1 писем» читается как недоделка и подрывает
+    доверие к остальному тексту тревоги.
+    """
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} писем"
+    last = count % 10
+    if last == 1:
+        return f"{count} письмо"
+    if 2 <= last <= 4:
+        return f"{count} письма"
+    return f"{count} писем"
+
+
+def _origin_rows(origins):
+    """Строки происхождения в едином виде: (отправитель, адрес, вход был)."""
+    for key, count in origins or []:
+        sender, ip = key[0], key[1]
+        authed = len(key) > 2 and str(key[2]) == "1"
+        yield sender, ip, authed, count
+
+
 def outside_senders(origins, local_domains) -> list:
-    """Свои адреса, письма от которых пришли с белого IP.
+    """Свои адреса, письма от которых СДАНЫ с белого IP по паролю.
 
     Ради этого правила и разбирается происхождение письма: угнанную учётку
-    видно ровно так — почта от своего адреса, а сдана снаружи.
+    видно ровно так — почта от своего адреса, сдана снаружи, и сдана после
+    аутентификации.
+
+    Последнее условие появилось не сразу, и без него правило кричало на
+    обычный спам: письмо от подделанного своего адреса приходит из
+    интернета через тот же smtpd, и от настоящей отправки в логе оно
+    отличается только отсутствием `sasl_username=`. Такие письма теперь
+    считает spoofed_senders.
     """
     found = []
-    for (sender, ip), count in origins or []:
+    for sender, ip, authed, count in _origin_rows(origins):
         if not local_domain(sender, local_domains):
             continue
-        if origin_kind(ip) != "outside":
+        if origin_kind(ip, authed) != "outside":
             continue
         found.append({"sender": sender, "ip": ip, "count": count})
     found.sort(key=lambda i: -i["count"])
     return found
+
+
+def spoofed_senders(origins, local_domains) -> dict:
+    """Письма от своих адресов, пришедшие снаружи БЕЗ аутентификации.
+
+    Это не угнанные учётки, а подделка отправителя: кто угодно в интернете
+    может написать в конверте ваш адрес. Само по себе явление обычное, но
+    знать о нём стоит по двум причинам: письмо от «коллеги» убедительнее
+    любого другого фишинга, и сам факт, что такие письма доходят, означает
+    что SPF/DMARC их не отбраковывают.
+
+    Отдаётся одной сводкой, а не находкой на письмо: девять писем за сутки
+    от девяти учёток — это девять одинаковых тревог и ноль пользы.
+    """
+    senders, addresses, total = set(), set(), 0
+    for sender, ip, authed, count in _origin_rows(origins):
+        if not local_domain(sender, local_domains):
+            continue
+        if origin_kind(ip, authed) != "incoming":
+            continue
+        senders.add(sender)
+        addresses.add(ip)
+        total += count
+    return {"messages": total, "senders": sorted(senders),
+            "ips": sorted(addresses)}
 
 
 def foreign_logins(events, geo_codes, home: str = None) -> list:

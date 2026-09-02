@@ -25,8 +25,10 @@ from alerts import check_zimbra_alerts
 from geoip import resolve as geo_resolve
 from mail_store import save_snapshot
 from zimbra_log import (
-    QUEUE_ALERT, brute_force, foreign_logins, has_zimbra, heavy_senders,
-    outside_senders, read_audit, read_mail,
+    QUEUE_ALERT, SPOOF_ALERT, _origin_rows, brute_force, foreign_logins,
+    has_zimbra, heavy_senders, letters, outside_senders, read_audit,
+    read_mail,
+    spoofed_senders,
 )
 
 
@@ -99,11 +101,26 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
     for item in outside_senders(mail.get("origins"), mail.get("local_domains")):
         found.append((server_name, {
             "level": "crit",
-            "text": (f"🔴 {item['sender']}: {item['count']} писем сдано "
-                     f"с белого адреса {item['ip']}{place(item['ip'])}, "
-                     f"а не через веб"),
+            "text": (f"🔴 {item['sender']}: {letters(item['count'])} сдано "
+                     f"с белого адреса {item['ip']}{place(item['ip'])} "
+                     f"по паролю, а не через веб"),
             "hint": "отправка снаружи",
             "key": f"zm_outside:{server_name}:{item['sender']}:{item['ip']}",
+        }))
+
+    spoof = spoofed_senders(mail.get("origins"), mail.get("local_domains"))
+    if spoof["messages"] >= SPOOF_ALERT:
+        names = ", ".join(spoof["senders"][:5])
+        more = f" и ещё {len(spoof['senders']) - 5}" if len(spoof["senders"]) > 5 else ""
+        found.append((server_name, {
+            "level": "warn",
+            "text": (f"🟠 подделка отправителя: {letters(spoof['messages'])} "
+                     f"пришло снаружи от ваших адресов ({names}{more}) "
+                     f"с {len(spoof['ips'])} адресов, без входа в почту. "
+                     f"Учётки целы — SPF/DMARC такие письма не отбивают"),
+            "hint": "письма от своих адресов приходят снаружи",
+            # Ключ без чисел: иначе каждое новое письмо — новая находка.
+            "key": f"zm_spoof:{server_name}",
         }))
 
     for item in heavy_senders(mail.get("senders")):
@@ -243,7 +260,8 @@ def collect_server(server: dict) -> list:
         return []
 
     addresses = [e["ip"] for e in audit.get("events") or []]
-    addresses += [ip for (_s, ip), _c in mail.get("origins") or []]
+    addresses += [ip for _s, ip, _a, _c
+                  in _origin_rows(mail.get("origins"))]
     try:
         geo = geo_resolve(addresses)
     except Exception:

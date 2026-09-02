@@ -21,8 +21,10 @@ from geoip import resolve as geo_resolve, tag as geo_tag
 from refresh import load_server
 from tg_utils import safe_edit_message, paginate, nav_row
 from zimbra_log import (
-    HOME_COUNTRY, QUEUE_ALERT, brute_force, foreign_logins, has_zimbra,
-    heavy_senders, origin_kind, outside_senders, read_audit, read_mail,
+    HOME_COUNTRY, QUEUE_ALERT, _origin_rows, brute_force, foreign_logins,
+    has_zimbra, heavy_senders, letters, origin_kind, outside_senders,
+    read_audit,
+    read_mail,
 )
 
 ZM_TOKENS: "OrderedDict[str, tuple]" = OrderedDict()
@@ -115,6 +117,7 @@ def render(header: str, blocks: list, page: int = 0) -> tuple:
 # ─── Экраны ──────────────────────────────────────────────────
 
 ORIGIN_NAMES = {"web": "через веб", "inside": "напрямую изнутри",
+                "incoming": "входящие на этот адрес",
                 "outside": "🔴 снаружи"}
 
 
@@ -138,14 +141,15 @@ def format_send(data: dict, hours: int, geo: dict = None) -> tuple:
     for item in outside:
         blocks.append(
             f"🔴 {item['sender']} ← {item['ip']}{geo_tag(item['ip'], geo)}\n"
-            f"   {item['count']} писем сдано С БЕЛОГО АДРЕСА, а не через веб\n"
+            f"   {letters(item['count'])} сдано С БЕЛОГО АДРЕСА ПО ПАРОЛЮ\n"
             f"   так выглядит угнанная учётка: почта от своего адреса, "
-            f"а отправлена снаружи")
+            f"отправлена снаружи, и вход был")
 
     for item in senders:
         mark = "⚠️ " if item["sender"] in heavy else ""
         kinds = by_origin.get(item["sender"]) or set()
-        how = " · ".join(ORIGIN_NAMES[k] for k in ("web", "inside", "outside")
+        how = " · ".join(ORIGIN_NAMES[k]
+                         for k in ("web", "inside", "outside", "incoming")
                          if k in kinds)
         blocks.append(f"{mark}{item['messages']:>6}  {item['sender']}\n"
                       f"        {item['recipients']} получателей"
@@ -157,8 +161,8 @@ def _origins_by_sender(origins) -> dict:
     """Отправитель → как именно от него уходила почта. Учётка, которая
     обычно пишет через веб, а сегодня сдала пачку напрямую, видна сразу."""
     out = {}
-    for (sender, ip), _count in origins or []:
-        out.setdefault(sender, set()).add(origin_kind(ip))
+    for sender, ip, authed, _count in _origin_rows(origins):
+        out.setdefault(sender, set()).add(origin_kind(ip, authed))
     return out
 
 
@@ -264,7 +268,7 @@ def _addresses(section: str, data: dict) -> list:
     if section == "reject":
         return [parts[0] for parts, _ in data.get("reject_ips") or []]
     if section == "send":
-        return [ip for (_sender, ip), _ in data.get("origins") or []]
+        return [ip for _s, ip, _a, _c in _origin_rows(data.get("origins"))]
     return []
 
 

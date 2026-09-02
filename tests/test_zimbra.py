@@ -47,16 +47,20 @@ def test_origin_inside():
     assert zimbra_log.origin_kind("192.168.1.5") == "inside"
 
 
-def test_origin_outside():
-    assert zimbra_log.origin_kind("203.0.113.5") == "outside"
+def test_origin_outside_only_with_login():
+    """Белый адрес сам по себе ничего не значит. Сдача письма — это
+    аутентифицированная сессия; без неё та же строка client= означает
+    входящее письмо, а адрес отправителя в конверте у него любой."""
+    assert zimbra_log.origin_kind("203.0.113.5", authed=True) == "outside"
+    assert zimbra_log.origin_kind("203.0.113.5") == "incoming"
 
 
 def test_outside_sender_is_found():
-    """Почта от своего адреса, сданная снаружи, — так выглядит угнанная
-    учётка: изнутри все пишут через веб."""
-    origins = [(["buh@example.local", "203.0.113.5"], 40),
-               (["buh@example.local", "127.0.0.1"], 900),
-               (["scanner@example.local", "10.20.30.9"], 12)]
+    """Почта от своего адреса, сданная снаружи ПО ПАРОЛЮ, — так выглядит
+    угнанная учётка: изнутри все пишут через веб."""
+    origins = [(["buh@example.local", "203.0.113.5", "1"], 40),
+               (["buh@example.local", "127.0.0.1", "0"], 900),
+               (["scanner@example.local", "10.20.30.9", "0"], 12)]
     found = zimbra_log.outside_senders(origins, ["example.local"])
     assert len(found) == 1
     assert found[0]["sender"] == "buh@example.local"
@@ -65,8 +69,45 @@ def test_outside_sender_is_found():
 
 def test_foreign_sender_is_not_our_problem():
     """Чужой адрес с белого IP — это обычная входящая почта."""
-    origins = [(["someone@other.example", "203.0.113.5"], 100)]
+    origins = [(["someone@other.example", "203.0.113.5", "0"], 100)]
     assert zimbra_log.outside_senders(origins, ["example.local"]) == []
+
+
+def test_spoofed_sender_is_not_a_stolen_account():
+    """Регрессия на боевой ложной тревоге. Спам приходит из интернета с
+    подделанным адресом своей же организации: тот же smtpd, тот же
+    client=, отправитель свой — и правило объявляло девять учёток
+    угнанными за сутки. Отличает такое письмо отсутствие входа."""
+    origins = [(["buh@example.local", "203.0.113.5", "0"], 1)]
+
+    assert zimbra_log.outside_senders(origins, ["example.local"]) == []
+
+
+def test_letters_are_declined():
+    """«1 писем» в тревоге читается как недоделка."""
+    assert zimbra_log.letters(1) == "1 письмо"
+    assert zimbra_log.letters(3) == "3 письма"
+    assert zimbra_log.letters(9) == "9 писем"
+    assert zimbra_log.letters(11) == "11 писем"
+    assert zimbra_log.letters(21) == "21 письмо"
+    assert zimbra_log.letters(102) == "102 письма"
+
+
+def test_spoofing_is_still_reported_but_as_one_line():
+    """Молчать об этом тоже неправильно: письмо от «коллеги» убедительнее
+    любого фишинга, а раз оно дошло — SPF/DMARC его не отбили. Но это одна
+    сводка, а не находка на каждое письмо."""
+    origins = [(["buh@example.local", "203.0.113.5", "0"], 3),
+               (["hr@example.local", "198.51.100.9", "0"], 2),
+               (["buh@example.local", "203.0.113.9", "1"], 7),
+               (["buh@example.local", "127.0.0.1", "0"], 900),
+               (["someone@other.example", "203.0.113.5", "0"], 50)]
+
+    spoof = zimbra_log.spoofed_senders(origins, ["example.local"])
+
+    assert spoof["messages"] == 5
+    assert spoof["senders"] == ["buh@example.local", "hr@example.local"]
+    assert spoof["ips"] == ["198.51.100.9", "203.0.113.5"]
 
 
 # ─── Входы ───────────────────────────────────────────────────
@@ -209,7 +250,7 @@ def test_scripts_report_missing_rights_instead_of_zeroes():
 def test_findings_cover_three_reasons():
     from zimbra_collector import findings_for
 
-    mail = {"origins": [(["buh@example.local", "203.0.113.5"], 40)],
+    mail = {"origins": [(["buh@example.local", "203.0.113.5", "1"], 40)],
             "local_domains": ["example.local"], "senders": [], "queue": 3}
     audit = {"events": EVENTS}
     geo = {"203.0.113.5": "🇳🇱 Amsterdam", "198.51.100.7": "🇹🇷 Istanbul"}
@@ -233,7 +274,8 @@ def test_queue_finding_key_has_no_number():
 def test_healthy_server_gives_no_findings():
     from zimbra_collector import findings_for
 
-    mail = {"queue": 3, "origins": [(["buh@example.local", "127.0.0.1"], 900)],
+    mail = {"queue": 3,
+            "origins": [(["buh@example.local", "127.0.0.1", "0"], 900)],
             "local_domains": ["example.local"], "senders": []}
     audit = {"events": [EVENTS[2]]}
     assert findings_for("mail-01", mail, audit, {"10.20.30.5": ""}) == []
@@ -269,6 +311,9 @@ Sep  1 08:10:01 mail postfix/qmgr[24698]: AAAA1111: from=<buh@example.local>, si
 Sep  1 10:00:00 mail postfix/smtpd[30468]: CCCC3333: client=unknown[203.0.113.5]
 Sep  1 10:00:00 mail postfix/cleanup[31450]: CCCC3333: message-id=<m4@example.local>
 Sep  1 10:00:00 mail postfix/qmgr[24698]: CCCC3333: from=<buh@example.local>, size=100, nrcpt=50 (queue active)
+Sep  1 11:00:00 mail postfix/submission/smtpd[30470]: DDDD4444: client=host.example.net[203.0.113.9], sasl_method=PLAIN, sasl_username=buh@example.local
+Sep  1 11:00:00 mail postfix/cleanup[31450]: DDDD4444: message-id=<m5@example.local>
+Sep  1 11:00:00 mail postfix/qmgr[24698]: DDDD4444: from=<buh@example.local>, size=200, nrcpt=1 (queue active)
 Sep  1 07:03:08 mail postfix/lmtp[55201]: 41B53A0099: to=<full@example.local>, relay=mail.example.local[127.0.0.1]:7025, dsn=4.2.2, status=deferred (host mail.example.local[127.0.0.1] said: 452 4.2.2 Over quota (in reply to end of DATA command))
 Sep  1 06:33:53 mail postfix/smtpd[30468]: NOQUEUE: reject: RCPT from smtp.example.local[198.51.100.7]: 550 5.1.1 <nobody@example.local>: Recipient address rejected: mng.example.local; from=<x@example.local> to=<nobody@example.local> proto=ESMTP helo=<smtp.example.local>
 Aug 20 06:33:53 mail postfix/qmgr[24698]: OLD00001: from=<old@example.local>, size=1, nrcpt=1 (queue active)
@@ -315,11 +360,11 @@ def _mail_output() -> dict:
 
 
 def test_awk_counts_messages_not_log_lines():
-    """Ключевая проверка. В фикстуре три письма, но пять строк `from=`:
+    """Ключевая проверка. В фикстуре четыре письма, но шесть строк `from=`:
     амавис переинжектит первое письмо второй очередью с тем же message-id.
-    Наивный grep дал бы пять."""
+    Наивный grep дал бы шесть."""
     rows = _mail_output()
-    assert rows["T"][0][0] == "3"
+    assert rows["T"][0][0] == "4"
 
 
 def test_awk_ignores_lines_outside_the_window():
@@ -330,10 +375,20 @@ def test_awk_ignores_lines_outside_the_window():
 
 def test_awk_tells_web_from_outside():
     rows = _mail_output()
-    origins = {(row[0], row[1]) for row in rows["X"]}
-    assert ("buh@example.local", "127.0.0.1") in origins
-    assert ("buh@example.local", "203.0.113.5") in origins
-    assert ("root@example.local", "local") in origins
+    origins = {(row[0], row[1], row[2]) for row in rows["X"]}
+    assert ("buh@example.local", "127.0.0.1", "0") in origins
+    assert ("root@example.local", "local", "0") in origins
+
+
+def test_awk_marks_authenticated_submission():
+    """Признак входа — единственное, чем сдача письма снаружи отличается в
+    логе от входящего письма с подделанным отправителем. Оба адреса белые,
+    оба письма от своего адреса, строка client= у них одинаковая."""
+    rows = _mail_output()
+    origins = {(row[0], row[1], row[2]) for row in rows["X"]}
+
+    assert ("buh@example.local", "203.0.113.9", "1") in origins, "сдано по паролю"
+    assert ("buh@example.local", "203.0.113.5", "0") in origins, "входящее"
 
 
 def test_awk_extracts_over_quota_reason():
