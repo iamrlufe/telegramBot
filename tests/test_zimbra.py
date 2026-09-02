@@ -540,6 +540,32 @@ def test_reject_finding_appears_above_threshold():
     text = found[0][1]["text"]
     assert "140 писем" in text
     assert "Sender address rejected" in text
+    # Текст отказа у Postfix стандартный и одинаковый у карты антиспуфинга и
+    # у чёрного списка. Пока они неразличимы, объявлять находку подделкой
+    # нельзя: тревога обязана называть то, что известно, и оговаривать
+    # неоднозначность, а не выдавать догадку за факт.
+    assert text.startswith("🟠 отправитель запрещён:")
+    assert "чёрный список" in text
+    assert "подделка отправителя:" not in text
+
+
+def test_reject_mark_is_configurable(monkeypatch):
+    """Своё сообщение в карте (REJECT Текст) — единственный способ отделить
+    антиспуфинг от чёрного списка. Значит подстрока должна настраиваться."""
+    monkeypatch.setattr(zimbra_log, "SENDER_REJECT_MARK",
+                        "spoofed sender of local domain")
+    reasons = [
+        (["554 5.7.1 Sender address rejected: Spoofed sender of local domain"], 7),
+        (["554 5.7.1 Sender address rejected: Access denied"], 900),
+    ]
+
+    assert zimbra_log.sender_rejects(reasons)["messages"] == 7
+
+
+def test_reject_mark_default_counts_both_maps():
+    """Умолчание — текст Postfix по умолчанию, и он один на обе карты.
+    Это осознанный предел, а не ошибка счёта."""
+    assert zimbra_log.SENDER_REJECT_MARK == "sender address rejected"
 
 
 def test_reject_finding_key_has_no_number():

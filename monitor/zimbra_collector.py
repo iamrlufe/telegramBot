@@ -126,12 +126,13 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
         reason = rejects["reasons"][0]["reason"] if rejects["reasons"] else ""
         found.append((server_name, {
             "level": "warn",
-            "text": (f"🟠 подделка отправителя: {letters(rejects['messages'])} "
-                     f"отбито на входе — сервер не принял письма с вашим "
-                     f"доменом в конверте от чужих отправителей"
+            "text": (f"🟠 отправитель запрещён: {letters(rejects['messages'])} "
+                     f"отбито на входе — Postfix не принял их по адресу "
+                     f"отправителя. Это подделка вашего домена, чёрный список "
+                     f"или оба сразу: в логе у них один и тот же текст"
                      + (f". Причина отказа: {reason}" if reason else "")
-                     + ". Защита работает; знать стоит о самих попытках"),
-            "hint": "попытки подделки отбиваются",
+                     + ". Защита работает, знать стоит о самих попытках"),
+            "hint": "отказы по адресу отправителя",
             # Ключ без чисел: иначе каждая новая попытка — новая находка.
             "key": f"zm_sender_reject:{server_name}",
         }))
