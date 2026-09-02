@@ -60,14 +60,27 @@ XFF = "x-forwarded-for"
 
 # Сколько файлов имеет смысл передавать в скрипт. В окно попадают текущий
 # и вчерашний, третий — запас на почасовую ротацию.
+#
+# Все три влезают в командную строку WinRM впритык: скрипт разбора стоит у
+# самого потолка, и смещения режутся первыми. Потерянное смещение здесь
+# дороже, чем кажется: файл, который уже не самый свежий, не перечитывается,
+# а пропускается — после полуночи это молча теряет хвост вчерашнего лога.
+# Поэтому следующее, что появится в разборе, придётся уносить во второй
+# вызов (`_extra_script`), а не дописывать сюда. Запас стережёт
+# test_offsets_for_three_files_still_fit.
 STATE_FILES = 3
 
 
 def _trim_state(state: dict, keep: int = STATE_FILES) -> str:
     """Свежие смещения первыми: у файлов имена вида u_exГГММДД.log, поэтому
-    сортировка по имени — это сортировка по дате."""
+    сортировка по имени — это сортировка по дате.
+
+    Разделители без пробелов: скрипт стоит у самого потолка командной строки
+    WinRM, и смещения режутся первыми — каждый сэкономленный символ это плюс
+    один файл, чьё смещение доедет до сервера.
+    """
     items = sorted((state or {}).items())[-keep:] if keep else []
-    return json.dumps({k: int(v) for k, v in items})
+    return json.dumps({k: int(v) for k, v in items}, separators=(",", ":"))
 
 
 def _fit(build, state: dict) -> str:
@@ -90,43 +103,60 @@ def _script(state: dict, slow_ms: int, top: int) -> str:
 
 
 def _site_script(state_json: str, slow_ms: int, top: int) -> str:
+    """Разбор логов сайтов.
+
+    Про два списка путей, `$ap` и `$loc`. Публикации (`$ap`) — это только
+    приложения IIS: за ними считается трафик и по ним ловится подбор пароля
+    1С. Но «не приложение» ещё не значит «посторонний путь»: виртуальный
+    каталог и обычная папка в корне сайта приложениями не являются, а
+    содержимое по ним сервер отдаёт совершенно законно. Раньше такой путь
+    попадал в посторонние и первый же заход сотрудника давал находку
+    «сервер отдал» — красную, с требованием разобрать вручную.
+
+    Поэтому `$loc` — свои пути, которых нет среди публикаций: они не
+    считаются ни публикацией, ни сканированием. Обратная сторона: файл,
+    подброшенный в существующую папку сайта, находкой уже не станет —
+    находки остаются только для путей, которых на сервере нет вовсе.
+    """
     return PS_OUT_B64_HELPER + f"""
 $ErrorActionPreference='SilentlyContinue'
 Import-Module WebAdministration
 function M($l){{$n=($l -replace '^#Fields:\\s*','') -split ' ';$h=@{{}};for($i=0;$i -lt $n.Count;$i++){{$h[$n[$i]]=$i}};$h}}
-$ap=@(Get-WebApplication|%{{$_.path.Trim('/').ToLower()}})
+function X($p){{[Environment]::ExpandEnvironmentVariables([string]$p)}}
+$ap=@(Get-WebApplication|%{{$_.path.Trim('/')}})
+$loc=@(Get-WebVirtualDirectory|%{{$_.path.Trim('/')}})
 $st=@{{}}
 (ConvertFrom-Json '{state_json}').PSObject.Properties|%{{$st[$_.Name]=[int64]$_.Value}}
 $au=@{{}};$pb=@{{}};$al=@{{}};$hit=@{{}};$lg=@{{}};$ips=@{{}};$e5=@{{}};$sl=@{{}};$hr=@{{}}
-$tot=0;$alt=0;$slt=0;$ns=@{{}};$dirs=@()
-foreach($s in Get-ChildItem IIS:\\Sites){{
-$b=[Environment]::ExpandEnvironmentVariables($s.logFile.directory)
-$d=Join-Path $b ('W3SVC'+$s.id)
-if(Test-Path $d){{$dirs+=$d}}}}
+$tot=$alt=$slt=0;$ns=@{{}};$dirs=@()
+foreach($s in gci IIS:\\Sites){{
+$d=Join-Path (X $s.logFile.directory) ('W3SVC'+$s.id)
+if(Test-Path $d){{$dirs+=$d}}
+$loc+=@(gci (X $s.physicalPath) -Directory -Name)}}
 foreach($dir in $dirs){{
-$fl=@(Get-ChildItem $dir -Filter u_ex*.log|?{{$_.LastWriteTime -gt (Get-Date).AddHours(-{WINDOW_HOURS})}}|Sort-Object LastWriteTime)
+$fl=@(gci $dir u_ex*.log|?{{$_.LastWriteTime -gt (Get-Date).AddHours(-{WINDOW_HOURS})}}|sort LastWriteTime)
 for($j=0;$j -lt $fl.Count;$j++){{
 $f=$fl[$j];$k=$f.Name;$off=$st[$k]
-if($null -eq $off){{if($j -eq $fl.Count-1){{$off=0}}else{{$off=$f.Length}}}}
+if($null -eq $off){{$off=$f.Length;if($j -eq $fl.Count-1){{$off=0}}}}
 if($off -gt $f.Length){{$off=0}}
-$fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader($fs)
+$fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader $fs
 $map=@{{}}
-while($map.Count -eq 0 -and ($l=$sr.ReadLine()) -ne $null){{
+while(!$map.Count -and ($l=$sr.ReadLine()) -ne $null){{
 if($l.StartsWith('#Fields:')){{$map=M $l}}}}
-if($map.Count -eq 0){{$sr.Close();$fs.Close();continue}}
+if(!$map.Count){{$sr.Close();$fs.Close();continue}}
 if($off -gt 0){{$fs.Position=$off;$sr.DiscardBufferedData()}}
 while(($l=$sr.ReadLine()) -ne $null){{
 if($l.StartsWith('#')){{if($l.StartsWith('#Fields:')){{$map=M $l}};continue}}
 $p=$l -split ' ';$tot++
 $s2=$p[$map['sc-status']];$c=$p[$map['c-ip']];$u=$p[$map['cs-uri-stem']];$a=$p[$map['cs(User-Agent)']]
-if($map.ContainsKey('{XFF}')){{$x=$p[$map['{XFF}']];if($x -and $x -ne '-'){{$c=($x -split ',')[0].Trim()}}}}
+$xi=$map['{XFF}'];if($null -ne $xi){{$x=$p[$xi];if($x -and $x -ne '-'){{$c=($x -split ',')[0].Trim()}}}}
 $ips[$c]=1+$ips[$c]
-$hr[$p[$map['time']].Substring(0,2)]=1+$hr[$p[$map['time']].Substring(0,2)]
+$q=$p[$map['time']].Substring(0,2);$hr[$q]=1+$hr[$q]
 $g=($u -split '/')[1];if($g){{$g=$g.ToLower()}}
 if($g -and $ap -contains $g){{
 $pb[$g]=1+$pb[$g]
 if($u -like '*/e1cib/login' -and $s2 -eq '402'){{$lg[$g+'|'+$c]=1+$lg[$g+'|'+$c]}}
-}}else{{
+}}elseif(!($g -and $loc -contains $g)){{
 $alt++;$al[$c+'|'+$a]=1+$al[$c+'|'+$a]
 $au[$u]=1+$au[$u]
 if($s2 -eq '200' -and $u -ne '/' -and $u -notmatch '{INNOCENT}'){{
@@ -136,7 +166,7 @@ $t=0;[void][int]::TryParse($p[$map['time-taken']],[ref]$t)
 if($t -gt {slow_ms} -and $u -notmatch '{LONG_POLL}'){{$slt++;$sl[$u+'|'+$c]=1+$sl[$u+'|'+$c]}}
 }}
 $ns[$k]=$fs.Position;$sr.Close();$fs.Close()}}}}
-function T($h){{@($h.GetEnumerator()|Sort-Object Value -Descending|Select-Object -First {top}|%{{@{{k=$_.Key;n=$_.Value}}}})}}
+function T($h){{@($h.GetEnumerator()|sort Value -Descending|select -First {top}|%{{@{{k=$_.Key;n=$_.Value}}}})}}
 Out-B64 @{{total=$tot;alien=$alt;slow=$slt;uniq=$ips.Count;state=$ns;
 alienuris=(T $au);pubs=(T $pb);scan=(T $al);hits=(T $hit);logins=(T $lg);
 ips=(T $ips);errors=(T $e5);slows=(T $sl);hours=(T $hr)}}
@@ -224,13 +254,13 @@ $rs=@{{}};$dt=@{{}};$ns=@{{}};$tot=0
 $fl=@(Get-ChildItem '{HTTPERR_DIR}' -Filter *.log|?{{$_.LastWriteTime -gt (Get-Date).AddHours(-{WINDOW_HOURS})}}|Sort-Object LastWriteTime)
 for($j=0;$j -lt $fl.Count;$j++){{
 $f=$fl[$j];$k=$f.Name;$off=$st[$k]
-if($null -eq $off){{if($j -eq $fl.Count-1){{$off=0}}else{{$off=$f.Length}}}}
+if($null -eq $off){{$off=$f.Length;if($j -eq $fl.Count-1){{$off=0}}}}
 if($off -gt $f.Length){{$off=0}}
-$fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader($fs)
+$fs=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite');$sr=New-Object IO.StreamReader $fs
 $map=@{{}}
-while($map.Count -eq 0 -and ($l=$sr.ReadLine()) -ne $null){{
+while(!$map.Count -and ($l=$sr.ReadLine()) -ne $null){{
 if($l.StartsWith('#Fields:')){{$map=M $l}}}}
-if($map.Count -eq 0){{$sr.Close();$fs.Close();continue}}
+if(!$map.Count){{$sr.Close();$fs.Close();continue}}
 if($off -gt 0){{$fs.Position=$off;$sr.DiscardBufferedData()}}
 while(($l=$sr.ReadLine()) -ne $null){{
 if($l.StartsWith('#')){{if($l.StartsWith('#Fields:')){{$map=M $l}};continue}}

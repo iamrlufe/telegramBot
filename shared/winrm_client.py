@@ -11,8 +11,7 @@ import winrm
 # Base64 — чистый ASCII, транспорт его не искажает.
 PS_OUT_B64_HELPER = r"""
 function Out-B64($obj) {
-    $json = ($obj | ConvertTo-Json -Depth 4 -Compress)
-    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 4 -Compress)))
 }
 """
 
