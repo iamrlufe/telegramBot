@@ -237,6 +237,20 @@ CREATE TABLE IF NOT EXISTS iis_facts (
     PRIMARY KEY (server_name, fact)
 );
 
+-- Почтовая сводка Zimbra и Exchange (вкладка 📮 Почта в дашборде).
+-- Снимок, а не история: сборщик каждый раз читает сутки целиком, и хранить
+-- проходы незачем. Форма сводки общая для обеих почт — плитки, списки,
+-- тревоги, — поэтому лежит одним JSON, а не разложена по колонкам: у
+-- Zimbra и Exchange общих полей почти нет.
+CREATE TABLE IF NOT EXISTS mail_snapshots (
+    server_name  TEXT NOT NULL,
+    kind         TEXT NOT NULL,      -- zimbra | exchange
+    payload      TEXT,               -- {kpis: [...], groups: [...], alarms: [...]}
+    error        TEXT,               -- чем кончился последний сбор
+    collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (server_name, kind)
+);
+
 -- Заблокированные адреса (раздел 🛡 Блокировка IP). Источник истины —
 -- здесь, а не на сервере: правило Windows Firewall не хранит ни срока, ни
 -- причины, ни автора, а пересозданный сервер теряет список целиком.

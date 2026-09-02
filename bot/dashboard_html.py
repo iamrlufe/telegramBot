@@ -31,6 +31,7 @@ from db import (
 )
 from ping_tools import load_targets
 from log_store import read_snapshot
+from mail_store import read_snapshots as read_mail_snapshots, KIND_LABELS
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
 from geoip import resolve as geo_resolve
 from iis_log import parse_hit, detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
@@ -195,6 +196,7 @@ def collect_dashboard_data(hours: int = 24) -> dict:
         "logs": logs,
         "backups": collect_backups(),
         "iis": collect_iis(),
+        "mail": collect_mail(),
         "hours": hours,
         "generated_at": datetime.now(ALMATY).strftime("%d.%m.%Y %H:%M"),
     }
@@ -380,6 +382,59 @@ def collect_logs() -> dict:
                            -g["total"], g["server"].lower())
         )
     return result
+
+
+# ─── Почта: Zimbra и Exchange ────────────────────────────────
+
+# Насколько старой должна быть сводка, чтобы это стоило подписать. Zimbra
+# собирается раз в полчаса, Exchange — раз в час, поэтому «два часа» это
+# ещё норма, а больше — уже повод спросить, жив ли сборщик.
+MAIL_STALE_MINUTES = 150
+
+MAIL_LEVELS = {"crit": STATUS_CRIT, "warn": STATUS_WARN, "ok": STATUS_GOOD}
+
+
+def collect_mail() -> list:
+    """Готовая сводка почты из базы: пишут zimbra_collector и
+    exchange_collector, здесь она только читается.
+
+    Живьём журналы не разбираются: awk по суточному mail.log Zimbra и
+    проход по логам IIS Exchange — это минуты на каждый сервер, а дашборд
+    собирается за секунды и рассылается по расписанию.
+
+    Zimbra и Exchange лежат в одной форме (kpis, groups, alarms) и рисуются
+    одним кодом. Что именно значит строка, решил сборщик — здесь только
+    вёрстка, иначе третья почтовая система означала бы третью ветку.
+    """
+    try:
+        rows = read_mail_snapshots()
+    except Exception as e:
+        print(f"[dashboard] Сводка почты недоступна: {e}", flush=True)
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    servers = []
+    for row in rows:
+        summary = row.get("summary") or {}
+        collected = row.get("collected_at")
+        age_min = None
+        if collected:
+            if collected.tzinfo is None:
+                collected = collected.replace(tzinfo=timezone.utc)
+            age_min = (now_utc - collected).total_seconds() / 60
+        servers.append({
+            "name": row["server"],
+            "kind": row["kind"],
+            "kind_label": KIND_LABELS.get(row["kind"], row["kind"]),
+            "kpis": summary.get("kpis") or [],
+            "groups": summary.get("groups") or [],
+            "alarms": summary.get("alarms") or [],
+            "error": row.get("error") or "",
+            "age_min": age_min,
+        })
+
+    servers.sort(key=lambda s: (0 if s["alarms"] else 1, s["name"].lower()))
+    return servers
 
 
 BACKUP_STATES = {
@@ -823,6 +878,10 @@ footer{margin-top:18px;text-align:center;font-size:11.5px;line-height:1.6;color:
 /* ─── Вкладка IIS ────────────────────────────────────────────── */
 #v-iis:checked~.wrap label[for="v-iis"]{color:var(--ink);font-weight:600;border-bottom-color:var(--ink)}
 #v-iis:checked~.wrap .pane-iis{display:block}
+/* Почта: та же вёрстка, что у IIS, — плитки, переключатель серверов,
+   разворачивающиеся карточки. Отдельные правила нужны только вкладке. */
+#v-mail:checked~.wrap label[for="v-mail"]{color:var(--ink);font-weight:600;border-bottom-color:var(--ink)}
+#v-mail:checked~.wrap .pane-mail{display:block}
 .srvchips{display:flex;gap:7px;margin-bottom:12px;overflow-x:auto;padding-bottom:2px}
 .srvchips label{flex:none;white-space:nowrap;cursor:pointer;font-size:13px;padding:7px 12px;
   border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:999px;
@@ -1318,6 +1377,96 @@ def _iis_pane(servers: list) -> tuple:
                     + "".join(boxes) + '</div>')
 
 
+def _mail_server(server: dict) -> str:
+    """Разделы одного почтового сервера. Порядок задал сборщик: первым идёт
+    то, ради чего сюда заходят, — отказы входа."""
+    cards = []
+    for group in server["groups"]:
+        rows = group.get("rows") or []
+        if not rows:
+            continue
+        color = MAIL_LEVELS.get(group.get("level"), STATUS_GOOD)
+        # Цвет карточки — по худшей строке, а не по замыслу раздела: список
+        # «пароль не подошёл» с подбором внутри обязан быть красным.
+        if any(r.get("level") == "crit" for r in rows):
+            color = STATUS_CRIT
+        body = "".join(
+            _lrow(MAIL_LEVELS.get(r.get("level"), STATUS_GOOD),
+                  html.escape(str(r.get("left") or "")),
+                  html.escape(str(r.get("title") or "")),
+                  html.escape(str(r.get("detail") or "")))
+            for r in rows
+        )
+        cards.append(_iis_card(color, html.escape(group.get("title") or ""),
+                               f"строк: {len(rows)}", body=body,
+                               open_=color == STATUS_CRIT))
+
+    if not cards:
+        return ('<div class="empty" style="display:block">За сутки записей нет. '
+                'Пусто и в журнале входов — повод проверить, что сборщик '
+                'дотягивается до сервера.</div>')
+    return "".join(cards)
+
+
+def _mail_pane(servers: list) -> tuple:
+    """Возвращает (переключатели, панель) — тот же приём, что у IIS: radio
+    обязаны стоять до .wrap, иначе селектор «~» до карточек не достанет."""
+    if not servers:
+        return "", ('<div class="pane pane-mail"><div class="empty" style="display:block">'
+                    'Сводка почты ещё не собрана. Монитор читает журналы Zimbra раз '
+                    'в полчаса, Exchange — раз в час; загляните после следующего '
+                    'цикла.</div></div>')
+
+    radios = "".join(
+        f'<input class="switch" type="radio" name="m" id="m-{i}"'
+        f'{" checked" if i == 0 else ""}>'
+        for i in range(len(servers))
+    )
+    chips = ""
+    if len(servers) > 1:
+        chips = '<div class="srvchips">' + "".join(
+            f'<label for="m-{i}"><i style="--c:'
+            f'{STATUS_CRIT if s["alarms"] else STATUS_GOOD}"></i>'
+            f'{html.escape(s["name"].split(".")[0])}</label>'
+            for i, s in enumerate(servers)
+        ) + '</div>'
+        rules = "<style>" + "".join(
+            f'#m-{i}:checked~.wrap label[for="m-{i}"]{{background:var(--ink);'
+            f'color:var(--surface);border-color:var(--ink)}}'
+            f'#m-{i}:checked~.wrap .mail-{i}{{display:block}}'
+            for i in range(len(servers))
+        ) + "</style>"
+    else:
+        rules = "<style>.mail-0{display:block}</style>"
+
+    boxes = []
+    for i, server in enumerate(servers):
+        tiles = "".join(
+            f'<div class="kpi" style="--c:'
+            f'{MAIL_LEVELS.get(k.get("level"), STATUS_GOOD)}">'
+            f'<b>{html.escape(str(k.get("value")))}</b>'
+            f'<span>{html.escape(str(k.get("label") or ""))}</span></div>'
+            for k in server["kpis"]
+        )
+        note = f'{html.escape(server["name"])} · {server["kind_label"]} · сводка за сутки'
+        age = server.get("age_min")
+        if age is not None and age > MAIL_STALE_MINUTES:
+            note += f' · собрана {_age_text(age)} назад'
+        if server["error"]:
+            note += f' · ⚠️ {html.escape(server["error"])}'
+        alarms = "".join(
+            _lrow(STATUS_CRIT, "!", html.escape(text)) for text in server["alarms"])
+        if alarms:
+            alarms = f'<div class="rows">{alarms}</div>'
+        boxes.append(
+            f'<div class="iisbox mail-{i}"><div class="kpis">{tiles}</div>'
+            f'<div class="hint">{note}</div>{alarms}{_mail_server(server)}</div>'
+        )
+
+    return radios, ('<div class="pane pane-mail">' + rules + chips
+                    + "".join(boxes) + '</div>')
+
+
 def render_dashboard(data: dict) -> str:
     """Данные → готовый HTML. Отдельно от базы, чтобы тесты проверяли разметку
     без Postgres.
@@ -1382,10 +1531,13 @@ def render_dashboard(data: dict) -> str:
     backups = data.get("backups") or {"servers": [], "totals": {}, "size_gb": 0}
     iis = data.get("iis") or []
     iis_radios, iis_html = _iis_pane(iis)
+    mail = data.get("mail") or []
+    mail_radios, mail_html = _mail_pane(mail)
     win_hot = sum(1 for g in logs["win"] if g["level"] == "crit")
     sql_hot = sum(1 for g in logs["sql"] if g["level"] == "crit")
     bak_hot = backups.get("totals", {}).get("crit", 0)
     iis_hot = sum(1 for s in iis if s["alarms"])
+    mail_hot = sum(1 for s in mail if s["alarms"])
 
     tabs = [
         ("srv", "Серверы", 0, STATUS_CRIT),
@@ -1395,11 +1547,15 @@ def render_dashboard(data: dict) -> str:
     ]
     if iis:
         tabs.append(("iis", "IIS", iis_hot, STATUS_CRIT))
+    # Вкладка только там, где почта есть: на инфраструктуре без Zimbra и
+    # Exchange пустой раздел — лишний вопрос «а почему тут ничего нет».
+    if mail:
+        tabs.append(("mail", "Почта", mail_hot, STATUS_CRIT))
     radios += "".join(
         f'<input class="switch" type="radio" name="v" id="v-{key}"'
         f'{" checked" if key == "srv" else ""}>'
         for key, _label, _count, _color in tabs
-    ) + iis_radios
+    ) + iis_radios + mail_radios
     tabs_html = "".join(
         f'<label for="v-{key}">{label}'
         + (f'<span class="badge" style="--bg:{color}">{count}</span>' if count else "")
@@ -1430,6 +1586,7 @@ def render_dashboard(data: dict) -> str:
                      "и движка, упавшие джобы Agent.")
         + _backups_pane(backups)
         + iis_html
+        + (mail_html if mail else "")
         + '<footer>AgentMonitor · автономный HTML-отчёт, работает без сети<br>'
         'данные на момент формирования — обновить можно командой /dashboard</footer>'
         '</div></body></html>'

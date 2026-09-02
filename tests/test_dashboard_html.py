@@ -532,3 +532,98 @@ def test_daily_backup_says_nothing_about_schedule():
         [_backup_item("warn", path="F:\\backup\\daily", age_h=26.0)])])
 
     assert "недельная копия" not in page
+
+
+# ─── Вкладка «Почта»: Zimbra и Exchange ──────────────────────
+
+def _mail(name="mail-01.example.local", kind="zimbra", **over):
+    server = {
+        "name": name, "kind": kind,
+        "kind_label": "Zimbra" if kind == "zimbra" else "Exchange",
+        "kpis": [{"value": 5338, "label": "писем за сутки", "level": "ok"},
+                 {"value": 12, "label": "в очереди", "level": "ok"}],
+        "groups": [{"title": "Кто отправляет", "level": "ok", "rows": [
+            {"level": "ok", "left": "40", "title": "buh@example.local",
+             "detail": "на 12 адресов"}]}],
+        "alarms": [], "error": "", "age_min": 20.0,
+    }
+    server.update(over)
+    return server
+
+
+def _with_mail(servers):
+    data = _data([_server("a.example.local")])
+    data["logs"] = {"win": [], "sql": []}
+    data["backups"] = {"servers": [], "totals": {}, "size_gb": 0}
+    data["iis"] = []
+    data["mail"] = servers
+    return dh.render_dashboard(data)
+
+
+def test_mail_tab_appears_only_with_data():
+    """На инфраструктуре без почтовых серверов вкладка — лишний вопрос
+    «а почему тут ничего нет»."""
+    assert 'id="v-mail"' not in _with_mail([])
+    assert 'id="v-mail"' in _with_mail([_mail()])
+
+
+def test_both_mail_systems_share_one_pane():
+    """Zimbra и Exchange рисуются одним кодом: знание о том, что значит
+    строка, осталось в сборщике."""
+    page = _with_mail([_mail(), _mail("ex-01.example.local", "exchange")])
+
+    assert "Zimbra" in page and "Exchange" in page
+    assert '<div class="srvchips">' in page
+    assert "#m-1:checked~.wrap .mail-1{display:block}" in page
+    assert "<script" not in page
+
+
+def test_mail_alarm_counts_in_the_tab_badge():
+    """Число у вкладки означает происшествие, а не просто наличие почты."""
+    def tab(page):
+        # Последнее вхождение: то же имя встречается в правилах CSS.
+        return page.rsplit('for="v-mail"', 1)[1].split("</label>")[0]
+
+    quiet = _with_mail([_mail()])
+    hot = _with_mail([_mail(alarms=["подбор пароля с 203.0.113.5"])])
+
+    assert "badge" not in tab(quiet)
+    assert ">1</span>" in tab(hot)
+    assert "подбор пароля с 203.0.113.5" in hot
+
+
+def test_red_rows_open_the_card_by_default():
+    """Ради отказов входа отчёт и открывают — прятать их за тап нельзя."""
+    page = _with_mail([_mail(groups=[{"title": "Пароль не подошёл", "level": "warn",
+                                      "rows": [{"level": "crit", "left": "240",
+                                                "title": "admin ← 203.0.113.5",
+                                                "detail": "неверный пароль"}]}])])
+
+    assert '<details class="logcard" open>' in page
+    assert "admin ← 203.0.113.5" in page
+
+
+def test_stale_mail_summary_is_signed():
+    """«Данные от вчера» полезнее пустого экрана, но обязаны быть подписаны."""
+    fresh = _with_mail([_mail(age_min=20.0)])
+    old = _with_mail([_mail(age_min=60 * 9)])
+
+    assert "назад" not in fresh.split('class="hint"')[1][:200]
+    assert "собрана 9 ч назад" in old
+
+
+def test_failed_collection_is_named():
+    """«В почте тихо» и «до сервера не достучались» не должны выглядеть
+    одинаково."""
+    page = _with_mail([_mail(error="audit.log — Permission denied")])
+
+    assert "audit.log — Permission denied" in page
+
+
+def test_mail_text_is_escaped():
+    page = _with_mail([_mail(groups=[{"title": "Кто заходил", "level": "ok", "rows": [
+        {"level": "ok", "left": "1", "title": "<script>alert(1)</script>",
+         "detail": ""}]}])])
+
+    assert "<script>alert(1)" not in page
+    assert "&lt;script&gt;" in page

@@ -319,3 +319,67 @@ def test_complete_read_says_nothing_extra():
     header, _blocks = exchange_bot.format_owa(data, 24)
 
     assert "не удалось" not in header.lower()
+
+
+# ─── Сводка для дашборда ─────────────────────────────────────
+
+def _ex_summary(**over):
+    from exchange_collector import summary_for
+
+    owa = {"scanned": 18422, "rows": [
+        {"user": "buh", "ip": "10.20.30.5", "count": 900,
+         "last": "2026-09-01 09:00:00"},
+        {"user": "buh", "ip": "203.0.113.5", "count": 12,
+         "last": "2026-09-01 03:00:00"}]}
+    eas = {"rows": [{"user": "buh", "ua": "Apple-iPhone14C1/2000.1", "count": 420}]}
+    failures = [{"user": "admin", "ip": "203.0.113.5", "count": 240,
+                 "code": "0xC000006A", "reason": "неверный пароль",
+                 "last": "2026-09-01 04:00:00"}]
+    owa.update(over.pop("owa", {}))
+    return summary_for(owa, over.pop("eas", eas), over.pop("failures", failures),
+                       over.pop("geo", {}))
+
+
+def test_summary_shape_matches_zimbra():
+    """Обе почты приезжают в дашборд в одной форме — иначе вторая почтовая
+    система означала бы вторую ветку в отрисовке."""
+    summary = _ex_summary()
+
+    assert {"kpis", "groups", "alarms"} == set(summary)
+    assert all({"value", "label", "level"} <= set(k) for k in summary["kpis"])
+    for group in summary["groups"]:
+        assert {"title", "level", "rows"} <= set(group)
+        assert all({"level", "left", "title"} <= set(r) for r in group["rows"])
+
+
+def test_users_counted_not_log_rows():
+    """Один пользователь с двух адресов — это один пользователь. Строк в
+    логе IIS у него десятки тысяч, и считать их как людей нельзя."""
+    summary = _ex_summary()
+
+    assert [k["value"] for k in summary["kpis"] if k["label"] == "пользователей"] == [1]
+
+
+def test_persistent_failures_raise_an_alarm():
+    """Человек ошибается паролем несколько раз и идёт к администратору.
+    240 попыток с одного адреса — это не забытый пароль."""
+    hot = _ex_summary()
+    calm = _ex_summary(failures=[{"user": "buh", "ip": "10.20.30.5", "count": 3,
+                                  "code": "0xC000006A", "reason": "неверный пароль"}])
+
+    assert hot["alarms"] == ["подбор пароля с 203.0.113.5"]
+    assert calm["alarms"] == []
+    assert [k["level"] for k in hot["kpis"] if k["label"] == "неверных паролей"] == ["crit"]
+    assert [k["level"] for k in calm["kpis"] if k["label"] == "неверных паролей"] == ["warn"]
+
+
+def test_failures_go_first():
+    """Порядок разделов задан вопросом, ради которого сюда заходят."""
+    assert _ex_summary()["groups"][0]["title"] == "Пароль не подошёл"
+
+
+def test_quiet_server_gives_no_alarms_and_no_empty_groups():
+    summary = _ex_summary(failures=[], eas={"rows": []})
+
+    assert summary["alarms"] == []
+    assert [g["title"] for g in summary["groups"]] == ["Кто работает в OWA"]
