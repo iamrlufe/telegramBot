@@ -194,26 +194,86 @@ def test_local_paths_are_not_publications():
     про открытую наружу точку входа, и от папок она бы зашумилась."""
     compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
 
-    pubs = compact.index("$pb[$g]=1+$pb[$g]")
+    pubs = compact.index("A $pb $g")
     local = compact.index("$loc -contains $g")
 
     assert pubs < local, "$pb заполняется только из $ap, до проверки $loc"
 
 
+def _worst_case_state():
+    """Худшее, что вообще может приехать в скрипт: STATE_FILES файлов с
+    пользовательскими полями (имя `u_exГГММДД_x.log` длиннее обычного на
+    `_x`) и смещение в 12 цифр. Двенадцать цифр — это лог на сотню
+    гигабайт: втрое больше всей истории, которая в этом проекте
+    встречалась, и вчетверо больше суточного файла живой публикации 1С.
+    Влезает этот случай — влезает любой настоящий."""
+    return {f"u_ex2609{i:02d}_x.log": 999999999999
+            for i in range(iis_log.STATE_FILES)}
+
+
 def test_offsets_for_three_files_still_fit():
-    """Скрипт у самого потолка командной строки WinRM. Смещения режутся
-    первыми, а потерянное смещение НЕ перечитывается: файл, который уже не
-    самый свежий, просто пропускается — после полуночи это молча теряет
-    хвост вчерашнего лога. Столько файлов, сколько обещает STATE_FILES,
-    обязано влезать."""
+    """Потерянное смещение НЕ перечитывается: файл, который уже не самый
+    свежий, просто пропускается — после полуночи это молча теряет хвост
+    вчерашнего лога. Столько файлов, сколько обещает STATE_FILES, обязано
+    доезжать до сервера, и на обоих вариантах имени."""
     for tag in (".log", "_x.log"):
-        state = {f"u_ex2609{i:02d}{tag}": 123456789
+        state = {f"u_ex2609{i:02d}{tag}": 999999999999
                  for i in range(iis_log.STATE_FILES)}
-        script = iis_log._site_script(iis_log._trim_state(state), 10000, 25)
+        script = iis_log._script(state, 10000, 25)
 
         assert winrm_client.ps_fits(script), tag
         for name in state:
-            assert name in script
+            assert name in script, f"смещение {name} не доехало"
+
+
+def test_script_keeps_reserve():
+    """Сторож запаса. Дописать строку в скрипт разбора легко и незаметно, а
+    расплачивается за неё не тот, кто дописал: смещения режутся первыми и
+    молча, и сводка теряет часть суток на бою.
+
+    Поэтому запас проверяется здесь. Если тест упал — место под новую
+    строку не выкраивать, а уносить работу во второй вызов, как сделано с
+    HTTPERR (`_extra_script`)."""
+    script = iis_log._site_script(
+        iis_log._trim_state(_worst_case_state()), 10000, 25)
+    free = winrm_client.MAX_PS_COMMAND_CHARS - winrm_client.ps_encoded_length(script)
+
+    assert free >= iis_log.SCRIPT_RESERVE, (
+        f"свободно {free} символов из обещанных {iis_log.SCRIPT_RESERVE}: "
+        f"скрипт разбора вырос и начнёт молча резать смещения"
+    )
+
+
+def test_dropped_offsets_are_not_silent(capsys):
+    """Если запас всё-таки проели, это обязано быть видно в логах: молча
+    потерянный хвост лога не отличить от тихого дня на сервере."""
+    state = _worst_case_state()
+
+    # Скрипт-пустышка ровно такой длины, чтобы влезать самому, но не
+    # оставлять места ни одному смещению: именно так выглядит проеденный
+    # запас, только на бою скрипт будет настоящим.
+    def build(pad):
+        return lambda state_json: "$x='" + "y" * pad + "'\n" + state_json
+
+    empty, one = iis_log._trim_state(state, 0), iis_log._trim_state(state, 1)
+    pad = 1
+    while not (winrm_client.ps_fits(build(pad)(empty))
+               and not winrm_client.ps_fits(build(pad)(one))):
+        pad += 1
+
+    iis_log._fit(build(pad), state)
+
+    out = capsys.readouterr().out
+    assert "[iis]" in out
+    for name in state:
+        assert name in out, f"в логе не назван потерянный {name}"
+
+
+def test_fitting_script_says_nothing(capsys):
+    """Обратная сторона: пока всё влезает, шуметь не о чем."""
+    iis_log._script(_worst_case_state(), 10000, 25)
+
+    assert capsys.readouterr().out == ""
 
 
 def test_only_served_content_counts_as_a_finding():

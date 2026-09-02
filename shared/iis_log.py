@@ -60,24 +60,30 @@ XFF = "x-forwarded-for"
 
 # Сколько файлов имеет смысл передавать в скрипт. В окно попадают текущий
 # и вчерашний, третий — запас на почасовую ротацию.
-#
-# Все три влезают в командную строку WinRM впритык: скрипт разбора стоит у
-# самого потолка, и смещения режутся первыми. Потерянное смещение здесь
-# дороже, чем кажется: файл, который уже не самый свежий, не перечитывается,
-# а пропускается — после полуночи это молча теряет хвост вчерашнего лога.
-# Поэтому следующее, что появится в разборе, придётся уносить во второй
-# вызов (`_extra_script`), а не дописывать сюда. Запас стережёт
-# test_offsets_for_three_files_still_fit.
 STATE_FILES = 3
+
+# Сколько символов командной строки скрипт разбора обязан оставлять
+# свободными сверх смещений.
+#
+# Смысл запаса в том, что дописать строку в скрипт легко и незаметно, а
+# расплачивается за неё не тот, кто дописал: смещения режутся первыми и
+# молча. Файл, чьё смещение не доехало, при следующем проходе НЕ
+# перечитывается, а пропускается как старый, — после полуночи так теряется
+# хвост вчерашнего лога, и в сводке просто не хватает части суток.
+#
+# Поэтому запас охраняется тестом (test_script_keeps_reserve): скрипт,
+# который в него не уложился, роняет pytest, а не сводку на бою. Если тест
+# упал — новое место в разборе не выкраивать, а уносить работу во второй
+# вызов, как сделано с HTTPERR (`_extra_script`): у того запас втрое больше.
+SCRIPT_RESERVE = 200
 
 
 def _trim_state(state: dict, keep: int = STATE_FILES) -> str:
     """Свежие смещения первыми: у файлов имена вида u_exГГММДД.log, поэтому
     сортировка по имени — это сортировка по дате.
 
-    Разделители без пробелов: скрипт стоит у самого потолка командной строки
-    WinRM, и смещения режутся первыми — каждый сэкономленный символ это плюс
-    один файл, чьё смещение доедет до сервера.
+    Разделители без пробелов: смещения уезжают в командную строку WinRM, где
+    место считаное, а два пробела на файл ничего не объясняют.
     """
     items = sorted((state or {}).items())[-keep:] if keep else []
     return json.dumps({k: int(v) for k, v in items}, separators=(",", ":"))
@@ -85,15 +91,29 @@ def _trim_state(state: dict, keep: int = STATE_FILES) -> str:
 
 def _fit(build, state: dict) -> str:
     """Собирает скрипт, ужимая состояние, пока он не влезет в командную
-    строку WinRM (8192 символа).
+    строку WinRM.
 
-    Ужимать безопасно: потерянное смещение означает лишь, что файл прочтётся
-    заново или будет пропущен как старый, а не влезший скрипт не выполнится
-    вовсе.
+    Вопреки первому впечатлению, ужимать НЕ безопасно. Не влезший скрипт не
+    выполнится вовсе — это видно сразу; выброшенное смещение не видно никак:
+    файл, который уже не самый свежий, при следующем проходе не
+    перечитывается, а пропускается как старый, и хвост вчерашнего лога
+    пропадает молча. Поэтому каждое такое смещение пишется в лог: шуметь
+    лучше, чем терять данные беззвучно.
+
+    До этого не должно доходить вообще — запас держит SCRIPT_RESERVE, а
+    сторожит его test_script_keeps_reserve. Если строки ниже сработали на
+    бою, значит запас проели, и чинить надо скрипт, а не это место.
     """
+    planned = sorted(state or {})[-STATE_FILES:]
     for keep in range(STATE_FILES, -1, -1):
         script = build(_trim_state(state, keep))
         if ps_fits(script):
+            dropped = planned[:len(planned) - keep] if keep else planned
+            if dropped:
+                print(f"[iis] Скрипт разбора не оставил места смещениям "
+                      f"({len(dropped)}): {', '.join(dropped)}. Эти файлы "
+                      f"будут пропущены как старые, их хвосты потеряются. "
+                      f"Скрипт пора укоротить.", flush=True)
             return script
     return script
 
@@ -123,6 +143,10 @@ $ErrorActionPreference='SilentlyContinue'
 Import-Module WebAdministration
 function M($l){{$n=($l -replace '^#Fields:\\s*','') -split ' ';$h=@{{}};for($i=0;$i -lt $n.Count;$i++){{$h[$n[$i]]=$i}};$h}}
 function X($p){{[Environment]::ExpandEnvironmentVariables([string]$p)}}
+# A — накопитель счётчика. Хеш-таблица приходит по ссылке, поэтому запись
+# внутри функции меняет исходную. Девять повторов вида ключ=1+ключ стоили
+# 115 символов командной строки, помощник — 34.
+function A($h,$k){{$h[$k]=1+$h[$k]}}
 $ap=@(Get-WebApplication|%{{$_.path.Trim('/')}})
 $loc=@(Get-WebVirtualDirectory|%{{$_.path.Trim('/')}})
 $st=@{{}}
@@ -150,23 +174,23 @@ if($l.StartsWith('#')){{if($l.StartsWith('#Fields:')){{$map=M $l}};continue}}
 $p=$l -split ' ';$tot++
 $s2=$p[$map['sc-status']];$c=$p[$map['c-ip']];$u=$p[$map['cs-uri-stem']];$a=$p[$map['cs(User-Agent)']]
 $xi=$map['{XFF}'];if($null -ne $xi){{$x=$p[$xi];if($x -and $x -ne '-'){{$c=($x -split ',')[0].Trim()}}}}
-$ips[$c]=1+$ips[$c]
-$q=$p[$map['time']].Substring(0,2);$hr[$q]=1+$hr[$q]
+A $ips $c
+$q=$p[$map['time']].Substring(0,2);A $hr $q
 $g=($u -split '/')[1];if($g){{$g=$g.ToLower()}}
 if($g -and $ap -contains $g){{
-$pb[$g]=1+$pb[$g]
-if($u -like '*/e1cib/login' -and $s2 -eq '402'){{$lg[$g+'|'+$c]=1+$lg[$g+'|'+$c]}}
+A $pb $g
+if($u -like '*/e1cib/login' -and $s2 -eq '402'){{A $lg ($g+'|'+$c)}}
 }}elseif(!($g -and $loc -contains $g)){{
-$alt++;$al[$c+'|'+$a]=1+$al[$c+'|'+$a]
-$au[$u]=1+$au[$u]
+$alt++;A $al ($c+'|'+$a)
+A $au $u
 if($s2 -eq '200' -and $u -ne '/' -and $u -notmatch '{INNOCENT}'){{
-$hit[$u+'|'+$c+'|'+$a]=1+$hit[$u+'|'+$c+'|'+$a]}}}}
-if($s2 -like '5*'){{$e5[$u+'|'+$c]=1+$e5[$u+'|'+$c]}}
+A $hit ($u+'|'+$c+'|'+$a)}}}}
+if($s2 -like '5*'){{A $e5 ($u+'|'+$c)}}
 $t=0;[void][int]::TryParse($p[$map['time-taken']],[ref]$t)
-if($t -gt {slow_ms} -and $u -notmatch '{LONG_POLL}'){{$slt++;$sl[$u+'|'+$c]=1+$sl[$u+'|'+$c]}}
+if($t -gt {slow_ms} -and $u -notmatch '{LONG_POLL}'){{$slt++;A $sl ($u+'|'+$c)}}
 }}
 $ns[$k]=$fs.Position;$sr.Close();$fs.Close()}}}}
-function T($h){{@($h.GetEnumerator()|sort Value -Descending|select -First {top}|%{{@{{k=$_.Key;n=$_.Value}}}})}}
+function T($h){{@($h.GetEnumerator()|sort Value -Desc|select -First {top}|%{{@{{k=$_.Key;n=$_.Value}}}})}}
 Out-B64 @{{total=$tot;alien=$alt;slow=$slt;uniq=$ips.Count;state=$ns;
 alienuris=(T $au);pubs=(T $pb);scan=(T $al);hits=(T $hit);logins=(T $lg);
 ips=(T $ips);errors=(T $e5);slows=(T $sl);hours=(T $hr)}}
