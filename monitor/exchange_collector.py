@@ -23,7 +23,7 @@ from exchange_log import (
     has_exchange, read_activesync, read_owa_failures, read_owa_logins,
 )
 from geoip import resolve as geo_resolve
-from mail_store import save_snapshot
+from mail_store import SUMMARY_ROWS, save_snapshot
 from settings import int_env
 
 
@@ -37,10 +37,6 @@ MAX_PARALLEL_EXCHANGE_SERVERS = _int_env("MAX_PARALLEL_EXCHANGE_SERVERS", 2)
 
 # Окно разбора — сутки: столько же показывает дашборд.
 WINDOW_HOURS = 24
-
-# Сколько строк держим в каждом списке. Столько же, сколько у Zimbra:
-# вкладка одна, и списки в ней должны быть одной длины.
-SUMMARY_ROWS = 8
 
 # Отказов входа с одного адреса на одну учётку за сутки, после которых это
 # уже не «забыл пароль». Порог тот же, что у подбора в Zimbra по смыслу:

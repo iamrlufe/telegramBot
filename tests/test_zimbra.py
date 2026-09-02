@@ -491,3 +491,153 @@ def test_summary_needs_no_second_read_of_the_log():
     source = inspect.getsource(zimbra_collector.collect_server)
     assert "summary_for(mail, audit" in source
     assert source.count("read_mail(") == 1
+
+
+# ─── Отбитые попытки подделки ────────────────────────────────
+#
+# Где на сервере настроен антиспуфинг своего домена, письмо с вашим доменом
+# в конверте от чужого отправителя отбивается на RCPT и до spoofed_senders
+# не доходит вовсе. Наблюдение переезжает на отказы Postfix.
+
+REJECT_REASONS = [
+    (["554 5.7.1 Sender address rejected: Access denied"], 128),
+    (["450 4.7.1 Client host rejected: cannot find your hostname"], 640),
+    (["554 5.7.1 Sender address rejected: not logged in"], 12),
+]
+
+
+def test_sender_rejects_counts_only_its_own_reason():
+    """Остальные отказы (грелист, обратный DNS, спам-листы) в счёт не идут:
+    их сотни на любом сервере в интернете, и порог по ним бессмыслен."""
+    res = zimbra_log.sender_rejects(REJECT_REASONS)
+
+    assert res["messages"] == 140
+    assert [r["count"] for r in res["reasons"]] == [128, 12]
+
+
+def test_sender_rejects_ignores_case():
+    """Формулировку задаёт администратор в restriction_class, регистр в ней
+    не гарантирован."""
+    assert zimbra_log.sender_rejects(
+        [(["554 5.7.1 SENDER ADDRESS REJECTED: Access denied"], 3)]
+    )["messages"] == 3
+
+
+def test_sender_rejects_on_empty_input():
+    assert zimbra_log.sender_rejects(None) == {"messages": 0, "reasons": []}
+    assert zimbra_log.sender_rejects([])["messages"] == 0
+
+
+def test_reject_finding_appears_above_threshold():
+    from zimbra_collector import findings_for
+
+    mail = {"origins": [], "local_domains": ["example.local"], "senders": [],
+            "reject_reasons": REJECT_REASONS}
+    found = findings_for("mail-01", mail, {}, {})
+    keys = [item["key"] for _s, item in found]
+
+    assert keys == ["zm_sender_reject:mail-01"]
+    text = found[0][1]["text"]
+    assert "140 писем" in text
+    assert "Sender address rejected" in text
+
+
+def test_reject_finding_key_has_no_number():
+    """Иначе каждая новая попытка — новая находка, и алерт повторяется
+    при каждом проходе."""
+    from zimbra_collector import findings_for
+
+    mail = {"origins": [], "local_domains": [], "senders": [],
+            "reject_reasons": [(["554 5.7.1 Sender address rejected"], 900)]}
+    found = findings_for("mail-01", mail, {}, {})
+    assert found[0][1]["key"] == "zm_sender_reject:mail-01"
+
+
+def test_ordinary_reject_noise_gives_no_finding():
+    """640 отказов по обратному DNS — фон интернета, а не находка."""
+    from zimbra_collector import findings_for
+
+    mail = {"origins": [], "local_domains": [], "senders": [],
+            "reject_reasons": [REJECT_REASONS[1]]}
+    assert findings_for("mail-01", mail, {}, {}) == []
+
+
+# ─── Служебные входы самого сервера ──────────────────────────
+
+def test_service_login_is_recognised_by_missing_address():
+    assert zimbra_log.is_service_login(
+        {"account": "zimbra", "ip": "?", "protocol": "soap/admin", "ok": True})
+    assert zimbra_log.is_service_login({"account": "zimbra", "ip": ""})
+    assert not zimbra_log.is_service_login(
+        {"account": "buh@example.local", "ip": "10.20.30.5"})
+
+
+def test_service_login_is_hidden_from_dashboard_logins():
+    """Учётка zimbra с админ-протоколом набирает за сутки больше входов,
+    чем любой человек, и занимала первую строку обзора."""
+    events = [
+        {"account": "zimbra", "ip": "?", "protocol": "soap/admin",
+         "ok": True, "count": 18, "last": "2026-09-01 10:00:00"},
+        {"account": "buh@example.local", "ip": "10.20.30.5",
+         "protocol": "imap", "ok": True, "count": 9,
+         "last": "2026-09-01 09:00:00"},
+    ]
+    summary = _summary(audit={"failed": 0, "events": events})
+    logins = [g for g in summary["groups"] if g["title"] == "Кто заходил"]
+
+    assert logins, "раздел входов пропал целиком"
+    titles = " ".join(row["title"] for row in logins[0]["rows"])
+    assert "zimbra" not in titles
+    assert "buh@example.local" in titles
+
+
+def test_failed_service_login_stays_visible():
+    """Вход без адреса, который НЕ удался, — это сломанный служебный
+    пароль, а не фоновая служба."""
+    events = [{"account": "zimbra", "ip": "?", "protocol": "soap/admin",
+               "ok": False, "count": 40, "last": "2026-09-01 10:00:00"}]
+    summary = _summary(audit={"failed": 40, "events": events})
+    bad = [g for g in summary["groups"] if g["title"] == "Пароль не подошёл"]
+
+    assert bad and "zimbra" in " ".join(r["title"] for r in bad[0]["rows"])
+
+
+# ─── Длина списков в сводке ──────────────────────────────────
+
+def test_summary_rows_are_shared_by_both_mail_systems():
+    """Вкладка одна: списки Zimbra и Exchange обязаны быть одной длины,
+    иначе карточки рядом выглядят по-разному без причины."""
+    from pathlib import Path
+
+    import mail_store
+    import zimbra_collector
+    import exchange_collector
+
+    assert zimbra_collector.SUMMARY_ROWS == mail_store.SUMMARY_ROWS
+    assert exchange_collector.SUMMARY_ROWS == mail_store.SUMMARY_ROWS
+    # Равенство чисел ни о чём не говорит: два «8» разойдутся при первой же
+    # правке одного из них. Предел обязан быть ровно один на оба сборщика.
+    for module in (zimbra_collector, exchange_collector):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "SUMMARY_ROWS =" not in source, \
+            f"{Path(module.__file__).name}: своя длина списков вместо общей"
+
+
+def test_summary_rows_do_not_exceed_what_the_server_sends():
+    """Больше TOP групп с сервера не приезжает — просить у сводки больше
+    строк бессмысленно, список всё равно кончится раньше."""
+    import mail_store
+
+    assert mail_store.SUMMARY_ROWS <= zimbra_log.TOP
+
+
+def test_summary_cuts_long_lists(monkeypatch):
+    import zimbra_collector
+
+    monkeypatch.setattr(zimbra_collector, "SUMMARY_ROWS", 3)
+    senders = [{"sender": f"user{i}@example.local", "messages": 100 - i,
+                "recipients": 2} for i in range(10)]
+    summary = _summary(mail={"senders": senders})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто отправляет"][0]
+
+    assert len(rows["rows"]) == 3

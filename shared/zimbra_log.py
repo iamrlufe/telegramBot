@@ -74,6 +74,24 @@ HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
 # для фишинга по своим же сотрудникам.
 SPOOF_ALERT = int_env("ZIMBRA_SPOOF_ALERT", 5)
 
+# Попыток подделки, отбитых на входе, за сутки.
+#
+# Порог отдельный и заметно выше SPOOF_ALERT намеренно. Когда на сервере
+# настроен антиспуфинг своего домена (Postfix отбивает письмо с чужого IP,
+# если в конверте адрес вашего домена), правило spoofed_senders замолкает:
+# считать нечего, такие письма больше не доходят. Наблюдение при этом
+# исчезать не должно — оно меняет источник, было «N писем подделки дошло»,
+# стало «N попыток подделки отбито». Отбитых всегда больше доходивших:
+# отбивается каждая попытка, а доходило только то, что проскочило.
+SENDER_REJECT_ALERT = int_env("ZIMBRA_SENDER_REJECT_ALERT", 50)
+
+# По этой подстроке Postfix узнаётся отказ «отправитель запрещён»: и
+# check_sender_access с картой своих адресов, и reject_authenticated_sender_
+# login_mismatch дают в логе «Sender address rejected». Сравнение
+# регистронезависимое: формулировку задаёт администратор в restriction_class,
+# и регистр в ней не гарантирован.
+SENDER_REJECT_MARK = "sender address rejected"
+
 
 def _reader(path: str) -> str:
     """Читалка файла с повышением прав, только если оно нужно.
@@ -551,6 +569,47 @@ def spoofed_senders(origins, local_domains) -> dict:
         total += count
     return {"messages": total, "senders": sorted(senders),
             "ips": sorted(addresses)}
+
+
+def sender_rejects(reject_reasons) -> dict:
+    """Отказы «отправитель запрещён» за окно: сколько и с какими причинами.
+
+    Это продолжение spoofed_senders для серверов, где подделку своего домена
+    режет сам Postfix. Там правило считает дошедшие письма, здесь — отбитые
+    попытки; вместе они покрывают обе настройки, и включение защиты не
+    оставляет наблюдение слепым.
+
+    Адресов источника здесь нет и быть не может: awk считает reject-IP по
+    всем отказам сразу, а не по каждой причине, и приписать их этой
+    конкретной означало бы соврать. Кто именно долбится, видно на экране
+    «🚫 Отбито на входе».
+    """
+    total = 0
+    reasons = []
+    for parts, count in reject_reasons or []:
+        reason = (parts[0] if parts else "").strip()
+        if SENDER_REJECT_MARK not in reason.lower():
+            continue
+        total += count
+        reasons.append({"reason": reason, "count": count})
+    reasons.sort(key=lambda i: -i["count"])
+    return {"messages": total, "reasons": reasons}
+
+
+def is_service_login(event) -> bool:
+    """Вход самого сервера, а не человека.
+
+    У служебных обращений (zmconfigd, zmmailboxdmgr, проверки состояния)
+    в audit.log нет `oip=` — обращение идёт с самой машины, — и парсер
+    ставит «?». Такая запись честно попадает в топ по числу входов и
+    вытесняет из обзора живого пользователя: одна учётка `zimbra` с
+    админ-протоколом набирает за сутки больше, чем любой человек.
+
+    Скрывается только из обзора успешных входов. Неудачные остаются: вход
+    без адреса, который НЕ удался, — это уже не фоновая служба, а сломанный
+    служебный пароль, и знать о нём нужно.
+    """
+    return (event.get("ip") or "?").strip() in ("", "?")
 
 
 def foreign_logins(events, geo_codes, home: str = None) -> list:

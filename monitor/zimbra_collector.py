@@ -22,10 +22,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from alerts import check_zimbra_alerts
 from geoip import resolve as geo_resolve
-from mail_store import save_snapshot
+from mail_store import SUMMARY_ROWS, save_snapshot
 from settings import int_env
 from zimbra_log import (
-    QUEUE_ALERT, SPOOF_ALERT, _origin_rows, brute_force, foreign_logins,
+    QUEUE_ALERT, SENDER_REJECT_ALERT, SPOOF_ALERT,
+    _origin_rows, brute_force, foreign_logins, is_service_login,
+    sender_rejects,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
     read_mail,
     spoofed_senders,
@@ -119,6 +121,21 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
             "key": f"zm_spoof:{server_name}",
         }))
 
+    rejects = sender_rejects(mail.get("reject_reasons"))
+    if rejects["messages"] >= SENDER_REJECT_ALERT:
+        reason = rejects["reasons"][0]["reason"] if rejects["reasons"] else ""
+        found.append((server_name, {
+            "level": "warn",
+            "text": (f"🟠 подделка отправителя: {letters(rejects['messages'])} "
+                     f"отбито на входе — сервер не принял письма с вашим "
+                     f"доменом в конверте от чужих отправителей"
+                     + (f". Причина отказа: {reason}" if reason else "")
+                     + ". Защита работает; знать стоит о самих попытках"),
+            "hint": "попытки подделки отбиваются",
+            # Ключ без чисел: иначе каждая новая попытка — новая находка.
+            "key": f"zm_sender_reject:{server_name}",
+        }))
+
     for item in heavy_senders(mail.get("senders")):
         found.append((server_name, {
             "level": "warn",
@@ -139,10 +156,6 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
         }))
     return found
 
-
-# Сколько строк держим в каждом списке сводки. Дашборд — это обзор:
-# двадцать отправителей в карточке никто не читает, а вес файла растёт.
-SUMMARY_ROWS = 8
 
 
 def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> dict:
@@ -202,7 +215,12 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
             for e in bad
         ]})
 
-    good = [e for e in events if e.get("ok")][:SUMMARY_ROWS]
+    # Служебные обращения самого сервера из обзора убраны: учётка zimbra с
+    # админ-протоколом набирает за сутки больше входов, чем любой человек,
+    # и занимала первую строку, вытесняя живого пользователя. В карточке
+    # бота (🔑 Входы в почту) она по-прежнему видна — там полный список.
+    good = [e for e in events
+            if e.get("ok") and not is_service_login(e)][:SUMMARY_ROWS]
     if good:
         groups.append({"title": "Кто заходил", "level": "ok", "rows": [
             {"level": "ok", "left": str(e.get("count") or 0),
