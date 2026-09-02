@@ -176,6 +176,46 @@ def test_publications_taken_from_iis_config():
     assert "Get-WebApplication" in iis_log._script({}, 10000, 25)
 
 
+def test_local_paths_are_not_findings():
+    """Регрессия: заход сотрудника по /отчеты давал красную находку
+    «сервер отдал». Виртуальный каталог и обычная папка в корне сайта
+    приложениями IIS не являются, поэтому попадали в посторонние пути,
+    хотя содержимое по ним сервер отдаёт совершенно законно."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    assert "Get-WebVirtualDirectory" in compact
+    assert "$s.physicalPath" in compact and "-Directory" in compact
+    assert "$loc -contains $g" in compact
+
+
+def test_local_paths_are_not_publications():
+    """Папка сайта — не публикация: считать по ней трафик и искать в ней
+    подбор пароля 1С незачем, а «публикация без трафика» — это тревога
+    про открытую наружу точку входа, и от папок она бы зашумилась."""
+    compact = winrm_client.compact_ps(iis_log._script({}, 10000, 25))
+
+    pubs = compact.index("$pb[$g]=1+$pb[$g]")
+    local = compact.index("$loc -contains $g")
+
+    assert pubs < local, "$pb заполняется только из $ap, до проверки $loc"
+
+
+def test_offsets_for_three_files_still_fit():
+    """Скрипт у самого потолка командной строки WinRM. Смещения режутся
+    первыми, а потерянное смещение НЕ перечитывается: файл, который уже не
+    самый свежий, просто пропускается — после полуночи это молча теряет
+    хвост вчерашнего лога. Столько файлов, сколько обещает STATE_FILES,
+    обязано влезать."""
+    for tag in (".log", "_x.log"):
+        state = {f"u_ex2609{i:02d}{tag}": 123456789
+                 for i in range(iis_log.STATE_FILES)}
+        script = iis_log._site_script(iis_log._trim_state(state), 10000, 25)
+
+        assert winrm_client.ps_fits(script), tag
+        for name in state:
+            assert name in script
+
+
 def test_only_served_content_counts_as_a_finding():
     """Редирект ничего не отдал: на корень и на любой путь по 80-му порту
     он приходит всегда, а на сайте за IIS — ещё и 302 на /index.php.
