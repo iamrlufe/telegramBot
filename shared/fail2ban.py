@@ -48,9 +48,37 @@ def _cmd(args: str) -> str:
             f'else sudo -n {CLIENT} {args}; fi')
 
 
-def _run(server: dict, args: str, timeout: int = 60) -> str:
+# Всё состояние читается ОДНОЙ сессией SSH.
+#
+# Сначала было по вызову на каждый вопрос: статус, потом статус каждой
+# клетки, потом белый список — пять подключений на одно открытие раздела.
+# Экран открывался секундами, а на боевом сервере рукопожатия начали
+# рваться с «Error reading SSH protocol banner»: пять коротких соединений
+# подряд упираются в ограничения sshd. Один скрипт с разделителями решает
+# и то, и другое.
+_STATE_SH = r"""
+set -u
+BIN=$(command -v fail2ban-client 2>/dev/null || echo /usr/bin/fail2ban-client)
+f2b() { if [ "$(id -u)" = "0" ]; then "$BIN" "$@"; else sudo -n "$BIN" "$@"; fi; }
+S=$(f2b status) || exit 1
+echo "===STATUS==="
+printf '%s\n' "$S"
+JAILS=$(printf '%s\n' "$S" | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d '[:space:]' | tr ',' ' ')
+for j in $JAILS; do
+  echo "===JAIL:$j==="
+  f2b status "$j"
+done
+FIRST=$(echo $JAILS | awk '{print $1}')
+if [ -n "$FIRST" ]; then
+  echo "===IGNORE==="
+  f2b get "$FIRST" ignoreip
+fi
+"""
+
+
+def _run(server: dict, args: str, timeout: int = 60, script: str = "") -> str:
     return run_ssh(
-        server["host"], _cmd(args),
+        server["host"], script or _cmd(args),
         server.get("username"), server.get("password"),
         port=int(server.get("ssh_port") or 22),
         key_path=server.get("ssh_key"),
@@ -118,15 +146,37 @@ def parse_ignoreip(text: str) -> list:
     return found
 
 
+def parse_state(output: str) -> dict:
+    """Разбор вывода одного скрипта: секции с разделителями ===ИМЯ===."""
+    sections, current = {}, None
+    for line in (output or "").splitlines():
+        marker = line.strip()
+        if marker.startswith("===") and marker.endswith("===") and len(marker) > 6:
+            current = marker.strip("=")
+            sections[current] = []
+            continue
+        if current:
+            sections[current].append(line)
+
+    def text(name):
+        return "\n".join(sections.get(name) or [])
+
+    jails = [parse_jail("\n".join(lines), name[len("JAIL:"):])
+             for name, lines in sections.items() if name.startswith("JAIL:")]
+    # Порядок как в `status`: клетки в словаре секций лежат как попало, а
+    # на экране они должны идти так же, как их показывает сам fail2ban.
+    order = parse_jails(text("STATUS"))
+    jails.sort(key=lambda j: order.index(j["jail"])
+               if j["jail"] in order else len(order))
+    return {"jails": jails, "ignored": parse_ignoreip(text("IGNORE"))}
+
+
 def read_state(server: dict) -> dict:
-    """Полное состояние: клетки, забаненные адреса, белый список."""
-    jails = parse_jails(_run(server, "status"))
-    details, ignored = [], []
-    for name in jails:
-        details.append(parse_jail(_run(server, f"status {name}"), name))
-    if jails:
-        ignored = parse_ignoreip(_run(server, f"get {jails[0]} ignoreip"))
-    return {"jails": details, "ignored": ignored}
+    """Полное состояние: клетки, забаненные адреса, белый список.
+
+    Одним подключением — см. комментарий к _STATE_SH.
+    """
+    return parse_state(_run(server, "", script=_STATE_SH, timeout=90))
 
 
 def ban(server: dict, jail: str, address: str) -> str:

@@ -216,3 +216,62 @@ def test_unknown_error_shows_the_original_text():
     from fail2ban_bot import _trouble
 
     assert "Connection timed out" in _trouble("mail-01", "Connection timed out")
+
+
+# ─── Одна сессия SSH вместо пяти ─────────────────────────────
+#
+# Сначала раздел спрашивал сервер по одному вопросу за подключение: статус,
+# статус каждой клетки, белый список. На боевом сервере рукопожатия начали
+# рваться с «Error reading SSH protocol banner» — пять коротких соединений
+# подряд упираются в ограничения sshd.
+
+STATE_OUTPUT = f"""===STATUS===
+{STATUS}
+===JAIL:zimbra-auth===
+{JAIL}
+===JAIL:zimbra-web===
+{EMPTY_JAIL}
+===IGNORE===
+These IP addresses/networks are ignored:
+| 127.0.0.1/8 10.100.0.0/16
+`-
+"""
+
+
+def test_state_is_read_in_one_session(monkeypatch):
+    calls = []
+
+    def fake_ssh(host, script, *a, **kw):
+        calls.append(script)
+        return STATE_OUTPUT
+
+    monkeypatch.setattr(fail2ban, "run_ssh", fake_ssh)
+    fail2ban.read_state({"host": "mail.example.local"})
+
+    assert len(calls) == 1, "одно открытие раздела — одно подключение"
+
+
+def test_state_sections_are_parsed():
+    state = fail2ban.parse_state(STATE_OUTPUT)
+
+    assert [j["jail"] for j in state["jails"]] == ["zimbra-auth", "zimbra-web"]
+    assert state["jails"][0]["addresses"] == ["203.0.113.5", "198.51.100.7"]
+    assert state["ignored"] == ["127.0.0.1/8", "10.100.0.0/16"]
+
+
+def test_jail_order_follows_fail2ban():
+    """Секции приходят словарём, а на экране порядок должен быть тот же,
+    что показывает сам fail2ban."""
+    swapped = STATE_OUTPUT.replace(
+        "`- Jail list:\tsshd, zimbra-auth, zimbra-web",
+        "`- Jail list:\tzimbra-web, zimbra-auth")
+    state = fail2ban.parse_state(swapped)
+
+    assert [j["jail"] for j in state["jails"]] == ["zimbra-web", "zimbra-auth"]
+
+
+def test_state_script_resolves_the_binary():
+    """Правило sudo написано на полный путь, а PATH под чужой учёткой
+    бывает урезан."""
+    assert "command -v fail2ban-client" in fail2ban._STATE_SH
+    assert 'sudo -n "$BIN"' in fail2ban._STATE_SH
