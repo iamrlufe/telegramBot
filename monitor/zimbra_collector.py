@@ -27,7 +27,7 @@ from settings import int_env
 from zimbra_log import (
     QUEUE_ALERT, SENDER_REJECT_ALERT, SPOOF_ALERT,
     _origin_rows, addresses, brute_force, foreign_logins, is_local_login,
-    is_service_login, is_service_sender, sender_rejects,
+    is_service_login, is_service_sender, sender_rejects, split_senders,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
     read_mail,
     spoofed_senders,
@@ -195,19 +195,32 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
     # Служебные отправители (отчёты о недоставке, ящики самой почты) из
     # обзора убраны: пятнадцать строк, и каждая занятая службой — минус один
     # живой отправитель. В карточке бота список остаётся полным.
-    senders = [item for item in (mail.get("senders") or [])
-               if not is_service_sender(item.get("sender"))][:SUMMARY_ROWS]
-    if senders:
-        heavy = {i.get("sender") for i in heavy_senders(mail.get("senders"))}
-        groups.append({"title": "Кто отправляет", "level": "ok", "rows": [
+    live = [item for item in (mail.get("senders") or [])
+            if not is_service_sender(item.get("sender"))]
+    split = split_senders(live, mail.get("origins"), mail.get("local_domains"))
+    heavy = {i.get("sender") for i in heavy_senders(mail.get("senders"))}
+
+    def sender_rows(items):
+        return [
             {"level": "warn" if item.get("sender") in heavy else "ok",
              "left": str(item.get("messages") or 0),
              "title": item.get("sender") or "",
              # Голое число слева не читается: «107» — это писем или адресов?
              # Подпись ставится здесь, рядом со вторым числом.
              "detail": f"писем · на {addresses(item.get('recipients') or 0)}"}
-            for item in senders
-        ]})
+            for item in items[:SUMMARY_ROWS]
+        ]
+
+    # Два списка, а не один: сотрудники и чужие рассылки решают разные
+    # задачи. В общем списке уведомления банков и налоговой занимали верх
+    # топа, и всплеск отправки у своей учётки — то, ради чего раздел и
+    # нужен, — терялся среди них.
+    if split["own"]:
+        groups.append({"title": "Кто отправляет", "level": "ok",
+                       "rows": sender_rows(split["own"])})
+    if split["incoming"]:
+        groups.append({"title": "Кто пишет вам", "level": "ok",
+                       "rows": sender_rows(split["incoming"])})
 
     events = audit.get("events") or []
     bad = [e for e in events if not e.get("ok")][:SUMMARY_ROWS]

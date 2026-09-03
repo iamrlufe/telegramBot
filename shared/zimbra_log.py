@@ -560,6 +560,39 @@ def is_service_sender(sender: str) -> bool:
     return value == "<>" or value.startswith(SERVICE_SENDERS[1:])
 
 
+def split_senders(senders, origins, local_domains) -> dict:
+    """Разделяет отправителей на своих и внешних: {"own": [...], "incoming": [...]}.
+
+    Postfix считает всех, кто прошёл через сервер, поэтому в одном списке
+    оказывались сотрудники и уведомления внешних сервисов — банки, налоговая,
+    доски вакансий. Раздел назывался «Кто отправляет», а показывал «кто
+    вообще слал почту через сервер», и первые строки топа стабильно
+    занимали чужие рассылки.
+
+    Разделение по адресу отправителя было бы наивным: свой домен в конверте
+    подделывается свободно, и спам, притворяющийся вашим сотрудником, попал
+    бы к своим. Поэтому «свой» — это адрес вашего домена И происхождение, не
+    равное `incoming`: письмо родилось на сервере (веб) или сдано изнутри
+    по паролю. Всё остальное — входящее, включая подделку.
+
+    Отправитель, которого нет в origins вовсе (строка сдачи не попала в
+    окно), решается по домену: это лучше, чем терять его из обоих списков.
+    """
+    kinds = {}
+    for sender, ip, authed, _count in _origin_rows(origins):
+        kinds.setdefault(sender, set()).add(origin_kind(ip, authed))
+
+    own, incoming = [], []
+    for item in senders or []:
+        sender = item.get("sender") or ""
+        seen = kinds.get(sender)
+        mine = local_domain(sender, local_domains)
+        if seen is not None:
+            mine = mine and bool(seen - {"incoming"})
+        (own if mine else incoming).append(item)
+    return {"own": own, "incoming": incoming}
+
+
 def is_local_login(event) -> bool:
     """Вход из локальной сети.
 

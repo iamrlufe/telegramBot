@@ -429,6 +429,9 @@ def _summary(**over):
     mail = {"messages": 5338, "queue": 12, "rejected": 2411,
             "senders": [{"sender": "buh@example.local", "messages": 40,
                          "recipients": 12}],
+            # Свои домены нужны сводке, чтобы отделить сотрудников от чужих
+            # рассылок, прошедших через тот же сервер.
+            "local_domains": ["example.local"],
             "defer_reasons": [(["Connection timed out"], 7)]}
     audit = {"failed": 1284, "ok": 404, "events": EVENTS}
     mail.update(over.pop("mail", {}))
@@ -768,3 +771,66 @@ def test_address_count_is_declined():
     assert zimbra_log.addresses(13) == "13 адресов"
     assert zimbra_log.addresses(103) == "103 адреса"
     assert zimbra_log.addresses(0) == "0 адресов"
+
+
+# ─── Свои отправители и чужие рассылки ───────────────────────
+#
+# Postfix считает всех, кто прошёл через сервер. В одном списке оказывались
+# сотрудники и уведомления банков, налоговой и досок вакансий — и всплеск
+# отправки у своей учётки терялся среди чужих рассылок.
+
+SPLIT_SENDERS = [
+    {"sender": "buh@example.local", "messages": 40, "recipients": 12},
+    {"sender": "report@bank.invalid", "messages": 107, "recipients": 136},
+]
+SPLIT_ORIGINS = [
+    # письмо родилось на самом сервере — сотрудник писал через веб
+    (["buh@example.local", "127.0.0.1", "0"], 40),
+    # чужая рассылка: публичный адрес, входа в почту не было
+    (["report@bank.invalid", "203.0.113.9", "0"], 107),
+]
+
+
+def test_own_senders_and_incoming_are_separate_lists():
+    summary = _summary(mail={"senders": SPLIT_SENDERS,
+                             "origins": SPLIT_ORIGINS})
+    titles = {g["title"]: [r["title"] for r in g["rows"]]
+              for g in summary["groups"]}
+
+    assert titles["Кто отправляет"] == ["buh@example.local"]
+    assert titles["Кто пишет вам"] == ["report@bank.invalid"]
+
+
+def test_spoofed_own_address_is_not_counted_as_ours():
+    """Свой домен в конверте подделывается свободно. Делить только по адресу
+    значило бы записывать спам в собственные отправители."""
+    senders = [{"sender": "director@example.local", "messages": 9,
+                "recipients": 9}]
+    origins = [(["director@example.local", "203.0.113.9", "0"], 9)]
+    summary = _summary(mail={"senders": senders, "origins": origins})
+    titles = {g["title"]: [r["title"] for r in g["rows"]]
+              for g in summary["groups"]}
+
+    assert "Кто отправляет" not in titles
+    assert titles["Кто пишет вам"] == ["director@example.local"]
+
+
+def test_sender_without_origin_falls_back_to_domain():
+    """Строка сдачи могла не попасть в окно разбора. Терять отправителя из
+    обоих списков хуже, чем решить по адресу."""
+    res = zimbra_log.split_senders(
+        [{"sender": "buh@example.local", "messages": 3, "recipients": 3}],
+        [], ["example.local"])
+
+    assert [i["sender"] for i in res["own"]] == ["buh@example.local"]
+    assert res["incoming"] == []
+
+
+def test_inside_submission_counts_as_ours():
+    """Сдача по паролю с внутреннего узла — это тоже свой отправитель,
+    а не входящее письмо."""
+    res = zimbra_log.split_senders(
+        [{"sender": "app@example.local", "messages": 5, "recipients": 5}],
+        [(["app@example.local", "10.100.0.10", "1"], 5)], ["example.local"])
+
+    assert [i["sender"] for i in res["own"]] == ["app@example.local"]
