@@ -241,12 +241,32 @@ def test_config_rejects_non_bool_firewall():
         raise AssertionError("нестроковое значение флага прошло валидацию")
 
 
-def test_firewall_is_windows_only():
-    from config_editor import WINDOWS_ONLY_FIELDS, TOGGLE_FIELDS, WIZARD_ORDER
+def test_firewall_flag_is_offered_on_both_systems():
+    """Блокировка есть и на Linux, только другим механизмом (fail2ban).
+    Пока поле числилось windows-only, флаг было негде включить, и раздел
+    у Linux-сервера не появлялся вовсе."""
+    from config_editor import WINDOWS_ONLY_FIELDS, LINUX_ONLY_FIELDS
+    from config_editor import TOGGLE_FIELDS, WIZARD_ORDER
 
-    assert "firewall" in WINDOWS_ONLY_FIELDS
+    assert "firewall" not in WINDOWS_ONLY_FIELDS
+    assert "firewall" not in LINUX_ONLY_FIELDS
     assert "firewall" in TOGGLE_FIELDS
     assert "firewall" in WIZARD_ORDER
+
+
+def test_linux_card_has_the_toggle():
+    """Регрессия: без кнопки в клавиатуре редактора флаг для Linux можно
+    задать только правкой servers.json руками."""
+    import inspect
+
+    from config_editor import edit_fields_kb
+
+    source = inspect.getsource(edit_fields_kb)
+    # именно `if`, а не `elif`: первым в функции идёт отбор полей строки,
+    # кнопки-переключатели собираются ниже отдельным блоком
+    linux_block = source.split('\n    if server_type == "linux":')[1].split(
+        'server_type == "vmware"')[0]
+    assert "cfg_toggle:firewall" in linux_block
 
 
 # ─── Кандидаты на блокировку ─────────────────────────────────

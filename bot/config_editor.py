@@ -425,9 +425,11 @@ FIELD_DEFS = {
     "firewall": {
         "label": "Блокировка IP",
         "prompt": "Разрешить боту блокировать адреса на этом сервере? (да/нет)\n"
-                  "Открывает кнопку 🛡 Блокировка IP в карточке: список "
-                  "заблокированных, блокировка адреса или подсети, снятие, "
-                  "белый список.\n\n"
+                  "Открывает кнопку блокировки в карточке. На Windows это "
+                  "правило Windows Firewall: список заблокированных, "
+                  "блокировка адреса или подсети, снятие, белый список. На "
+                  "Linux — раздел поверх fail2ban: его клетки, кого он "
+                  "поймал, кандидаты из почтовых находок и ручной бан.\n\n"
                   "Бот блокирует только то, что назвали вы, — сам не "
                   "блокирует никого.\n"
                   "Нужны права администратора у учётки WinRM: адреса "
@@ -527,10 +529,15 @@ REQUIRED_FIELDS = {"name", "host"}
 #   retention_days       — удаление файлов идёт через PowerShell
 #   verify_backup        — RESTORE VERIFYONLY выполняет MSSQL
 #   reg_file             — реестр Windows
+#
+# firewall сюда НЕ входит, хотя раньше входил: блокировка адресов есть и на
+# Linux, только другим механизмом (fail2ban вместо Windows Firewall). Пока
+# поле числилось windows-only, флаг было негде включить, и раздел у
+# Linux-сервера не появлялся вовсе.
 # Пути бэкапов и пороги сюда НЕ входят: каталоги на Linux/NAS (Synology)
 # читаются по SSH, и задавать их из бота нужно так же, как на Windows.
 WINDOWS_ONLY_FIELDS = {
-    "onec_logs", "dbsize", "exchange", "firewall", "retention_days",
+    "onec_logs", "dbsize", "exchange", "retention_days",
     "verify_backup", "reg_file",
 }
 
@@ -1469,6 +1476,10 @@ def edit_fields_kb(server: dict):
             InlineKeyboardButton(
                 f"📬 Почта Zimbra: {'✅' if server.get('zimbra') else '❌'}",
                 callback_data="cfg_toggle:zimbra"
+            ),
+            InlineKeyboardButton(
+                f"🛡 Блокировка: {'✅' if server.get('firewall') else '❌'}",
+                callback_data="cfg_toggle:firewall"
             ),
         ])
     if server_type == "vmware":
@@ -3139,7 +3150,11 @@ zimbraMailTrustedIP, тогда в лог попадёт адрес клиент
 
 HELP_FAIL2BAN = """🛡 БЛОКИРОВКА (FAIL2BAN)
 
-Кнопка у Linux-сервера с флагом «🛡 Блокировка IP». Своего механизма
+Кнопка у Linux-сервера с флагом «🛡 Блокировка» (⚙️ Настройка →
+сервер → переключатель). Это флаг конфига, а не служба: добавлять
+fail2ban в список services незачем, кнопку открывает именно флаг.
+
+Своего механизма
 блокировки здесь нет: банит fail2ban, который на сервере уже стоит,
 читает логи, ловит по порогу и снимает бан по сроку. Второй механизм
 рядом означал бы два источника истины в одном iptables.
