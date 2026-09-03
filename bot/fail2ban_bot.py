@@ -163,9 +163,42 @@ def menu_kb(server_name: str, state: dict, candidates: list) -> InlineKeyboardMa
     return InlineKeyboardMarkup(rows)
 
 
+def _trouble(server_name: str, error: str) -> str:
+    """Понятный текст вместо общего «произошла ошибка».
+
+    Причин ровно две, и обе чинятся на сервере, а не в боте: нет правила
+    sudo на fail2ban-client либо сам fail2ban не запущен. Общая ошибка
+    заставляла бы искать это вслепую.
+    """
+    first = (error or "").strip().splitlines()[0][:200] if error else ""
+    hint = ""
+    if "sudo" in first.lower() or "password" in first.lower():
+        hint = ("\n\nПохоже, нет правила sudo. Учётке SSH нужно разрешить "
+                "без пароля: fail2ban-client status, get * ignoreip, "
+                "set * banip, set * unbanip.")
+    elif "not find" in first.lower() or "command not found" in first.lower():
+        hint = "\n\nПохоже, fail2ban на сервере не установлен."
+    elif "socket" in first.lower() or "refused" in first.lower():
+        hint = "\n\nПохоже, служба fail2ban не запущена."
+    return (f"🛡 Блокировка — {server_name}\n\n"
+            f"Не удалось прочитать состояние fail2ban.\n{first}{hint}")
+
+
 async def _show(query, server_name: str, note: str = ""):
     server = load_server(server_name)
-    state = await asyncio.to_thread(read_state, server)
+    try:
+        state = await asyncio.to_thread(read_state, server)
+    except Exception as e:
+        await safe_edit_message(
+            query, _trouble(server_name, str(e)),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔄 Повторить",
+                    callback_data=f"f2b_menu:{f2b_token(server_name)}"),
+                InlineKeyboardButton("← Назад",
+                                     callback_data=f"server:{server_name}"),
+            ]]))
+        return
     candidates = suspects_for(server_name, state)
 
     addresses = [a for j in state.get("jails") or []

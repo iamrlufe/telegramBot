@@ -187,3 +187,32 @@ def test_exchange_suspects_need_the_threshold():
             {"user": "admin", "ip": "10.20.30.5", "count": 500}]
 
     assert [i["ip"] for i in suspects(rows)] == ["203.0.113.5"]
+
+
+# ─── Понятная ошибка вместо общей ────────────────────────────
+
+def test_missing_sudo_rule_is_explained():
+    """Общая «произошла ошибка» заставляла бы искать причину вслепую, а
+    чинится это на сервере одной строкой в sudoers."""
+    from fail2ban_bot import _trouble
+
+    text = _trouble("mail-01", "sudo: a password is required")
+    assert "правила sudo" in text
+    assert "banip" in text
+
+
+def test_missing_service_is_explained():
+    from fail2ban_bot import _trouble
+
+    assert "не запущена" in _trouble("mail-01",
+                                     "Failed to access socket path")
+    assert "не установлен" in _trouble("mail-01",
+                                       "bash: fail2ban-client: command not found")
+
+
+def test_unknown_error_shows_the_original_text():
+    """Если причина не опознана, показываем текст с сервера как есть —
+    он информативнее любой догадки."""
+    from fail2ban_bot import _trouble
+
+    assert "Connection timed out" in _trouble("mail-01", "Connection timed out")
