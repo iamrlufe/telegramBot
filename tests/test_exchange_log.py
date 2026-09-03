@@ -337,7 +337,7 @@ def _ex_summary(**over):
                  "last": "2026-09-01 04:00:00"}]
     owa.update(over.pop("owa", {}))
     return summary_for(owa, over.pop("eas", eas), over.pop("failures", failures),
-                       over.pop("geo", {}))
+                       over.pop("geo", {}), over.pop("track", None))
 
 
 def test_summary_shape_matches_zimbra():
@@ -422,3 +422,131 @@ def test_probes_are_hidden_from_dashboard_lists():
     assert not any("HealthMailbox" in t for t in lists["Телефоны (ActiveSync)"])
     assert any("buh@example.local" in t for t in lists["Кто работает в OWA"])
     assert lists["Телефоны (ActiveSync)"] == ["zh@example.local"]
+
+
+# ─── Поток писем из трассировки ──────────────────────────────
+#
+# До этого про Exchange было известно только то, что видно в логах IIS:
+# кто заходил в OWA и с какого телефона. Писем там нет вовсе, поэтому
+# карточка выглядела втрое беднее Zimbra.
+
+TRACK = {
+    "messages_in": 4210, "messages_out": 812, "recipients": 5300,
+    "failed": 17, "queue": 5, "poison": 0,
+    "senders_out": [{"sender": "buh@example.local", "messages": 300,
+                     "recipients": 640},
+                    {"sender": "hr@example.local", "messages": 12,
+                     "recipients": 12}],
+    "senders_in": [{"sender": "news@bank.invalid", "messages": 107,
+                    "recipients": 136}],
+    "fail_reasons": [{"reason": "550 5.1.1 User unknown", "count": 12}],
+    "sources": [{"ip": "203.0.113.9", "count": 90}],
+}
+
+
+def test_mail_flow_appears_in_kpis():
+    summary = _ex_summary(track=TRACK)
+    labels = {k["label"]: k["value"] for k in summary["kpis"]}
+
+    assert labels["писем принято"] == 4210
+    assert labels["отправлено"] == 812
+    assert labels["в очереди"] == 5
+
+
+def test_senders_are_split_like_zimbra():
+    summary = _ex_summary(track=TRACK)
+    titles = {g["title"]: [r["title"] for r in g["rows"]]
+              for g in summary["groups"]}
+
+    assert titles["Кто отправляет"] == ["buh@example.local", "hr@example.local"]
+    assert titles["Кто пишет вам"] == ["news@bank.invalid"]
+    assert titles["Не доставлено"] == ["550 5.1.1 User unknown"]
+
+
+def test_sender_row_says_what_the_number_means():
+    rows = [g for g in _ex_summary(track=TRACK)["groups"]
+            if g["title"] == "Кто отправляет"][0]["rows"]
+
+    assert rows[0]["left"] == "300"
+    assert rows[0]["detail"] == "писем · на 640 адресов"
+
+
+def test_heavy_sender_is_marked():
+    """Всплеск отправки у своей учётки — первый признак того, что ею
+    начали рассылать спам."""
+    import exchange_collector
+
+    track = dict(TRACK, senders_out=[
+        {"sender": "buh@example.local",
+         "messages": exchange_collector.SEND_ALERT + 1, "recipients": 9000}])
+    rows = [g for g in _ex_summary(track=track)["groups"]
+            if g["title"] == "Кто отправляет"][0]["rows"]
+
+    assert rows[0]["level"] == "warn"
+
+
+def test_queue_and_poison_reach_alarms():
+    import exchange_collector
+
+    summary = _ex_summary(track=dict(
+        TRACK, queue=exchange_collector.QUEUE_ALERT + 1, poison=3))
+
+    assert any("poison" in a for a in summary["alarms"])
+    assert any("очередь" in a for a in summary["alarms"])
+
+
+def test_unknown_queue_is_not_reported_as_empty():
+    """Счётчики могли не сняться. «Очередь пуста» в этом случае означало бы
+    обратное тому, что произошло."""
+    summary = _ex_summary(track=dict(TRACK, queue=None))
+    labels = {k["label"]: k["value"] for k in summary["kpis"]}
+
+    assert labels["в очереди"] == "?"
+    assert not any("очередь" in a for a in summary["alarms"])
+
+
+def test_old_kpis_stay_when_tracking_is_unavailable():
+    """Нет прав на каталог трассировки или снимок старый — карточка
+    остаётся прежней, а не показывает нули вместо писем."""
+    labels = {k["label"] for k in _ex_summary()["kpis"]}
+
+    assert "обращений в OWA" in labels
+    assert "писем принято" not in labels
+
+
+def test_tracking_script_reads_fields_by_name():
+    """Схема лога трассировки менялась между версиями Exchange: разбор по
+    позициям молча дал бы чужие значения."""
+    import exchange_track
+
+    script = exchange_track._script(24)
+    assert "#Fields:" in script
+    assert "ConvertFrom-Csv -Header $cols" in script
+
+
+def test_tracking_script_counts_messages_not_lines():
+    """Одно письмо проходит транспорт несколькими событиями (RECEIVE,
+    RESOLVE, AGENTINFO, SEND, DELIVER). Счёт строк завысил бы объём в
+    несколько раз — та же ошибка, что и со строками mail.log у Zimbra."""
+    import exchange_track
+
+    script = exchange_track._script(24)
+    assert "$seen.ContainsKey($id)" in script
+    assert "$event -ne 'RECEIVE'" in script
+
+
+def test_tracking_script_trusts_exchange_about_direction():
+    """directionality проставляет сама Exchange, зная свои домены. Это
+    надёжнее разбора адреса: подделанный свой адрес в конверте туда не
+    пролезет."""
+    import exchange_track
+
+    assert "$r.directionality -eq 'Originating'" in exchange_track._script(24)
+
+
+def test_tracking_parser_keeps_unknown_queue_as_none():
+    import exchange_track
+
+    assert exchange_track._rows(None) == []
+    assert exchange_track._rows({"a": 1}) == [{"a": 1}]
+    assert exchange_track._rows([{"a": 1}, {"b": 2}]) == [{"a": 1}, {"b": 2}]

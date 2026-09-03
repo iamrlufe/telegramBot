@@ -23,6 +23,7 @@ from exchange_log import (
     has_exchange, is_service_client, read_activesync, read_owa_failures,
     read_owa_logins,
 )
+from exchange_track import read_tracking
 from geoip import resolve as geo_resolve
 from mail_store import SUMMARY_ROWS, save_snapshot
 from settings import int_env
@@ -44,10 +45,19 @@ WINDOW_HOURS = 24
 # человек ошибается несколько раз и идёт к администратору.
 FAIL_ALERT = _int_env("EXCHANGE_FAIL_ALERT", 20)
 
+# Писем в очереди транспорта. Здоровая очередь на живом сервере — единицы;
+# сотни означают, что почта не уходит.
+QUEUE_ALERT = _int_env("EXCHANGE_QUEUE_ALERT", 100)
+
+# Писем от одного отправителя за сутки. Всплеск у своей учётки — первый
+# признак того, что ею начали рассылать спам.
+SEND_ALERT = _int_env("EXCHANGE_SEND_ALERT", 500)
+
 _last_scan = None
 
 
-def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None) -> dict:
+def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None,
+                track: dict = None) -> dict:
     """Сводка одного сервера в общей для почты форме: kpis, groups, alarms.
 
     Чистая функция ради теста: правила здесь важнее, чем то, как читались
@@ -72,16 +82,59 @@ def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None) -> dict:
     attempts = sum(int(r.get("count") or 0) for r in failures)
     brute = [r for r in failures if int(r.get("count") or 0) >= FAIL_ALERT]
 
-    kpis = [
-        {"value": owa.get("scanned") or 0, "label": "обращений в OWA",
-         "level": "ok"},
-        {"value": len(users), "label": "пользователей", "level": "ok"},
-        {"value": len(mobile), "label": "мобильных клиентов", "level": "ok"},
-        {"value": attempts, "label": "неверных паролей",
-         "level": "crit" if brute else "warn" if attempts else "ok"},
-    ]
+    track = track or {}
+    queue = track.get("queue")
+    poison = track.get("poison") or 0
+
+    # Плитки те же по смыслу, что у Zimbra: сначала объём почты, потом
+    # состояние транспорта, потом безопасность. Пока трассировка не
+    # читается (старый снимок, нет прав), верх занимают счётчики OWA —
+    # прежнее поведение, а не пустые нули.
+    kpis = []
+    if track:
+        kpis += [
+            {"value": track.get("messages_in") or 0, "label": "писем принято",
+             "level": "ok"},
+            {"value": track.get("messages_out") or 0, "label": "отправлено",
+             "level": "ok"},
+            {"value": queue if queue is not None else "?", "label": "в очереди",
+             "level": "warn" if (queue or 0) > QUEUE_ALERT else "ok"},
+        ]
+    else:
+        kpis += [
+            {"value": owa.get("scanned") or 0, "label": "обращений в OWA",
+             "level": "ok"},
+            {"value": len(users), "label": "пользователей", "level": "ok"},
+            {"value": len(mobile), "label": "мобильных клиентов", "level": "ok"},
+        ]
+    kpis.append({"value": attempts, "label": "неверных паролей",
+                 "level": "crit" if brute else "warn" if attempts else "ok"})
 
     groups = []
+
+    def sender_rows(items):
+        return [
+            {"level": "warn" if (i.get("messages") or 0) >= SEND_ALERT else "ok",
+             "left": str(i.get("messages") or 0),
+             "title": i.get("sender") or "",
+             # Голое число слева не читается: писем это или адресов?
+             "detail": f"писем · на {i.get('recipients') or 0} адресов"}
+            for i in items[:SUMMARY_ROWS]
+        ]
+
+    if track.get("senders_out"):
+        groups.append({"title": "Кто отправляет", "level": "ok",
+                       "rows": sender_rows(track["senders_out"])})
+    if track.get("senders_in"):
+        groups.append({"title": "Кто пишет вам", "level": "ok",
+                       "rows": sender_rows(track["senders_in"])})
+    if track.get("fail_reasons"):
+        groups.append({"title": "Не доставлено", "level": "warn", "rows": [
+            {"level": "warn", "left": str(i.get("count") or 0),
+             "title": (i.get("reason") or "")[:90], "detail": ""}
+            for i in track["fail_reasons"][:SUMMARY_ROWS]
+        ]})
+
     if failures:
         groups.append({"title": "Пароль не подошёл", "level": "warn", "rows": [
             {"level": "crit" if int(r.get("count") or 0) >= FAIL_ALERT else "warn",
@@ -110,6 +163,10 @@ def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None) -> dict:
         ]})
 
     alarms = sorted({f"подбор пароля с {r.get('ip') or '?'}" for r in brute})
+    if poison:
+        alarms.append(f"{poison} писем в poison-очереди")
+    if queue is not None and queue > QUEUE_ALERT:
+        alarms.append(f"очередь {queue} при пороге {QUEUE_ALERT}")
     return {"kpis": kpis, "groups": groups, "alarms": alarms}
 
 
@@ -119,9 +176,11 @@ def collect_server(server: dict):
     name = server["name"]
     owa, eas, failures, errors = {}, {}, [], []
 
+    track = {}
     for label, call in (("OWA", lambda: read_owa_logins(server, WINDOW_HOURS)),
                         ("ActiveSync", lambda: read_activesync(server, WINDOW_HOURS)),
-                        ("Security", lambda: read_owa_failures(server, WINDOW_HOURS))):
+                        ("Security", lambda: read_owa_failures(server, WINDOW_HOURS)),
+                        ("Трассировка", lambda: read_tracking(server, WINDOW_HOURS))):
         try:
             result = call()
         except Exception as e:
@@ -132,10 +191,12 @@ def collect_server(server: dict):
             owa = result
         elif label == "ActiveSync":
             eas = result
-        else:
+        elif label == "Security":
             failures = result
+        else:
+            track = result
 
-    if not owa and not eas and not failures:
+    if not owa and not eas and not failures and not track:
         # Прежняя сводка остаётся, к ней дописывается причина: пустая
         # карточка выглядела бы как «в почту никто не заходил».
         save_snapshot(name, "exchange", None, error="; ".join(errors))
@@ -146,7 +207,8 @@ def collect_server(server: dict):
         geo = geo_resolve([a for a in addresses if a])
     except Exception:
         geo = {}
-    save_snapshot(name, "exchange", summary_for(owa, eas, failures, geo),
+    save_snapshot(name, "exchange",
+                  summary_for(owa, eas, failures, geo, track),
                   error="; ".join(errors))
 
 
