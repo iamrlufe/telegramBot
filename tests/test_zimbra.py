@@ -834,3 +834,68 @@ def test_inside_submission_counts_as_ours():
         [(["app@example.local", "10.100.0.10", "1"], 5)], ["example.local"])
 
     assert [i["sender"] for i in res["own"]] == ["app@example.local"]
+
+
+# ─── Маршрутизатор — не рабочее место ────────────────────────
+#
+# Zimbra пишет адрес соединения. Если пользователи ходят через
+# маршрутизатор, все приходят с его адреса: внешний сотрудник неотличим от
+# сидящего в соседней комнате. Прятать такие входы как «локальные» —
+# прятать ровно то, ради чего раздел существует.
+
+GATEWAY_EVENTS = [
+    {"account": "a@example.local", "ip": "10.100.0.10", "protocol": "soap",
+     "ok": True, "count": 10, "last": "2026-09-01 10:00:00"},
+    {"account": "b@example.local", "ip": "10.100.0.10", "protocol": "soap",
+     "ok": True, "count": 9, "last": "2026-09-01 10:00:00"},
+    {"account": "c@example.local", "ip": "10.100.0.10", "protocol": "soap",
+     "ok": True, "count": 6, "last": "2026-09-01 10:00:00"},
+    {"account": "d@example.local", "ip": "10.100.210.41", "protocol": "soap",
+     "ok": True, "count": 4, "last": "2026-09-01 10:00:00"},
+]
+
+
+def test_gateway_is_recognised_by_number_of_accounts():
+    """За рабочим местом один человек, за шлюзом — вся сеть."""
+    assert zimbra_log.shared_gateways(GATEWAY_EVENTS) == {"10.100.0.10"}
+
+
+def test_public_address_is_never_a_gateway():
+    """Внешний адрес и так показывается: записывать его в шлюзы незачем,
+    а страну по нему видно."""
+    events = [dict(e, ip="203.0.113.9") for e in GATEWAY_EVENTS]
+    assert zimbra_log.shared_gateways(events) == set()
+
+
+def test_login_through_gateway_stays_visible():
+    summary = _summary(audit={"failed": 0, "events": GATEWAY_EVENTS})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто заходил"][0]["rows"]
+    titles = " ".join(r["title"] for r in rows)
+
+    # трое из-за шлюза видны, рабочее место скрыто
+    assert "a@example.local" in titles and "c@example.local" in titles
+    assert "d@example.local" not in titles
+
+
+def test_gateway_row_says_the_address_is_not_the_client():
+    """Иначе строку читают как «вход изнутри, всё в порядке» — а это
+    может быть кто угодно из интернета."""
+    summary = _summary(audit={"failed": 0, "events": GATEWAY_EVENTS})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто заходил"][0]["rows"]
+
+    assert all("адрес клиента не виден" in r["detail"] for r in rows)
+    # и никакого «локальная сеть» рядом со шлюзом
+    assert all("локальная сеть" not in r["title"] for r in rows)
+
+
+def test_no_claim_about_outside_when_only_workstations():
+    """Раньше здесь стояло «снаружи не заходил никто». При NAT это ложь, а
+    без NAT — утверждение о том, чего в логе нет."""
+    events = [{"account": "d@example.local", "ip": "10.100.210.41",
+               "protocol": "soap", "ok": True, "count": 4, "last": ""}]
+    summary = _summary(audit={"failed": 0, "events": events})
+    row = [g for g in summary["groups"]
+           if g["title"] == "Кто заходил"][0]["rows"][0]
+
+    assert "снаружи не заходил никто" not in row["detail"]
+    assert row["left"] == "4"

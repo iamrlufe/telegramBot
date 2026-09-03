@@ -593,20 +593,53 @@ def split_senders(senders, origins, local_domains) -> dict:
     return {"own": own, "incoming": incoming}
 
 
-def is_local_login(event) -> bool:
-    """Вход из локальной сети.
+# Сколько разных учёток за одним внутренним адресом означает, что это не
+# рабочее место, а общий выход сети наружу — маршрутизатор, прокси, шлюз.
+# За рабочим местом сидит один человек, изредка двое.
+GATEWAY_MIN_ACCOUNTS = int_env("ZIMBRA_GATEWAY_MIN_ACCOUNTS", 3)
 
-    На дашборде такие входы вытесняли всё остальное: у организации со
-    своей сетью девяносто девять входов из ста — внутренние, и обзор
-    состоял из них целиком. Интерес представляет обратное — вход снаружи,
-    поэтому в сводке остаются только они.
+
+def shared_gateways(events, min_accounts: int = None) -> set:
+    """Внутренние адреса, за которыми стоит не человек, а выход целой сети.
+
+    Zimbra пишет в audit.log адрес, с которого пришло соединение. Если
+    пользователи ходят в почту через маршрутизатор, все они приходят с его
+    адреса — и внешний сотрудник, и сидящий в соседней комнате выглядят
+    одинаково, как «локальная сеть». Считать такой вход внутренним нельзя:
+    настоящий адрес клиента до сервера просто не доезжает.
+
+    Отличить шлюз от рабочего места по логу можно только так — по числу
+    разных учёток за одним адресом.
+
+    Честный вывод отсюда — не «все входы внутренние», а «адрес клиента не
+    виден». Это разные утверждения, и второе не даёт повода успокоиться.
+    """
+    limit = GATEWAY_MIN_ACCOUNTS if min_accounts is None else min_accounts
+    from geoip import is_private
+
+    accounts = {}
+    for event in events or []:
+        ip = (event.get("ip") or "").strip()
+        if not is_private(ip):
+            continue
+        accounts.setdefault(ip, set()).add(event.get("account") or "")
+    return {ip for ip, names in accounts.items() if len(names) >= limit}
+
+
+def is_local_login(event, gateways=()) -> bool:
+    """Вход с рабочего места в локальной сети — такой из обзора убирается.
+
+    Вход через шлюз (gateways) сюда НЕ попадает: за ним может стоять
+    человек снаружи, и прятать его — значит прятать ровно то, ради чего
+    раздел существует.
 
     Полный список входов, включая внутренние, никуда не делся: он в
     карточке сервера в боте, 🔑 Входы в почту.
     """
     from geoip import is_private
 
-    return is_private((event.get("ip") or "").strip())
+    ip = (event.get("ip") or "").strip()
+    return is_private(ip) and ip not in set(gateways or ())
 
 
 def _origin_rows(origins):

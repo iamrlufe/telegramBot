@@ -27,7 +27,8 @@ from settings import int_env
 from zimbra_log import (
     QUEUE_ALERT, SENDER_REJECT_ALERT, SPOOF_ALERT,
     _origin_rows, addresses, brute_force, foreign_logins, is_local_login,
-    is_service_login, is_service_sender, sender_rejects, split_senders,
+    is_service_login, is_service_sender, sender_rejects, shared_gateways,
+    split_senders,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
     read_mail,
     spoofed_senders,
@@ -236,27 +237,42 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
         ]})
 
     # Из обзора успешных входов убраны двое: служебные обращения самого
-    # сервера (учётка zimbra с админ-протоколом набирает за сутки больше
-    # входов, чем любой человек) и входы из локальной сети — в организации
-    # со своей сетью ими заполнялся весь список, и вход снаружи, ради
-    # которого раздел и нужен, в пятнадцать строк уже не попадал.
-    # Полный список входов остаётся в карточке бота, 🔑 Входы в почту.
+    # сервера (учётка zimbra набирает за сутки больше входов, чем любой
+    # человек) и входы с рабочих мест в локальной сети — ими заполнялся
+    # весь список, и вход снаружи в пятнадцать строк уже не попадал.
+    #
+    # Шлюзы — исключение, и оно тут главное. Если пользователи ходят в
+    # почту через маршрутизатор, все они приходят с его адреса, и внешний
+    # сотрудник неотличим от сидящего в соседней комнате. Такие входы
+    # прячутся ровно наоборот тому, зачем раздел нужен, поэтому остаются —
+    # с подписью, что настоящий адрес до сервера не доехал.
     good = [e for e in events if e.get("ok") and not is_service_login(e)]
-    outside = [e for e in good if not is_local_login(e)]
-    rows = [
-        {"level": "ok", "left": str(e.get("count") or 0),
-         "title": f"{e.get('account') or '—'} ← {e.get('ip') or '—'}"
-                  + place(e.get("ip")),
-         "detail": e.get("protocol") or ""}
-        for e in outside[:SUMMARY_ROWS]
-    ]
-    # Пустой раздел молча исчезает, а «снаружи не заходил никто» — это
-    # ответ, а не отсутствие данных, и он стоит одной строки.
+    gateways = shared_gateways(events)
+    shown = [e for e in good if not is_local_login(e, gateways)]
+
+    def login_row(event):
+        ip = event.get("ip") or "—"
+        gateway = ip in gateways
+        return {
+            "level": "ok",
+            "left": str(event.get("count") or 0),
+            "title": f"{event.get('account') or '—'} ← {ip}"
+                     + ("" if gateway else place(ip)),
+            "detail": ((event.get("protocol") or "") + " · через шлюз, "
+                       "адрес клиента не виден") if gateway
+                      else (event.get("protocol") or ""),
+        }
+
+    rows = [login_row(e) for e in shown[:SUMMARY_ROWS]]
+    # Пустой раздел молча исчезает, а «входили только с рабочих мест» —
+    # это ответ, и он стоит строки. Утверждать при этом, что снаружи никто
+    # не заходил, нельзя: за шлюзом адреса не видно, а без шлюза видно
+    # только тех, кто пришёл напрямую.
     if good and not rows:
-        rows = [{"level": "ok", "left": str(sum(e.get("count") or 0
-                                                for e in good)),
-                 "title": "входов из локальной сети",
-                 "detail": "снаружи не заходил никто"}]
+        rows = [{"level": "ok",
+                 "left": str(sum(e.get("count") or 0 for e in good)),
+                 "title": "входов с рабочих мест в локальной сети",
+                 "detail": "адресов снаружи среди них нет"}]
     if rows:
         groups.append({"title": "Кто заходил", "level": "ok", "rows": rows})
 
