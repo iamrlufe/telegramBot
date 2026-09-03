@@ -28,7 +28,7 @@ from zimbra_log import (
     QUEUE_ALERT, SENDER_REJECT_ALERT, SPOOF_ALERT,
     _origin_rows, addresses, brute_force, foreign_logins, is_local_login,
     is_service_login, is_service_sender, sender_rejects, shared_gateways,
-    split_senders,
+    split_senders, spray_targets, attempts,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
     read_mail,
     spoofed_senders,
@@ -100,6 +100,28 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
                         if item["guessed"] else "")),
             "hint": f"{item['count']} неудачных входов",
             "key": f"zm_brute:{server_name}:{item['account']}:{item['ip']}",
+        }))
+
+    # Распылённый перебор: порог по одному адресу его не берёт, а это самая
+    # обычная форма — по одной попытке с десятков адресов из разных стран.
+    louder = {item["account"] for item in brute_force(audit.get("events"))}
+    for item in spray_targets(audit.get("events"), skip=louder):
+        where = ", ".join(item["addresses"][:3])
+        more = (f" и ещё {len(item['addresses']) - 3}"
+                if len(item["addresses"]) > 3 else "")
+        how = (" по " + ", ".join(item["protocols"])) if item["protocols"] else ""
+        found.append((server_name, {
+            "level": "crit" if item["guessed"] else "warn",
+            "text": (f"{'🔴' if item['guessed'] else '🟠'} перебор пароля"
+                     f"{how} к {item['account']}: {attempts(item['count'])} с "
+                     f"{addresses(len(item['addresses']))} ({where}{more})"
+                     + (" — И ОДИН УДАЧНЫЙ ВХОД С ТЕХ ЖЕ АДРЕСОВ, "
+                        "пароль подобран" if item["guessed"] else
+                        ". По одному адресу порог не срабатывает — так его "
+                        "и обходят")),
+            "hint": f"перебор с {len(item['addresses'])} адресов",
+            # Ключ без чисел: иначе каждая новая попытка — новая находка.
+            "key": f"zm_spray:{server_name}:{item['account']}",
         }))
 
     for item in outside_senders(mail.get("origins"), mail.get("local_domains")):

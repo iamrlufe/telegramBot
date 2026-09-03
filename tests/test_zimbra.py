@@ -947,3 +947,83 @@ def test_admin_flag_needs_port_7071():
     """Путь /service/admin/ общий у админки и у проверки пароля SMTP —
     отличает их только порт."""
     assert ":7071/service/admin/" in zimbra_log._AUDIT_AWK
+
+
+# ─── Распылённый перебор ─────────────────────────────────────
+#
+# Настоящий лог с боевого: одна учётка, шесть стран, по одной-две попытки
+# с каждого адреса. Порог «50 неудач с одного адреса» такой перебор не
+# берёт никогда — именно так его и обходят.
+
+SPRAY_EVENTS = [
+    {"account": "admin@example.local", "ip": "203.0.113.5", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 05:48:44"},
+    {"account": "admin@example.local", "ip": "203.0.113.9", "protocol": "smtp",
+     "ok": False, "count": 2, "last": "2026-09-01 05:50:08"},
+    {"account": "admin@example.local", "ip": "198.51.100.7", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 06:01:00"},
+    {"account": "buh@example.local", "ip": "198.51.100.20", "protocol": "imap",
+     "ok": False, "count": 2, "last": "2026-09-01 06:10:00"},
+]
+
+
+def test_spray_needs_several_addresses():
+    found = zimbra_log.spray_targets(SPRAY_EVENTS)
+
+    assert [i["account"] for i in found] == ["admin@example.local"]
+    assert found[0]["count"] == 4          # попытки суммируются по адресам
+    assert len(found[0]["addresses"]) == 3
+
+
+def test_single_address_is_not_spray():
+    """Одиночный адрес — это забытый пароль либо работа brute_force,
+    у которого свой порог."""
+    events = [{"account": "buh@example.local", "ip": "198.51.100.7",
+               "protocol": "imap", "ok": False, "count": 40, "last": ""}]
+    assert zimbra_log.spray_targets(events) == []
+
+
+def test_spray_does_not_repeat_what_brute_force_said():
+    found = zimbra_log.spray_targets(SPRAY_EVENTS,
+                                     skip=["admin@example.local"])
+    assert found == []
+
+
+def test_spray_turns_red_when_a_login_succeeded():
+    """Удачный вход с одного из тех же адресов означает, что пароль уже
+    подобран, а не что его подбирают."""
+    events = SPRAY_EVENTS + [
+        {"account": "admin@example.local", "ip": "203.0.113.9",
+         "protocol": "imap", "ok": True, "count": 1, "last": ""}]
+    found = zimbra_log.spray_targets(events)
+
+    assert found[0]["guessed"] is True
+
+
+def test_spray_finding_reaches_alerts():
+    from zimbra_collector import findings_for
+
+    found = findings_for("mail-01", {}, {"events": SPRAY_EVENTS}, {})
+    spray = [item for _s, item in found if item["key"].startswith("zm_spray:")]
+
+    assert len(spray) == 1
+    assert spray[0]["level"] == "warn"
+    assert "3 адреса" in spray[0]["text"]
+    assert "4 попытки" in spray[0]["text"]
+    assert "по smtp" in spray[0]["text"]
+
+
+def test_spray_finding_key_has_no_number():
+    from zimbra_collector import findings_for
+
+    found = findings_for("mail-01", {}, {"events": SPRAY_EVENTS}, {})
+    keys = [item["key"] for _s, item in found]
+
+    assert keys == ["zm_spray:mail-01:admin@example.local"]
+
+
+def test_attempts_are_declined():
+    assert zimbra_log.attempts(1) == "1 попытка"
+    assert zimbra_log.attempts(3) == "3 попытки"
+    assert zimbra_log.attempts(11) == "11 попыток"
+    assert zimbra_log.attempts(52) == "52 попытки"

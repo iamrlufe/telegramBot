@@ -65,6 +65,16 @@ QUEUE_ALERT = int_env("ZIMBRA_QUEUE_ALERT", 300)
 # Неудачных входов с одного адреса за сутки.
 AUTH_FAIL_ALERT = int_env("ZIMBRA_AUTH_FAIL_ALERT", 50)
 
+# Разных адресов, с которых за сутки перебирают одну учётку.
+#
+# Порог по одному адресу обходится тривиально и обходится на практике: по
+# одной попытке с полусотни адресов из разных стран не берёт ни одно
+# правило, считающее пару «учётка + адрес». Признак здесь другой — не
+# настойчивость с одного места, а сама разбросанность: живой человек,
+# забывший пароль, ошибается со своего компьютера, а не из шести стран за
+# ночь.
+SPRAY_ADDRESSES_ALERT = int_env("ZIMBRA_SPRAY_ADDRESSES_ALERT", 3)
+
 # Страна, из которой входы считаются штатными.
 HOME_COUNTRY = os.getenv("ZIMBRA_HOME_COUNTRY", "KZ").strip().upper()
 
@@ -532,6 +542,19 @@ def letters(count: int) -> str:
     return f"{count} писем"
 
 
+def attempts(count: int) -> str:
+    """«1 попытка», «3 попытки», «5 попыток». Третья пара к letters()."""
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} попыток"
+    last = count % 10
+    if last == 1:
+        return f"{count} попытка"
+    if 2 <= last <= 4:
+        return f"{count} попытки"
+    return f"{count} попыток"
+
+
 def addresses(count: int) -> str:
     """«1 адрес», «2 адреса», «5 адресов». Пара к letters().
 
@@ -789,6 +812,45 @@ def brute_force(events, threshold: int = None) -> list:
         found.append(dict(event, guessed=key in good,
                           admin="/admin" in event.get("protocol", "")))
     found.sort(key=lambda e: -e["count"])
+    return found
+
+
+def spray_targets(events, min_addresses: int = None, skip=()) -> list:
+    """Учётки, пароль к которым перебирают сразу с нескольких адресов.
+
+    Дополняет brute_force, а не заменяет: то правило ловит настойчивость с
+    одного адреса, это — разбросанность по многим. Вместе они закрывают обе
+    формы перебора, поодиночке — ни одной полностью.
+
+    skip — учётки, о которых уже сказал brute_force: две тревоги об одном и
+    том же не добавляют знания.
+
+    guessed повторяет логику соседнего правила: если с одного из тех же
+    адресов вход в итоге удался, пароль подобран, и это уже не попытка.
+    """
+    limit = SPRAY_ADDRESSES_ALERT if min_addresses is None else min_addresses
+    good = {(e["account"], e["ip"]) for e in events or [] if e.get("ok")}
+
+    by_account = {}
+    for event in events or []:
+        if event.get("ok") or event.get("account") in set(skip or ()):
+            continue
+        item = by_account.setdefault(event["account"], {
+            "account": event["account"], "count": 0,
+            "addresses": set(), "protocols": set(), "guessed": False,
+        })
+        item["count"] += event.get("count") or 0
+        item["addresses"].add(event.get("ip"))
+        if event.get("protocol"):
+            item["protocols"].add(event["protocol"])
+        if (event["account"], event.get("ip")) in good:
+            item["guessed"] = True
+
+    found = [dict(item, addresses=sorted(item["addresses"]),
+                  protocols=sorted(item["protocols"]))
+             for item in by_account.values()
+             if len(item["addresses"]) >= limit]
+    found.sort(key=lambda i: (-len(i["addresses"]), -i["count"]))
     return found
 
 
