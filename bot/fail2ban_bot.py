@@ -120,6 +120,15 @@ def format_state(server_name: str, state: dict, candidates: list,
             lines.append(f"   … и ещё {hidden}")
         lines.append("")
 
+    history = state.get("history") or []
+    if history:
+        lines.append("🕘 Банили за последние сутки — сейчас срок уже вышел:")
+        for item in history[:SHOW_LIMIT]:
+            again = f" ×{item['count']}" if item["count"] > 1 else ""
+            lines.append(f"   {item['ip']}{_geo(item['ip'], geo)}{again} — "
+                         f"{item['jail']}, {item['last'][11:16]}")
+        lines.append("")
+
     if state.get("ignored"):
         lines.append("⚪ Белый список fail2ban: "
                      + ", ".join(state["ignored"][:10]))
@@ -204,6 +213,7 @@ async def _show(query, server_name: str, note: str = ""):
     addresses = [a for j in state.get("jails") or []
                  for a in (j.get("addresses") or [])]
     addresses += [c["ip"] for c in candidates]
+    addresses += [h["ip"] for h in state.get("history") or []]
     try:
         geo = await asyncio.to_thread(geo_resolve, addresses)
     except Exception:

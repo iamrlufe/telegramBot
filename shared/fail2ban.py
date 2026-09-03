@@ -73,6 +73,10 @@ if [ -n "$FIRST" ]; then
   echo "===IGNORE==="
   f2b get "$FIRST" ignoreip
 fi
+echo "===HISTORY==="
+for f in /var/log/fail2ban.log.1 /var/log/fail2ban.log; do
+  if [ -r "$f" ]; then grep -h "] Ban " "$f" 2>/dev/null | tail -400; fi
+done
 """
 
 
@@ -168,7 +172,41 @@ def parse_state(output: str) -> dict:
     order = parse_jails(text("STATUS"))
     jails.sort(key=lambda j: order.index(j["jail"])
                if j["jail"] in order else len(order))
-    return {"jails": jails, "ignored": parse_ignoreip(text("IGNORE"))}
+    return {"jails": jails, "ignored": parse_ignoreip(text("IGNORE")),
+            "history": parse_history(text("HISTORY"))}
+
+
+# Строка бана в логе: «2026-09-03 14:07:49,112 fail2ban.actions [1788]:
+# NOTICE  [zimbra-web] Ban 203.0.113.5».
+_BAN_LINE = re.compile(
+    r"^(?P<when>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)"
+    r".*\[(?P<jail>[^\]]+)\]\s+Ban\s+(?P<ip>\S+)")
+
+
+def parse_history(text: str, limit: int = 20) -> list:
+    """Кого банили за время, что лежит в логе.
+
+    Нужна потому, что `status` знает только тех, кто забанен сейчас, а при
+    часовом bantime это почти всегда пусто: на экране «заблокировано 0»
+    рядом с «всего 66» читается как поломка, хотя оба числа верны.
+
+    Повторные баны одного адреса схлопываются: важно, что он возвращался,
+    и когда это было в последний раз, а не каждая отметка отдельно.
+    """
+    found = {}
+    for line in (text or "").splitlines():
+        match = _BAN_LINE.match(line.strip())
+        if not match:
+            continue
+        ip = match.group("ip")
+        item = found.setdefault(ip, {"ip": ip, "jail": match.group("jail"),
+                                     "count": 0, "last": ""})
+        item["count"] += 1
+        item["jail"] = match.group("jail")
+        if match.group("when") > item["last"]:
+            item["last"] = match.group("when")
+    rows = sorted(found.values(), key=lambda i: i["last"], reverse=True)
+    return rows[:limit]
 
 
 def read_state(server: dict) -> dict:

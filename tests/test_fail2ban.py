@@ -275,3 +275,58 @@ def test_state_script_resolves_the_binary():
     бывает урезан."""
     assert "command -v fail2ban-client" in fail2ban._STATE_SH
     assert 'sudo -n "$BIN"' in fail2ban._STATE_SH
+
+
+# ─── История банов ───────────────────────────────────────────
+#
+# `status` знает только тех, кто забанен сейчас, а при часовом bantime это
+# почти всегда пусто: «заблокировано 0» рядом с «всего 66» читается как
+# поломка, хотя оба числа верны.
+
+HISTORY_LOG = """\
+2026-09-03 05:48:44,358 fail2ban.actions [1788]: NOTICE  [zimbra-auth] Ban 203.0.113.5
+2026-09-03 06:01:02,110 fail2ban.actions [1788]: NOTICE  [zimbra-auth] Ban 198.51.100.7
+2026-09-03 07:15:00,000 fail2ban.actions [1788]: NOTICE  [zimbra-auth] Ban 203.0.113.5
+2026-09-03 07:20:00,000 fail2ban.actions [1788]: NOTICE  [zimbra-auth] Unban 203.0.113.5
+"""
+
+
+def test_history_groups_repeat_bans():
+    rows = fail2ban.parse_history(HISTORY_LOG)
+
+    by_ip = {r["ip"]: r for r in rows}
+    assert by_ip["203.0.113.5"]["count"] == 2
+    assert by_ip["203.0.113.5"]["last"] == "2026-09-03 07:15:00"
+    assert by_ip["198.51.100.7"]["count"] == 1
+
+
+def test_history_ignores_unban_lines():
+    """Снятие бана — не бан: иначе адрес считался бы дважды."""
+    rows = fail2ban.parse_history(HISTORY_LOG)
+    assert sum(r["count"] for r in rows) == 3
+
+
+def test_history_is_sorted_by_recency():
+    rows = fail2ban.parse_history(HISTORY_LOG)
+    assert [r["ip"] for r in rows] == ["203.0.113.5", "198.51.100.7"]
+
+
+def test_history_survives_a_missing_log():
+    """Лог fail2ban читается не всякой учёткой. Раздел от этого не должен
+    ломаться — просто не покажет историю."""
+    assert fail2ban.parse_history("") == []
+    assert fail2ban.parse_state("===STATUS===\n")["history"] == []
+
+
+def test_history_reaches_the_screen():
+    from fail2ban_bot import format_state
+
+    state = {"jails": [{"jail": "zimbra-auth", "banned_now": 0,
+                        "banned_total": 66, "failed_total": 7161,
+                        "addresses": []}],
+             "ignored": [], "history": fail2ban.parse_history(HISTORY_LOG)}
+    text = format_state("mail-01", state, [], {})
+
+    assert "Банили за последние сутки" in text
+    assert "203.0.113.5" in text
+    assert "×2" in text
