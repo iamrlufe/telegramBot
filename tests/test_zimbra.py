@@ -604,7 +604,7 @@ def test_service_login_is_hidden_from_dashboard_logins():
     events = [
         {"account": "zimbra", "ip": "?", "protocol": "soap/admin",
          "ok": True, "count": 18, "last": "2026-09-01 10:00:00"},
-        {"account": "buh@example.local", "ip": "10.20.30.5",
+        {"account": "buh@example.local", "ip": "198.51.100.7",
          "protocol": "imap", "ok": True, "count": 9,
          "last": "2026-09-01 09:00:00"},
     ]
@@ -667,3 +667,104 @@ def test_summary_cuts_long_lists(monkeypatch):
     rows = [g for g in summary["groups"] if g["title"] == "Кто отправляет"][0]
 
     assert len(rows["rows"]) == 3
+
+
+# ─── Обзор входов: только снаружи ────────────────────────────
+#
+# У организации со своей сетью входы из неё — это весь список: пятнадцать
+# строк заняты внутренними адресами, а вход снаружи, ради которого раздел и
+# нужен, в обзор не попадает вовсе.
+
+def test_local_login_is_recognised():
+    assert zimbra_log.is_local_login({"ip": "10.100.0.66"})
+    assert zimbra_log.is_local_login({"ip": "192.168.1.10"})
+    assert not zimbra_log.is_local_login({"ip": "95.59.126.130"})
+    assert not zimbra_log.is_local_login({"ip": "?"})
+
+
+def test_dashboard_logins_keep_only_outside():
+    events = [
+        {"account": "a@example.local", "ip": "10.100.0.66", "protocol": "soap",
+         "ok": True, "count": 10, "last": "2026-09-01 10:00:00"},
+        {"account": "b@example.local", "ip": "203.0.113.9", "protocol": "imap",
+         "ok": True, "count": 2, "last": "2026-09-01 09:00:00"},
+    ]
+    summary = _summary(audit={"failed": 0, "events": events})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто заходил"][0]["rows"]
+    titles = " ".join(r["title"] for r in rows)
+
+    assert "b@example.local" in titles
+    assert "a@example.local" not in titles
+
+
+def test_all_local_logins_give_one_honest_line():
+    """Пустой раздел молча исчезает, а «снаружи не заходил никто» — это
+    ответ, и его видно."""
+    events = [
+        {"account": "a@example.local", "ip": "10.100.0.66", "protocol": "soap",
+         "ok": True, "count": 10, "last": "2026-09-01 10:00:00"},
+        {"account": "b@example.local", "ip": "10.100.0.10", "protocol": "soap",
+         "ok": True, "count": 5, "last": "2026-09-01 09:00:00"},
+    ]
+    summary = _summary(audit={"failed": 0, "events": events})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто заходил"][0]["rows"]
+
+    assert len(rows) == 1
+    assert rows[0]["left"] == "15"          # входы сосчитаны, а не отброшены
+    assert "локальной сети" in rows[0]["title"]
+
+
+def test_failed_local_login_stays_visible():
+    """Отказы фильтру не подлежат: подбор пароля из своей же сети — это
+    заражённая машина внутри периметра, худший случай из возможных."""
+    events = [{"account": "a@example.local", "ip": "10.100.0.66",
+               "protocol": "soap", "ok": False, "count": 400,
+               "last": "2026-09-01 10:00:00"}]
+    summary = _summary(audit={"failed": 400, "events": events})
+    bad = [g for g in summary["groups"] if g["title"] == "Пароль не подошёл"]
+
+    assert bad and "a@example.local" in " ".join(r["title"] for r in bad[0]["rows"])
+
+
+# ─── Обзор отправителей: без служебных ───────────────────────
+
+def test_service_senders_are_recognised():
+    assert zimbra_log.is_service_sender("<>")
+    assert zimbra_log.is_service_sender("MAILER-DAEMON@mail.example.local")
+    assert zimbra_log.is_service_sender("double-bounce@example.local")
+    assert zimbra_log.is_service_sender("")
+    assert not zimbra_log.is_service_sender("buh@example.local")
+
+
+def test_dashboard_senders_drop_the_null_envelope():
+    """`<>` — отчёты о недоставке, они стабильно входили в топ и занимали
+    место живого отправителя."""
+    senders = [
+        {"sender": "<>", "messages": 21, "recipients": 22},
+        {"sender": "buh@example.local", "messages": 19, "recipients": 19},
+    ]
+    summary = _summary(mail={"senders": senders})
+    rows = [g for g in summary["groups"] if g["title"] == "Кто отправляет"][0]["rows"]
+
+    assert [r["title"] for r in rows] == ["buh@example.local"]
+
+
+def test_sender_row_says_what_the_number_means():
+    """«107» слева — это писем или адресов? Подпись обязана быть."""
+    senders = [{"sender": "buh@example.local", "messages": 107,
+                "recipients": 136}]
+    summary = _summary(mail={"senders": senders})
+    row = [g for g in summary["groups"]
+           if g["title"] == "Кто отправляет"][0]["rows"][0]
+
+    assert row["left"] == "107"
+    assert row["detail"] == "писем · на 136 адресов"
+
+
+def test_address_count_is_declined():
+    """«на 22 адресов» — та же недоделка, что и «1 писем»."""
+    assert zimbra_log.addresses(1) == "1 адрес"
+    assert zimbra_log.addresses(22) == "22 адреса"
+    assert zimbra_log.addresses(13) == "13 адресов"
+    assert zimbra_log.addresses(103) == "103 адреса"
+    assert zimbra_log.addresses(0) == "0 адресов"

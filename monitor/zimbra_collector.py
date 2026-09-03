@@ -26,8 +26,8 @@ from mail_store import SUMMARY_ROWS, save_snapshot
 from settings import int_env
 from zimbra_log import (
     QUEUE_ALERT, SENDER_REJECT_ALERT, SPOOF_ALERT,
-    _origin_rows, brute_force, foreign_logins, is_service_login,
-    sender_rejects,
+    _origin_rows, addresses, brute_force, foreign_logins, is_local_login,
+    is_service_login, is_service_sender, sender_rejects,
     has_zimbra, heavy_senders, letters, outside_senders, read_audit,
     read_mail,
     spoofed_senders,
@@ -192,14 +192,20 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
     ]
 
     groups = []
-    senders = (mail.get("senders") or [])[:SUMMARY_ROWS]
+    # Служебные отправители (отчёты о недоставке, ящики самой почты) из
+    # обзора убраны: пятнадцать строк, и каждая занятая службой — минус один
+    # живой отправитель. В карточке бота список остаётся полным.
+    senders = [item for item in (mail.get("senders") or [])
+               if not is_service_sender(item.get("sender"))][:SUMMARY_ROWS]
     if senders:
         heavy = {i.get("sender") for i in heavy_senders(mail.get("senders"))}
         groups.append({"title": "Кто отправляет", "level": "ok", "rows": [
             {"level": "warn" if item.get("sender") in heavy else "ok",
              "left": str(item.get("messages") or 0),
              "title": item.get("sender") or "",
-             "detail": f"на {item.get('recipients') or 0} адресов"}
+             # Голое число слева не читается: «107» — это писем или адресов?
+             # Подпись ставится здесь, рядом со вторым числом.
+             "detail": f"писем · на {addresses(item.get('recipients') or 0)}"}
             for item in senders
         ]})
 
@@ -216,20 +222,30 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
             for e in bad
         ]})
 
-    # Служебные обращения самого сервера из обзора убраны: учётка zimbra с
-    # админ-протоколом набирает за сутки больше входов, чем любой человек,
-    # и занимала первую строку, вытесняя живого пользователя. В карточке
-    # бота (🔑 Входы в почту) она по-прежнему видна — там полный список.
-    good = [e for e in events
-            if e.get("ok") and not is_service_login(e)][:SUMMARY_ROWS]
-    if good:
-        groups.append({"title": "Кто заходил", "level": "ok", "rows": [
-            {"level": "ok", "left": str(e.get("count") or 0),
-             "title": f"{e.get('account') or '—'} ← {e.get('ip') or '—'}"
-                      + place(e.get("ip")),
-             "detail": e.get("protocol") or ""}
-            for e in good
-        ]})
+    # Из обзора успешных входов убраны двое: служебные обращения самого
+    # сервера (учётка zimbra с админ-протоколом набирает за сутки больше
+    # входов, чем любой человек) и входы из локальной сети — в организации
+    # со своей сетью ими заполнялся весь список, и вход снаружи, ради
+    # которого раздел и нужен, в пятнадцать строк уже не попадал.
+    # Полный список входов остаётся в карточке бота, 🔑 Входы в почту.
+    good = [e for e in events if e.get("ok") and not is_service_login(e)]
+    outside = [e for e in good if not is_local_login(e)]
+    rows = [
+        {"level": "ok", "left": str(e.get("count") or 0),
+         "title": f"{e.get('account') or '—'} ← {e.get('ip') or '—'}"
+                  + place(e.get("ip")),
+         "detail": e.get("protocol") or ""}
+        for e in outside[:SUMMARY_ROWS]
+    ]
+    # Пустой раздел молча исчезает, а «снаружи не заходил никто» — это
+    # ответ, а не отсутствие данных, и он стоит одной строки.
+    if good and not rows:
+        rows = [{"level": "ok", "left": str(sum(e.get("count") or 0
+                                                for e in good)),
+                 "title": "входов из локальной сети",
+                 "detail": "снаружи не заходил никто"}]
+    if rows:
+        groups.append({"title": "Кто заходил", "level": "ok", "rows": rows})
 
     stuck = (mail.get("defer_reasons") or [])[:SUMMARY_ROWS]
     if stuck:
