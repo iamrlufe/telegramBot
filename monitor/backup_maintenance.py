@@ -289,9 +289,17 @@ def run_verify(servers: list):
                 print(f"[verify] {name}: не удалось сохранить результат: {e}", flush=True)
 
             if res["status"] == "ok":
+                # Проверка без контрольных сумм читает заголовок и структуру,
+                # но не страницы: битая страница внутри такой копии пройдёт
+                # молча. Это не повод будить ночью, но в логе сказать стоит —
+                # лечится одной галкой WITH CHECKSUM в задании бэкапа.
+                depth = ("сверены контрольные суммы страниц"
+                         if res.get("checksum")
+                         else "без контрольных сумм — копия снята без них")
                 print(
                     f"[verify] {name}: ✅ ok, {res['file']} "
-                    f"({res['size_gb']} ГБ за {res['duration_sec']} сек)",
+                    f"({res['size_gb']} ГБ за {res['duration_sec']} сек, "
+                    f"{depth})",
                     flush=True
                 )
             else:
