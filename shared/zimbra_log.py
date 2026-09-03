@@ -383,9 +383,18 @@ function grab(line, key, endch,   p, q, s) {
   if (acct == "") next
   ip = grab($0, "oip=", ";")
   if (ip == "") ip = "?"
-  proto = grab($0, "protocol=", ";")
+  # protocol= у этих записей почти всегда soap: mailboxd проверяет пароль
+  # своим внутренним SOAP, кто бы ни спрашивал. Настоящий протокол клиента
+  # лежит в oproto= — он появляется, когда пароль проверяют для SMTP или
+  # IMAP-сессии, и именно он отвечает на вопрос «чем ломятся».
+  proto = grab($0, "oproto=", ";")
+  if (proto == "") proto = grab($0, "protocol=", ";")
   if (proto == "") proto = "?"
-  if (index($0, "/service/admin/")) proto = proto "/admin"
+  # Админ-консоль — это 7071. Путь /service/admin/ сам по себе админ-входом
+  # не делает: по нему же на 7073 идёт проверка пароля SMTP и IMAP, и
+  # перебор паролей к ящикам выглядел из-за этого попыткой влезть в
+  # админку — то есть тревога называла не то, что происходило.
+  if (index($0, ":7071/service/admin/")) proto = proto "/admin"
   ok = index($0, "error=") ? 0 : 1
   k = acct "\t" ip "\t" proto "\t" ok
   n[k] += 1

@@ -319,10 +319,14 @@ Sep  1 06:33:53 mail postfix/smtpd[30468]: NOQUEUE: reject: RCPT from smtp.examp
 Aug 20 06:33:53 mail postfix/qmgr[24698]: OLD00001: from=<old@example.local>, size=1, nrcpt=1 (queue active)
 """
 
+# Строки взяты по форме с живого сервера. Ключевое здесь — 7073 и oproto:
+# так выглядит проверка пароля для SMTP-сессии, а вовсе не вход в админку,
+# хотя путь в URL у них общий.
 AUDIT_FIXTURE = """\
-2026-09-01 00:15:45,087 WARN  [qtp1:https:https://mail.example.local:7073/service/admin/soap/] [name=admin@example.local;oip=203.0.113.5;oport=51288;] security - cmd=Auth; account=admin@example.local; protocol=soap; error=authentication failed for [admin], invalid password;
-2026-09-01 00:45:30,218 WARN  [qtp2:https:https://mail.example.local:7073/service/admin/soap/] [name=admin@example.local;oip=203.0.113.5;oport=54806;] security - cmd=Auth; account=admin@example.local; protocol=soap; error=authentication failed for [admin], invalid password;
+2026-09-01 00:15:45,087 WARN  [qtp1:https:https://mail.example.local:7073/service/admin/soap/] [name=admin@example.local;oip=203.0.113.5;oport=51288;oproto=smtp;] security - cmd=Auth; account=admin@example.local; protocol=soap; error=authentication failed for [admin], invalid password;
+2026-09-01 00:45:30,218 WARN  [qtp2:https:https://mail.example.local:7073/service/admin/soap/] [name=admin@example.local;oip=203.0.113.5;oport=54806;oproto=smtp;] security - cmd=Auth; account=admin@example.local; protocol=soap; error=authentication failed for [admin], invalid password;
 2026-09-01 08:00:00,001 INFO  [qtp3:https:https://mail.example.local/service/soap/] [name=buh@example.local;oip=198.51.100.7;] security - cmd=Auth; account=buh@example.local; protocol=soap;
+2026-09-01 09:10:00,001 WARN  [qtp4:https:https://mail.example.local:7071/service/admin/soap/AuthRequest] [name=root@example.local;oip=203.0.113.77;] security - cmd=Auth; account=root@example.local; protocol=soap; error=authentication failed for [root], invalid password;
 2026-08-20 09:00:00,001 INFO  [old] [name=old@example.local;oip=10.20.30.5;] security - cmd=Auth; account=old@example.local; protocol=imap;
 """
 
@@ -413,9 +417,13 @@ def test_audit_awk_separates_success_and_admin_console():
     out = _run_awk(zimbra_log._AUDIT_AWK,
                    ["-v", "cut=2026-08-31 18:00:00"], [AUDIT_FIXTURE])
     rows = zimbra_log._rows(out)
-    assert rows["T"][0] == ["1", "2"]
+    assert rows["T"][0] == ["1", "3"]
     by_account = {row[0]: row for row in rows["A"]}
-    assert by_account["admin@example.local"][2] == "soap/admin"
+    # 7073 + oproto=smtp — это перебор пароля к ящику через SMTP, а не
+    # попытка влезть в админку, хотя путь в URL у них одинаковый.
+    assert by_account["admin@example.local"][2] == "smtp"
+    # а вот 7071 — настоящая админ-консоль
+    assert by_account["root@example.local"][2] == "soap/admin"
     assert by_account["admin@example.local"][3] == "0"
     assert by_account["buh@example.local"][3] == "1"
     assert "old@example.local" not in by_account
@@ -899,3 +907,43 @@ def test_no_claim_about_outside_when_only_workstations():
 
     assert "снаружи не заходил никто" not in row["detail"]
     assert row["left"] == "4"
+
+
+# ─── Чем именно ломятся ──────────────────────────────────────
+#
+# protocol= в audit.log почти всегда soap: mailboxd проверяет пароль своим
+# внутренним SOAP, кто бы ни спрашивал. Настоящий протокол клиента лежит в
+# oproto=, и без него перебор паролей к ящикам через SMTP выглядел попыткой
+# влезть в админ-консоль — тревога называла не то, что происходит.
+
+def test_smtp_bruteforce_is_not_called_admin_console():
+    from zimbra_collector import findings_for
+
+    events = [{"account": "user@example.local", "ip": "203.0.113.5",
+               "protocol": "smtp", "ok": False, "count": 300,
+               "last": "2026-09-01 05:48:44"}]
+    found = findings_for("mail-01", {}, {"events": events}, {})
+    text = found[0][1]["text"]
+
+    assert "админ-консоли" not in text
+    assert "по smtp" in text
+
+
+def test_admin_console_bruteforce_still_says_so():
+    from zimbra_collector import findings_for
+
+    events = [{"account": "root@example.local", "ip": "203.0.113.77",
+               "protocol": "soap/admin", "ok": False, "count": 300,
+               "last": "2026-09-01 09:10:00"}]
+    found = findings_for("mail-01", {}, {"events": events}, {})
+    text = found[0][1]["text"]
+
+    assert "к админ-консоли" in text
+    # протокол в тексте не дублируется: «к админ-консоли по soap/admin»
+    assert "по soap" not in text
+
+
+def test_admin_flag_needs_port_7071():
+    """Путь /service/admin/ общий у админки и у проверки пароля SMTP —
+    отличает их только порт."""
+    assert ":7071/service/admin/" in zimbra_log._AUDIT_AWK

@@ -86,9 +86,14 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
 
     for item in brute_force(audit.get("events")):
         where = " к админ-консоли" if item["admin"] else ""
+        # Чем именно ломятся — половина ответа. SMTP означает попытку
+        # разослать спам от вашего имени, IMAP — прочитать почту, и
+        # действия по этим находкам разные.
+        proto = item.get("protocol") or ""
+        how = f" по {proto}" if proto and proto != "?" and not item["admin"] else ""
         found.append((server_name, {
             "level": "crit",
-            "text": (f"🔴 подбор пароля{where}: {item['account']} ← "
+            "text": (f"🔴 подбор пароля{where}{how}: {item['account']} ← "
                      f"{item['ip']}{place(item['ip'])}, "
                      f"{item['count']} неудачных за сутки"
                      + (" — И ОДИН УДАЧНЫЙ, пароль подобран"
