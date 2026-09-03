@@ -200,6 +200,30 @@ def read_owa_failures(server: dict, hours: int = 24, limit: int = 200) -> list:
     return sorted(grouped.values(), key=lambda i: i["count"], reverse=True)
 
 
+# Ящики и агенты собственного мониторинга Exchange. HealthMailbox-* создаёт
+# сама система (Managed Availability) и раз в минуту дёргает ими каждый
+# протокол; AMProbe и TestActiveSyncConnectivity — те же проверки со стороны
+# клиента. Трафика они дают больше живых пользователей и на боевом сервере
+# занимали треть списка телефонов.
+SERVICE_MAILBOX_PREFIXES = ("healthmailbox", "systemmailbox")
+SERVICE_AGENTS = ("amprobe", "testactivesync", "microsoft office configuration")
+
+
+def is_service_client(user: str = "", agent: str = "") -> bool:
+    """Обращение системы мониторинга Exchange, а не человека.
+
+    Скрывается только из обзора на дашборде: там пятнадцать строк, и каждая
+    занятая пробой — минус один живой пользователь. В карточке бота списки
+    остаются полными: если проверки доступности перестали ходить, это тоже
+    новость, и увидеть её должно быть где.
+    """
+    name = (user or "").strip().lower()
+    if name.startswith(SERVICE_MAILBOX_PREFIXES):
+        return True
+    ua = (agent or "").strip().lower()
+    return ua.startswith(SERVICE_AGENTS)
+
+
 def has_exchange(server: dict) -> bool:
     """Почтовый сервер: явный флаг exchange или служба MSExchange* в сервисах.
 

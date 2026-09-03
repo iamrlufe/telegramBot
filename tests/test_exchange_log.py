@@ -383,3 +383,42 @@ def test_quiet_server_gives_no_alarms_and_no_empty_groups():
 
     assert summary["alarms"] == []
     assert [g["title"] for g in summary["groups"]] == ["Кто работает в OWA"]
+
+
+# ─── Пробы Managed Availability ──────────────────────────────
+#
+# HealthMailbox-* создаёт сама Exchange и раз в минуту дёргает ими каждый
+# протокол. На боевом сервере эти ящики занимали треть списка телефонов и
+# давали больше обращений, чем живые пользователи.
+
+def test_health_mailbox_is_recognised():
+    import exchange_log
+
+    assert exchange_log.is_service_client("HealthMailboxe48a406@corp.example.local")
+    assert exchange_log.is_service_client("SystemMailbox{bb558c35}@example.local")
+    assert exchange_log.is_service_client(agent="AMProbe/Local/ClientAccess")
+    assert exchange_log.is_service_client(agent="TestActiveSyncConnectivity")
+    assert not exchange_log.is_service_client("buh@example.local",
+                                              "Apple-iPhone14C1/2000.1")
+
+
+def test_probes_are_hidden_from_dashboard_lists():
+    summary = _ex_summary(
+        owa={"rows": [
+            {"user": "HealthMailbox1@corp.example.local", "ip": "10.20.30.5",
+             "count": 5000, "last": ""},
+            {"user": "buh@example.local", "ip": "10.20.30.6", "count": 10,
+             "last": ""}]},
+        eas={"rows": [
+            {"user": "HealthMailbox2@corp.example.local",
+             "ua": "AMProbe/Local/ClientAccess", "count": 489},
+            {"user": "zh@example.local", "ua": "Apple-iPhone14C5/2307.71",
+             "count": 538}]})
+
+    lists = {g["title"]: [r["title"] for r in g["rows"]]
+             for g in summary["groups"]}
+
+    assert not any("HealthMailbox" in t for t in lists["Кто работает в OWA"])
+    assert not any("HealthMailbox" in t for t in lists["Телефоны (ActiveSync)"])
+    assert any("buh@example.local" in t for t in lists["Кто работает в OWA"])
+    assert lists["Телефоны (ActiveSync)"] == ["zh@example.local"]

@@ -20,7 +20,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from exchange_log import (
-    has_exchange, read_activesync, read_owa_failures, read_owa_logins,
+    has_exchange, is_service_client, read_activesync, read_owa_failures,
+    read_owa_logins,
 )
 from geoip import resolve as geo_resolve
 from mail_store import SUMMARY_ROWS, save_snapshot
@@ -60,8 +61,13 @@ def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None) -> dict:
     def place(ip):
         return f" ({tag[ip]})" if tag.get(ip) else ""
 
-    rows = owa.get("rows") or []
-    mobile = eas.get("rows") or []
+    # Пробы Managed Availability из обзора убраны: HealthMailbox-* дёргают
+    # каждый протокол раз в минуту и давали больше обращений, чем живые
+    # пользователи, занимая треть списка телефонов.
+    rows = [r for r in (owa.get("rows") or [])
+            if not is_service_client(r.get("user"), r.get("ua"))]
+    mobile = [r for r in (eas.get("rows") or [])
+              if not is_service_client(r.get("user"), r.get("ua"))]
     users = {str(r.get("user") or "").lower() for r in rows} - {""}
     attempts = sum(int(r.get("count") or 0) for r in failures)
     brute = [r for r in failures if int(r.get("count") or 0) >= FAIL_ALERT]
