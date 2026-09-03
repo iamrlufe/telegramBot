@@ -317,7 +317,44 @@ def summary_for(mail: dict, audit: dict, findings: list, geo: dict = None) -> di
     alarms = [(item.get("text") or item.get("hint") or "").lstrip("🔴 ").strip()
               for _server, item in findings
               if item.get("level") == "crit"]
-    return {"kpis": kpis, "groups": groups, "alarms": sorted(set(alarms))}
+    return {"kpis": kpis, "groups": groups, "alarms": sorted(set(alarms)),
+            "suspects": suspects(audit.get("events"))}
+
+
+def suspects(events) -> list:
+    """Адреса, которые стоит предложить к блокировке вручную.
+
+    Нужны потому, что fail2ban по построению пропускает распылённый
+    перебор: порог maxretry считает попытки с одного адреса, а их там одна
+    или две. Автоматика в этом не виновата — так устроен её признак; но
+    пробел от этого не исчезает, и закрыть его может только человек,
+    которому список показали.
+
+    Внутренние адреса не предлагаются никогда: за ними шлюз или рабочее
+    место, и блокировка отрезает своих. Это же правило стоит в белом
+    списке самого fail2ban, но полагаться на чужую настройку здесь нельзя.
+    """
+    from geoip import is_private
+
+    found = {}
+
+    def add(ip, reason, weight):
+        ip = (ip or "").strip()
+        if not ip or ip in ("?", "-") or is_private(ip):
+            return
+        old = found.get(ip)
+        if not old or weight > old["weight"]:
+            found[ip] = {"ip": ip, "reason": reason, "weight": weight}
+
+    for item in brute_force(events):
+        add(item["ip"], f"подбор пароля к {item['account']}: "
+                        f"{item['count']} неудачных", 3)
+    for item in spray_targets(events):
+        for ip in item["addresses"]:
+            add(ip, f"распылённый перебор к {item['account']}", 2)
+
+    return [dict(i) for i in sorted(found.values(),
+                                    key=lambda i: -i["weight"])]
 
 
 def collect_server(server: dict) -> list:

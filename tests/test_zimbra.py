@@ -453,7 +453,7 @@ def test_summary_has_the_shape_the_dashboard_draws():
     не знает ни про postfix, ни про mailboxd."""
     summary = _summary()
 
-    assert {"kpis", "groups", "alarms"} == set(summary)
+    assert {"kpis", "groups", "alarms", "suspects"} == set(summary)
     assert all({"value", "label", "level"} <= set(k) for k in summary["kpis"])
     for group in summary["groups"]:
         assert {"title", "level", "rows"} <= set(group)

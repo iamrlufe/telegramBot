@@ -167,7 +167,29 @@ def summary_for(owa: dict, eas: dict, failures: list, geo: dict = None,
         alarms.append(f"{poison} писем в poison-очереди")
     if queue is not None and queue > QUEUE_ALERT:
         alarms.append(f"очередь {queue} при пороге {QUEUE_ALERT}")
-    return {"kpis": kpis, "groups": groups, "alarms": alarms}
+    return {"kpis": kpis, "groups": groups, "alarms": alarms,
+            "suspects": suspects(failures)}
+
+
+def suspects(failures) -> list:
+    """Адреса для ручной блокировки: те, с которых подбирают пароль.
+
+    Внутренние не предлагаются — за ними рабочие места и шлюзы.
+    """
+    from geoip import is_private
+
+    found = {}
+    for row in failures or []:
+        ip = (row.get("ip") or "").strip()
+        count = int(row.get("count") or 0)
+        if not ip or is_private(ip) or count < FAIL_ALERT:
+            continue
+        if count > (found.get(ip) or {}).get("count", -1):
+            found[ip] = {"ip": ip, "count": count,
+                         "reason": f"подбор пароля к "
+                                   f"{row.get('user') or 'неизвестной учётке'}: "
+                                   f"{count} отказов"}
+    return sorted(found.values(), key=lambda i: -i["count"])
 
 
 def collect_server(server: dict):

@@ -36,6 +36,8 @@ from iis_bot import has_iis, iis_token, iis_callback
 from exchange_bot import has_exchange, ex_token, exchange_callback
 from zimbra_bot import zm_token, zimbra_callback
 from zimbra_log import has_zimbra
+from fail2ban_bot import f2b_token, fail2ban_callback
+from fail2ban import has_fail2ban
 from firewall_bot import (
     has_firewall, fw_token, firewall_callback, handle_firewall_text,
     AWAIT_KEY as FW_AWAIT_KEY,
@@ -777,6 +779,11 @@ def server_detail_kb(server_name: str) -> InlineKeyboardMarkup:
                 "🛡 Блокировка IP",
                 callback_data=f"fw_menu:{fw_token(server_name)}",
             )])
+        if has_fail2ban(server):
+            rows.append([InlineKeyboardButton(
+                "🛡 Блокировка (fail2ban)",
+                callback_data=f"f2b_menu:{f2b_token(server_name)}",
+            )])
     except Exception as e:
         print(f"[bot] Логи: сервер {server_name} не прочитан: {e}", flush=True)
 
@@ -829,6 +836,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("zm_"):
         await zimbra_callback(query, context)
+
+    elif query.data.startswith("f2b_"):
+        await fail2ban_callback(query, context)
 
     elif query.data.startswith("fw_"):
         await firewall_callback(query, context)
