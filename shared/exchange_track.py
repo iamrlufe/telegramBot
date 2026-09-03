@@ -21,7 +21,10 @@ TransportRoles\\Logs\\MessageTracking. На боевом сервере это 1
 эвристики по домену отправителя, которой приходится обходиться у Zimbra:
 подделанный свой адрес в конверте туда не пролезет.
 """
-from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
+from winrm_client import (
+    PS_OUT_B64_HELPER, compact_ps, ps_encoded_length, ps_fits, ps_json,
+    run_ps,
+)
 
 # Сколько групп отдавать в каждом списке.
 TOP = 20
@@ -48,117 +51,67 @@ def _script(hours: int, top: int = TOP) -> str:
     письмо проходит транспорт несколькими событиями (RECEIVE, RESOLVE,
     AGENTINFO, SEND, DELIVER), и наивный счёт строк завысил бы объём в
     несколько раз — та же ошибка, что и со строками mail.log у Zimbra.
+
+    Файлы берутся с запасом в час: лог ротируется по размеру, и письмо из
+    начала окна может лежать в файле, дописанном чуть раньше.
+
+    Готовый скрипт прогоняется через compact_ps: пояснения живут здесь, а
+    в командную строку WinRM влезает 8000 символов после кодирования, и
+    первая же версия с комментариями в них не уместилась (9476).
     """
-    return PS_OUT_B64_HELPER + f"""
+    return compact_ps(PS_OUT_B64_HELPER + f"""
     $ErrorActionPreference = 'SilentlyContinue'
-    $dir = '{DEFAULT_TRACK_DIR}'
-    $setup = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\ExchangeServer\\v15\\Setup' -ErrorAction SilentlyContinue
-    if ($setup -and $setup.MsiInstallPath) {{
-        $guess = Join-Path $setup.MsiInstallPath 'TransportRoles\\Logs\\MessageTracking'
-        if (Test-Path $guess) {{ $dir = $guess }}
-    }}
-    if (-not (Test-Path $dir)) {{ Out-B64 @{{ track_error = 'Каталог трассировки не найден: ' + $dir }}; return }}
-
-    $start = (Get-Date).AddHours(-{hours})
-    $cut = $start.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')
-    # Файл ротируется по размеру, поэтому берём с запасом в час: письмо
-    # из начала окна может лежать в файле, дописанном чуть раньше.
-    $files = @(Get-ChildItem -Path $dir -Filter '*.LOG' |
-               Where-Object {{ $_.LastWriteTime -gt $start.AddHours(-1) }} |
-               Sort-Object LastWriteTime)
-    if (-not $files) {{ Out-B64 @{{ messages_in = 0; messages_out = 0 }}; return }}
-
-    $seen = @{{}}
-    $out = @{{}}; $inn = @{{}}; $fails = @{{}}; $src = @{{}}
-    $msgIn = 0; $msgOut = 0; $rcpt = 0; $failed = 0
-    $badFiles = @()
-
-    foreach ($f in $files) {{
-        try {{ $lines = Get-Content -LiteralPath $f.FullName -ErrorAction Stop }}
-        catch {{ $badFiles += $f.Name; continue }}
-        $head = $lines | Where-Object {{ $_ -like '#Fields:*' }} | Select-Object -First 1
-        if (-not $head) {{ continue }}
-        $cols = ($head -replace '^#Fields:\\s*', '') -split ','
-        $data = $lines | Where-Object {{ $_ -and -not $_.StartsWith('#') }} |
-                ConvertFrom-Csv -Header $cols
-        foreach ($r in $data) {{
-            if ($r.'date-time' -lt $cut) {{ continue }}
-            $event = $r.'event-id'
-
-            if ($event -eq 'FAIL') {{
-                $failed++
-                $why = $r.'recipient-status'
-                if (-not $why) {{ $why = $r.'source-context' }}
-                if ($why) {{
-                    if ($why.Length -gt 90) {{ $why = $why.Substring(0, 90) }}
-                    if ($fails.ContainsKey($why)) {{ $fails[$why]++ }} else {{ $fails[$why] = 1 }}
-                }}
-                continue
-            }}
-
-            if ($event -ne 'RECEIVE') {{ continue }}
-            $id = $r.'message-id'
-            if (-not $id -or $seen.ContainsKey($id)) {{ continue }}
-            $seen[$id] = $true
-
-            $n = 0
-            [int]::TryParse($r.'recipient-count', [ref]$n) | Out-Null
-            $rcpt += $n
-            $from = $r.'sender-address'
-            if (-not $from) {{ $from = '<>' }}
-
-            if ($r.directionality -eq 'Originating') {{
-                $msgOut++
-                $bag = $out
-            }} else {{
-                $msgIn++
-                $bag = $inn
-                $ip = $r.'original-client-ip'
-                if (-not $ip) {{ $ip = $r.'client-ip' }}
-                if ($ip) {{
-                    if ($src.ContainsKey($ip)) {{ $src[$ip]++ }} else {{ $src[$ip] = 1 }}
-                }}
-            }}
-            if ($bag.ContainsKey($from)) {{
-                $bag[$from].n++; $bag[$from].r += $n
-            }} else {{
-                $bag[$from] = @{{ n = 1; r = $n }}
-            }}
-        }}
-    }}
-
-    function TopSenders($bag) {{
-        @($bag.GetEnumerator() | Sort-Object {{ $_.Value.n }} -Descending |
-          Select-Object -First {top} |
-          ForEach-Object {{ @{{ sender = $_.Key; messages = $_.Value.n; recipients = $_.Value.r }} }})
-    }}
-    function TopPairs($bag, $keyName) {{
-        @($bag.GetEnumerator() | Sort-Object {{ $_.Value }} -Descending |
-          Select-Object -First {top} |
-          ForEach-Object {{ @{{ $keyName = $_.Key; count = $_.Value }} }})
-    }}
-
-    $queue = $null; $poison = $null
-    $counters = Get-Counter '\\MSExchangeTransport Queues(_total)\\*' -ErrorAction SilentlyContinue
-    if ($counters) {{
-        $q = 0
-        foreach ($s in $counters.CounterSamples) {{
-            if ($s.Path -match '{QUEUE_COUNTER}') {{ $q += [int]$s.CookedValue }}
-            if ($s.Path -match '{POISON_COUNTER}') {{ $poison = [int]$s.CookedValue }}
-        }}
-        $queue = $q
-    }}
-
-    Out-B64 @{{
-        messages_in = $msgIn; messages_out = $msgOut;
-        recipients = $rcpt; failed = $failed;
-        queue = $queue; poison = $poison;
-        senders_out = (TopSenders $out); senders_in = (TopSenders $inn);
-        fail_reasons = (TopPairs $fails 'reason');
-        sources = (TopPairs $src 'ip');
-        files = $files.Count; unreadable = $badFiles
-    }}
-    """
+    $d = '{DEFAULT_TRACK_DIR}'
+    $s = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\ExchangeServer\\v15\\Setup' -EA 0
+    if ($s -and $s.MsiInstallPath) {{
+    $g = Join-Path $s.MsiInstallPath 'TransportRoles\\Logs\\MessageTracking'
+    if (Test-Path $g) {{ $d = $g }} }}
+    if (-not (Test-Path $d)) {{ Out-B64 @{{ err = 'Нет каталога трассировки: ' + $d }}; return }}
+    $t0 = (Get-Date).AddHours(-{hours})
+    $cut = $t0.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')
+    $fs = @(Get-ChildItem $d -Filter '*.LOG' | ? {{ $_.LastWriteTime -gt $t0.AddHours(-1) }})
+    if (-not $fs) {{ Out-B64 @{{ mi = 0; mo = 0 }}; return }}
+    $seen = @{{}}; $o = @{{}}; $i = @{{}}; $f = @{{}}
+    $mi = 0; $mo = 0; $rc = 0; $fl = 0; $bad = 0
+    foreach ($x in $fs) {{
+    try {{ $L = Get-Content -LiteralPath $x.FullName -EA Stop }} catch {{ $bad++; continue }}
+    $h = $L | ? {{ $_ -like '#Fields:*' }} | select -First 1
+    if (-not $h) {{ continue }}
+    $c = ($h -replace '^#Fields:\\s*', '') -split ','
+    foreach ($r in ($L | ? {{ $_ -and -not $_.StartsWith('#') }} | ConvertFrom-Csv -Header $c)) {{
+    if ($r.'date-time' -lt $cut) {{ continue }}
+    $e = $r.'event-id'
+    if ($e -eq 'FAIL') {{
+    $fl++
+    $w = $r.'recipient-status'; if (-not $w) {{ $w = $r.'source-context' }}
+    if ($w) {{ if ($w.Length -gt 90) {{ $w = $w.Substring(0, 90) }}
+    if ($f.ContainsKey($w)) {{ $f[$w]++ }} else {{ $f[$w] = 1 }} }}
+    continue }}
+    if ($e -ne 'RECEIVE') {{ continue }}
+    $id = $r.'message-id'
+    if (-not $id -or $seen.ContainsKey($id)) {{ continue }}
+    $seen[$id] = 1
+    $n = 0; [int]::TryParse($r.'recipient-count', [ref]$n) | Out-Null
+    $rc += $n
+    $a = $r.'sender-address'; if (-not $a) {{ $a = '<>' }}
+    if ($r.directionality -eq 'Originating') {{ $mo++; $b = $o }} else {{ $mi++; $b = $i }}
+    if ($b.ContainsKey($a)) {{ $b[$a].n++; $b[$a].r += $n }} else {{ $b[$a] = @{{ n = 1; r = $n }} }}
+    }} }}
+    $q = $null; $pz = $null
+    $cs = Get-Counter '\\MSExchangeTransport Queues(_total)\\*' -EA 0
+    if ($cs) {{ $v = 0
+    foreach ($p in $cs.CounterSamples) {{
+    if ($p.Path -match '{QUEUE_COUNTER}') {{ $v += [int]$p.CookedValue }}
+    if ($p.Path -match '{POISON_COUNTER}') {{ $pz = [int]$p.CookedValue }} }}
+    $q = $v }}
+    $top = {{ param($b) @($b.GetEnumerator() | sort {{ $_.Value.n }} -Desc | select -First {top} |
+    % {{ @{{ sender = $_.Key; messages = $_.Value.n; recipients = $_.Value.r }} }}) }}
+    Out-B64 @{{ mi = $mi; mo = $mo; rc = $rc; fl = $fl; q = $q; pz = $pz;
+    so = (& $top $o); si = (& $top $i);
+    fr = @($f.GetEnumerator() | sort {{ $_.Value }} -Desc | select -First {top} |
+    % {{ @{{ reason = $_.Key; count = $_.Value }} }});
+    files = $fs.Count; bad = $bad }}
+    """)
 
 
 def _rows(value) -> list:
@@ -176,26 +129,28 @@ def read_tracking(server: dict, hours: int = 24) -> dict:
     data = ps_json(raw) or {}
     if isinstance(data, list):
         data = data[0] if data else {}
-    if data.get("track_error"):
-        raise Exception(data["track_error"])
+    if data.get("err"):
+        raise Exception(data["err"])
 
     def number(key):
         value = data.get(key)
         return int(value) if str(value).lstrip("-").isdigit() else None
 
+    # Ключи в скрипте короткие не для красоты: в командную строку WinRM
+    # влезает 8000 символов после кодирования, и длинные имена полей —
+    # такой же расход, как лишний код. Разворачиваются они здесь.
     return {
-        "messages_in": number("messages_in") or 0,
-        "messages_out": number("messages_out") or 0,
-        "recipients": number("recipients") or 0,
-        "failed": number("failed") or 0,
+        "messages_in": number("mi") or 0,
+        "messages_out": number("mo") or 0,
+        "recipients": number("rc") or 0,
+        "failed": number("fl") or 0,
         # None, а не 0: счётчики могли не сняться, и «очередь пуста» здесь
         # означало бы обратное тому, что произошло.
-        "queue": number("queue"),
-        "poison": number("poison"),
-        "senders_out": _rows(data.get("senders_out")),
-        "senders_in": _rows(data.get("senders_in")),
-        "fail_reasons": _rows(data.get("fail_reasons")),
-        "sources": _rows(data.get("sources")),
+        "queue": number("q"),
+        "poison": number("pz"),
+        "senders_out": _rows(data.get("so")),
+        "senders_in": _rows(data.get("si")),
+        "fail_reasons": _rows(data.get("fr")),
         "files": number("files") or 0,
-        "unreadable": _rows(data.get("unreadable")),
+        "unreadable": number("bad") or 0,
     }

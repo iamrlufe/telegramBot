@@ -514,6 +514,28 @@ def test_old_kpis_stay_when_tracking_is_unavailable():
     assert "писем принято" not in labels
 
 
+def test_tracking_script_fits_winrm_limit():
+    """Первая версия скрипта не влезла в командную строку WinRM (9476 из
+    8000 после кодирования), и раздел молча остался без данных. Проверка
+    здесь дешевле, чем ещё один такой заход на боевой сервер."""
+    from winrm_client import MAX_PS_COMMAND_CHARS, ps_encoded_length
+    import exchange_track
+
+    encoded = ps_encoded_length(exchange_track._script(24))
+    assert encoded <= MAX_PS_COMMAND_CHARS, f"{encoded} из {MAX_PS_COMMAND_CHARS}"
+
+
+def test_tracking_script_has_no_comments_or_indentation():
+    """Пояснения живут в Python-докстроке: в PowerShell они стоят места в
+    той же командной строке, в которую скрипт и не влез."""
+    import exchange_track
+
+    lines = exchange_track._script(24).splitlines()
+    assert not any(line.startswith((" ", "\t")) for line in lines)
+    assert not any(line.lstrip().startswith("#") for line in lines
+                   if "Fields" not in line)
+
+
 def test_tracking_script_reads_fields_by_name():
     """Схема лога трассировки менялась между версиями Exchange: разбор по
     позициям молча дал бы чужие значения."""
@@ -521,7 +543,7 @@ def test_tracking_script_reads_fields_by_name():
 
     script = exchange_track._script(24)
     assert "#Fields:" in script
-    assert "ConvertFrom-Csv -Header $cols" in script
+    assert "ConvertFrom-Csv -Header $c" in script
 
 
 def test_tracking_script_counts_messages_not_lines():
@@ -532,7 +554,7 @@ def test_tracking_script_counts_messages_not_lines():
 
     script = exchange_track._script(24)
     assert "$seen.ContainsKey($id)" in script
-    assert "$event -ne 'RECEIVE'" in script
+    assert "$e -ne 'RECEIVE'" in script
 
 
 def test_tracking_script_trusts_exchange_about_direction():
