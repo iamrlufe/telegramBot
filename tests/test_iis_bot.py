@@ -176,6 +176,16 @@ def test_silent_login_burst_raises_alarm(monkeypatch):
     assert found[0][1]["key"] == "iis_brute:web-01.example.local:192.0.2.99"
 
 
+def test_internal_address_does_not_raise_alarm(monkeypatch):
+    """Запрос из своей сети — сотрудник, сканер безопасности или свой
+    мониторинг. Разбирать нечего, будить незачем."""
+    day = {"web-01.example.local": _events(hit=[("/отчеты|10.100.170.26|curl", 3)])}
+    hour = {"web-01.example.local": _events(
+        login=[("agro|192.168.10.5", 180)], ip=[("192.168.10.5", 181)])}
+
+    assert _findings(monkeypatch, day, hour) == []
+
+
 def test_finding_keys_are_stable(monkeypatch):
     """Ключ должен переживать смену счётчиков: иначе «Принял» слетал бы,
     а алерт уходил бы каждый час на одно и то же."""

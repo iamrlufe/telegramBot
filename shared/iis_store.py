@@ -209,7 +209,14 @@ def iis_findings() -> list:
     Три вещи, ради которых стоит идти на сервер: сканер получил успешный
     ответ, идёт подбор пароля, публикации были недоступны. Всё остальное из
     IIS-сводки — фон, ему место в дашборде, а не в тревоге.
+
+    Запросы из своих сетей в тревогу не идут. Внутренний адрес — это
+    сотрудник, сканер безопасности или собственный мониторинг: разбирать
+    там нечего, а уведомление всё равно приходит. В разделе 🌐 IIS такие
+    строки остаются, из находок исчезают.
     """
+    from geoip import is_private
+
     try:
         day = read_events(24)
         hour = read_events(1)
@@ -224,6 +231,8 @@ def iis_findings() -> list:
             if not parsed:
                 continue
             uri, ip, _ua = parsed
+            if is_private(ip):
+                continue
             found.append((server_name, {
                 "level": "crit",
                 "text": f"🔴 сервер отдал {uri} — запрос с {ip}",
@@ -247,7 +256,7 @@ def iis_findings() -> list:
         requests = [{"parts": [str(r["item"])], "count": r["count"]}
                     for r in events.get("ip") or []]
         for item in detect_brute_force(logins, requests):
-            if item["working"]:
+            if item["working"] or is_private(item["ip"]):
                 continue
             found.append((server_name, {
                 "level": "crit",
