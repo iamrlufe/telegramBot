@@ -149,6 +149,63 @@ def test_validate_rejects_bad_schedule_values():
         }))
 
 
+# ─── Сверка с источником (mirror_of) ─────────────────────────
+
+def test_validate_accepts_mirror():
+    validate_config(_with_backup_path({
+        "path": "E:\\IN\\DIFF",
+        "mirror_of": {"server": "sql-01", "path": "E:\\Backups"},
+        "mirror_lag_minutes": 30,
+    }))
+
+
+def test_validate_rejects_incomplete_mirror():
+    """Половина настройки тихо выключила бы проверку — лучше ошибка
+    при сохранении."""
+    with pytest.raises(ValueError):
+        validate_config(_with_backup_path({
+            "path": "E:\\IN", "mirror_of": {"server": "sql-01"}
+        }))
+    with pytest.raises(ValueError):
+        validate_config(_with_backup_path({"path": "E:\\IN", "mirror_of": "sql-01"}))
+
+
+def test_validate_rejects_mirror_settings_without_source():
+    """Задержка без mirror_of ничего не делает — это опечатка, а не настройка."""
+    with pytest.raises(ValueError):
+        validate_config(_with_backup_path({
+            "path": "E:\\IN", "mirror_lag_minutes": 30
+        }))
+
+
+def test_validate_rejects_out_of_range_mirror_values():
+    with pytest.raises(ValueError):
+        validate_config(_with_backup_path({
+            "path": "E:\\IN",
+            "mirror_of": {"server": "s", "path": "p"},
+            "mirror_lag_minutes": 0,
+        }))
+    with pytest.raises(ValueError):
+        validate_config(_with_backup_path({
+            "path": "E:\\IN",
+            "mirror_of": {"server": "s", "path": "p"},
+            "mirror_size_ratio": 1.5,
+        }))
+
+
+def test_merge_preserves_mirror_on_edit():
+    """Мастер про сверку не спрашивает — значит обязан её сохранить."""
+    existing = [{
+        "path": "E:\\IN\\DIFF",
+        "mirror_of": {"server": "sql-01", "path": "E:\\Backups"},
+        "mirror_lag_minutes": 30,
+    }]
+    merged = _merge_backup_paths(existing, [{"path": "E:\\IN\\DIFF", "alert_hours": 8}])
+    assert merged[0]["mirror_of"] == {"server": "sql-01", "path": "E:\\Backups"}
+    assert merged[0]["mirror_lag_minutes"] == 30
+    assert merged[0]["alert_hours"] == 8
+
+
 # ─── _merge_backup_paths: правка не теряет расписание ────────
 
 def test_merge_preserves_schedule_on_edit():
