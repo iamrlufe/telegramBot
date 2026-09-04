@@ -32,6 +32,14 @@ from backup_bot_db import (
 )
 from charts import build_growth_chart, build_backup_freshness_chart, build_backup_volume_chart
 from backup_files import delete_backup_files, deletable_backup_targets, NO_DELETE_TYPES
+from backup_copy import (
+    copy_servers,
+    copy_settings,
+    find_server,
+    load_state as load_copy_state,
+    start_copy_now,
+    type_label,
+)
 from backup_schedule import (
     load_schedule_map,
     schedule_for,
@@ -189,6 +197,7 @@ def backup_menu_kb():
         [InlineKeyboardButton("📈 Рост баз",       callback_data="backup_growth_servers")],
         [InlineKeyboardButton("🧹 Cleanup",        callback_data="backup_cleanup_servers")],
         [InlineKeyboardButton("🧪 Verify статус",  callback_data="backup_verify")],
+        [InlineKeyboardButton("📤 Копирование",    callback_data="backup_copy")],
         [InlineKeyboardButton("📋 Дайджест",       callback_data="backup_digest")],
     ])
 
@@ -489,6 +498,122 @@ async def _run_verify_background(context, chat_id: int, server_name: str, user):
         ", ".join(f"{r['path']}={r['status']}" for r in results)
     )
     await context.bot.send_message(chat_id, "\n".join(lines))
+
+
+# ─── Копирование копий на приёмник ───────────────────────────
+
+def _copy_server_lines(server: dict, entry: dict) -> list:
+    """Что показать про один сервер-источник: настройка и последний рейс."""
+    settings = copy_settings(server)
+    lines = [f"🖥 {server['name']}", f"   📜 {settings['script']}"]
+
+    auto = "включён" if settings["auto"] else "ВЫКЛЮЧЕН"
+    types = ", ".join(type_label(t) for t in settings["types"])
+    lines.append(f"   🔁 автозапуск: {auto} ({types})")
+
+    run = (entry or {}).get("run")
+    last = (entry or {}).get("last_run")
+    if run:
+        lines.append(f"   ⏳ идёт с {run.get('started')} (PID {run.get('pid')})")
+    elif last:
+        minutes = last.get("minutes")
+        by = last.get("by") or "монитор"
+        lines.append(
+            f"   ✅ последний рейс: {last.get('ended')}"
+            + (f", ехал {minutes} мин" if minutes is not None else "")
+            + f" (запустил {by})"
+        )
+    else:
+        lines.append("   ⏸ рейсов ещё не было")
+    return lines
+
+
+async def show_copy_status(query, context, page: int = 0):
+    names = await asyncio.to_thread(copy_servers)
+    if not names:
+        await safe_edit_message(
+            query,
+            "📤 КОПИРОВАНИЕ\n\n"
+            "Ни у одного сервера не задан скрипт копирования.\n\n"
+            "Это опция: пока она не включена, копии возит планировщик "
+            "Windows, как раньше. Чтобы копированием управлял бот — "
+            "⚙️ Настройка → сервер-источник → «Скрипт копирования». "
+            "Подробности: ⚙️ Настройка → 📖 Справка → 📤 Копирование копий.",
+            reply_markup=back_kb()
+        )
+        return
+
+    state = await asyncio.to_thread(load_copy_state)
+    blocks = []
+    for name in names:
+        server = await asyncio.to_thread(find_server, name)
+        if not server:
+            continue
+        blocks.append("\n".join(_copy_server_lines(server, state.get(name))))
+
+    text, keyboard = paginate_text_blocks(
+        f"📤 КОПИРОВАНИЕ\n\nСерверов-источников: {len(blocks)}\n\n{'━'*20}\n\n",
+        blocks,
+        page=page,
+        callback_prefix="backup_copy_page"
+    )
+    rows = list(keyboard.inline_keyboard)
+    rows.insert(-1, [InlineKeyboardButton("📤 Скопировать сейчас",
+                                          callback_data="backup_copy_run_servers")])
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_copy_run_servers(query, context, page: int = 0):
+    names = await asyncio.to_thread(copy_servers)
+    if not names:
+        await safe_edit_message(
+            query,
+            "⚠️ Ни у одного сервера не задан скрипт копирования.",
+            reply_markup=back_kb()
+        )
+        return
+
+    await safe_edit_message(
+        query,
+        "📤 ЗАПУСК КОПИРОВАНИЯ\n\n"
+        "Выбери сервер-источник. Скрипт запустится на нём самом; "
+        "большая база едет часами, ждать здесь не нужно.",
+        reply_markup=build_paginated_server_keyboard(
+            names, "backup_copy_run", page, back_callback="backup_copy")
+    )
+
+
+async def do_copy_run(query, context, server_name: str):
+    if not can_delete_backups(query):
+        await safe_edit_message(
+            query,
+            "⛔ Нет прав на запуск копирования.\n\nОбратитесь к администратору.",
+            reply_markup=back_kb()
+        )
+        return
+
+    await safe_edit_message(query, f"⏳ Запускаю копирование на {server_name}...")
+    try:
+        run = await asyncio.to_thread(start_copy_now, server_name)
+    except Exception as e:
+        await safe_edit_message(
+            query,
+            f"❌ {server_name}: копирование не запущено.\n\n{str(e)[:300]}",
+            reply_markup=back_kb()
+        )
+        return
+
+    audit.log_config_change(query.from_user, "copy_run", server_name,
+                            f"pid={run.get('pid')}")
+    await safe_edit_message(
+        query,
+        f"📤 Копирование запущено: {server_name}\n\n"
+        f"▶️ Старт: {run.get('started')} (PID {run.get('pid')})\n\n"
+        f"Скрипт работает на самом сервере — ботом можно пользоваться "
+        f"дальше. Если копирование затянется дольше порога, придёт алерт "
+        f"«КОПИРОВАНИЕ ЗАВИСЛО».",
+        reply_markup=back_kb()
+    )
 
 
 # ─── Backup Report: выбор сервера ────────────────────────────
@@ -1131,6 +1256,25 @@ async def backup_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("backup_verify_run:"):
         server_name = data.split(":", 1)[1]
         await do_verify_run(query, context, server_name)
+
+    elif data == "backup_copy":
+        await safe_edit_message(query, "⏳ Смотрю состояние копирования...")
+        await show_copy_status(query, context)
+
+    elif data.startswith("backup_copy_page:"):
+        page = int(data.split(":", 1)[1])
+        await show_copy_status(query, context, page=page)
+
+    elif data == "backup_copy_run_servers":
+        await show_copy_run_servers(query, context)
+
+    elif data.startswith("backup_copy_run_servers:"):
+        page = int(data.split(":", 1)[1])
+        await show_copy_run_servers(query, context, page=page)
+
+    elif data.startswith("backup_copy_run:"):
+        server_name = data.split(":", 1)[1]
+        await do_copy_run(query, context, server_name)
 
     elif data == "backup_report_servers":
         await show_report_servers(query, context)

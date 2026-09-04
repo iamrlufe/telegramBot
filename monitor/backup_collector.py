@@ -19,8 +19,6 @@ from alerts import (
     send_or_defer, load_json, save_json, is_muted, check_backup_failure_alerts,
 )
 from onec_logs import ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, onec_targets
-from backup_mirror import mirror_findings, mirror_spec
-from backup_transfer import active_copy
 from backup_schedule import (
     ALMATY,
     most_recent_weekly_deadline,
@@ -694,31 +692,6 @@ def get_last_newest_file(server_name: str, backup_type: str, backup_path: str):
         return row[0] if row else None
 
 
-def get_last_metrics(server_name: str, backup_type: str, backup_path: str):
-    """Последний удачный замер каталога: что за файл самый свежий, какого
-    размера и когда это видели. Нужен для сверки приёмника с источником —
-    источник опрашивается в том же цикле, но своим потоком, поэтому его
-    метрики берутся из БД, а не из памяти."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT newest_file, newest_file_gb, created_at
-            FROM backup_metrics
-            WHERE server_name = %s AND backup_type = %s AND backup_path = %s
-              AND status = 'ok'
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (server_name, backup_type, backup_path))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "newest_file": row[0],
-            "newest_file_gb": float(row[1]) if row[1] is not None else None,
-            "collected_at": row[2],
-        }
-
-
 def save_db_sizes(server_name: str, sizes: list):
     with get_conn() as conn:
         cur = conn.cursor()
@@ -901,70 +874,6 @@ def _check_backup_alerts(server_name: str, backup_type: str,
                     save_json(BACKUP_ALERT_STATE_FILE, state)
 
 
-def _check_mirror_alerts(server_name: str, backup_type: str, backup_path: str,
-                          metrics: dict, spec: dict):
-    """Сверка приёмника с источником: копия не приехала или приехала
-    огрызком. Смысл проверки — в shared/backup_mirror.py."""
-    if not spec or is_muted(server_name) or is_muted(spec["server"]):
-        return
-
-    # Копирование идёт прямо сейчас — файл в дороге. Сколько бы он ни
-    # ехал (70 ГБ едут часами), «не доехал» здесь будет ложью: за
-    # затянувшееся копирование отвечает свой таймаут в backup_transfer.
-    if active_copy(spec["server"]):
-        return
-
-    source = get_last_metrics(spec["server"], spec["type"], spec["path"])
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    findings = mirror_findings(source, metrics, spec, now)
-
-    key = f"{server_name}:{backup_type}:{backup_path}:mirror"
-    state = load_json(BACKUP_ALERT_STATE_FILE)
-
-    if not findings:
-        if key in state:
-            state.pop(key, None)
-            save_json(BACKUP_ALERT_STATE_FILE, state)
-        return
-
-    finding = findings[0]
-    if not alert_due(state, key, finding["kind"]):
-        return
-    mark_alert_sent(state, key, finding["kind"])
-    save_json(BACKUP_ALERT_STATE_FILE, state)
-
-    source_line = (f"📤 Источник: {spec['server']}\n"
-                   f"📁 {spec['path']}\n\n")
-    if finding["kind"] == "late":
-        here = (_fmt_local(finding["dest_newest"]) if finding["dest_newest"]
-                else "копий нет вообще")
-        send_or_defer(
-            f"🆘🆘 БЭКАП НЕ ДОЕХАЛ 🆘🆘\n\n"
-            f"🖥 {server_name}\n"
-            f"📁 {backup_path} ({backup_type})\n\n"
-            f"{source_line}"
-            f"🆕 На источнике файл от {_fmt_local(finding['source_newest'])} "
-            f"— прошло {finding['lag_minutes']} мин, сюда не приехал\n"
-            f"📅 Самый свежий здесь: {here}\n\n"
-            f"‼️ Задание отработало, а копия не пришла — проверьте копирование!",
-            ack_key=f"backup_mirror_late:{server_name}:{backup_path}",
-        )
-    else:
-        send_or_defer(
-            f"🆘🆘 КОПИЯ ПРИЕХАЛА НЕ ЦЕЛИКОМ 🆘🆘\n\n"
-            f"🖥 {server_name}\n"
-            f"📁 {backup_path} ({backup_type})\n\n"
-            f"{source_line}"
-            f"📦 Здесь: {round(finding['dest_gb'], 2)} ГБ "
-            f"({finding['percent']}% от оригинала)\n"
-            f"📊 На источнике: {round(finding['source_gb'], 2)} ГБ\n"
-            f"📅 Файл: {_fmt_local(finding['dest_newest'])}\n\n"
-            f"‼️ Загрузка оборвалась — по SFTP это выглядит как успех. "
-            f"Перезалейте файл!",
-            ack_key=f"backup_mirror_small:{server_name}:{backup_path}",
-        )
-
-
 def _check_onec_log_alerts(server_name: str, log_name: str, log_path: str,
                            metrics: dict, warn_gb: float, crit_gb: float):
     if is_muted(server_name):
@@ -1057,7 +966,6 @@ def _backup_targets(server: dict) -> list:
         for path_spec in paths:
             # Путь — либо просто строка, либо {"path": ..., "alert_hours": ...}
             # для своего времени алерта на конкретную папку.
-            path_mirror = mirror_spec(path_spec, backup_type)
             if isinstance(path_spec, dict):
                 backup_path = path_spec.get("path")
                 path_alert_hours = path_spec.get("alert_hours")
@@ -1093,7 +1001,6 @@ def _backup_targets(server: dict) -> list:
                 "size_check": size_check,
                 "ignore_logs": path_ignore_logs,
                 "schedule": path_schedule(path_spec),
-                "mirror": path_mirror,
             })
     return targets
 
@@ -1224,14 +1131,6 @@ def apply_server_backups(collected: dict):
             weekly_scheduled=bool(target["schedule"]),
             ignore_logs=target["ignore_logs"],
         )
-        # Сверка с источником. Отвечает на тот же вопрос, что и порог
-        # по возрасту, но на часы раньше: порог ждёт alert_hours, а здесь
-        # виден сам факт «на регионе файл есть, здесь его нет».
-        try:
-            _check_mirror_alerts(name, backup_type, backup_path, metrics,
-                                 target["mirror"])
-        except Exception as e:
-            print(f"  ❌ mirror {backup_type} {backup_path}: {e}", flush=True)
         print(
             f"  [{backup_type}] {backup_path}: "
             f"{metrics['file_count']} файлов, "

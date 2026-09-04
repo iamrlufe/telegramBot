@@ -124,23 +124,5 @@
       "ssh"
     ],
     "zimbra": true
-  },
-  {
-    "_comment": "Приёмник бэкапов: сюда регионы заливают копии по SFTP. mirror_of сверяет каталог с источником — если на sql-01 файл есть, а здесь через mirror_lag_minutes его нет, приходит «БЭКАП НЕ ДОЕХАЛ», не дожидаясь порога по возрасту. Размер тоже сверяется с оригиналом: по SFTP обрыв загрузки выглядит как успех.",
-    "name": "sftp-01.example.local",
-    "host": "192.0.2.38",
-    "backups": {
-      "sql": [
-        {
-          "path": "E:\\Backups\\region-a\\DIFF",
-          "alert_hours": 8,
-          "mirror_of": {
-            "server": "sql-01.example.local",
-            "path": "E:\\Backups\\daily"
-          },
-          "mirror_lag_minutes": 240
-        }
-      ]
-    }
   }
 ]

@@ -153,3 +153,62 @@ def test_quotes_do_not_break_the_script():
 
 def test_type_label_is_readable():
     assert type_label("I") == "разностная"
+
+
+# ─── Ручной запуск из бота ───────────────────────────────────
+
+import backup_copy
+
+
+def _wire_state(monkeypatch, tmp_path, state):
+    path = tmp_path / "backup_transfer.json"
+    monkeypatch.setattr(backup_copy, "TRANSFER_STATE_FILE", str(path))
+    backup_copy.save_state(state)
+    return path
+
+
+def test_manual_start_writes_state(monkeypatch, tmp_path):
+    _wire_state(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(backup_copy, "find_server", lambda n: _server(name=n))
+    monkeypatch.setattr(backup_copy, "launch_copy",
+                        lambda *a, **kw: {"pid": 42, "started": "2026-09-05 04:00:00",
+                                          "by": kw.get("by")})
+
+    run = backup_copy.start_copy_now("sql-region")
+
+    assert run["pid"] == 42
+    assert run["by"] == "бот"
+    assert backup_copy.load_state()["sql-region"]["run"]["pid"] == 42
+
+
+def test_manual_start_refuses_while_copy_runs(monkeypatch, tmp_path):
+    """Второй запуск того же скрипта — это две копии одного файла в одну
+    папку, самый быстрый способ получить огрызок."""
+    _wire_state(monkeypatch, tmp_path,
+                {"sql-region": {"run": {"pid": 7, "started": "2026-09-05 01:00:00"}}})
+    monkeypatch.setattr(backup_copy, "find_server", lambda n: _server(name=n))
+
+    with pytest.raises(RuntimeError, match="уже идёт"):
+        backup_copy.start_copy_now("sql-region")
+
+
+def test_manual_start_needs_script(monkeypatch, tmp_path):
+    _wire_state(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(backup_copy, "find_server",
+                        lambda n: {"name": n, "host": "h"})
+
+    with pytest.raises(RuntimeError, match="copy_script"):
+        backup_copy.start_copy_now("sql-region")
+
+
+def test_manual_start_keeps_last_finished(monkeypatch, tmp_path):
+    """Ручной рейс не отменяет обычного хода дел: следующую копию,
+    которую закончит SQL, всё равно повезут."""
+    _wire_state(monkeypatch, tmp_path,
+                {"sql-region": {"last_finished": "2026-09-05 03:30:00"}})
+    monkeypatch.setattr(backup_copy, "find_server", lambda n: _server(name=n))
+    monkeypatch.setattr(backup_copy, "launch_copy", lambda *a, **kw: {"pid": 1})
+
+    backup_copy.start_copy_now("sql-region")
+
+    assert backup_copy.load_state()["sql-region"]["last_finished"] == "2026-09-05 03:30:00"

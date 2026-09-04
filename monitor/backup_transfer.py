@@ -8,30 +8,30 @@ monitor/backup_transfer.py
 Здесь всё, что требует внешнего мира: чтение msdb, запуск скрипта на
 сервере-источнике по WinRM, наблюдение за процессом, состояние и алерты.
 
-Состояние на сервер (data/backup_transfer.json):
-    {"last_finished": "2026-09-05 00:34:52",
-     "run": {"pid": 1234, "started": "...", "source_finished": "...",
-             "db": "...", "type": "I", "size_gb": 70.4},
-     "last_run": {... тот же вид + "ended", "minutes"}}
-
-Пока `run` не пуст, копирование считается идущим: сверка приёмника с
-источником (shared/backup_mirror.py) в это время молчит — файл в дороге,
-и звонить «не доехал» рано, сколько бы он ни ехал.
+Состояние живёт в общем для бота и монитора файле (см. TRANSFER_STATE_FILE
+в shared/backup_copy.py): бот запускает копирование кнопкой, монитор — по
+готовности копии, и оба обязаны видеть одно и то же. Пока в состоянии есть
+`run`, копирование считается идущим — по нему видно, что файл в дороге и
+сколько он едет на самом деле.
 """
-import json
-import os
 from datetime import datetime
 
-from settings import SERVERS_FILE, ALMATY
+from settings import SERVERS_FILE
 from server_check import server_type
 from winrm_client import run_ps, ps_json
 from mssql_log import read_backup_history
 from backup_copy import (
-    copy_settings,
+    TRANSFER_STATE_FILE,
     check_process_ps,
-    launch_script_ps,
+    copy_settings,
+    launch_copy,
+    load_servers,
+    load_state,
+    marker as _marker,
+    now_local as _now,
     pick_ready_backup,
     run_verdict,
+    save_state,
     should_start,
     type_label,
 )
@@ -39,65 +39,13 @@ from alerts import (
     alert_due, mark_alert_sent, send_or_defer, load_json, save_json, is_muted,
 )
 
-TRANSFER_STATE_FILE = "/app/data/backup_transfer.json"
-
 # История msdb за сутки: копия, законченная раньше, уже никуда не поедет
 # (see COPY_FRESH_MINUTES), а лишние строки только раздувают ответ WinRM.
 HISTORY_DAYS = 1
 HISTORY_LIMIT = 20
 
 
-def _now() -> datetime:
-    """Местное время без tzinfo: msdb пишет backup_finish_date по часам
-    самого SQL-сервера, а серверы стоят в том же поясе, что и бот."""
-    return datetime.now(ALMATY).replace(tzinfo=None)
-
-
-def _marker(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def load_servers() -> list:
-    with open(SERVERS_FILE) as f:
-        return json.load(f)
-
-
-def load_state() -> dict:
-    return load_json(TRANSFER_STATE_FILE)
-
-
-def save_state(state: dict):
-    save_json(TRANSFER_STATE_FILE, state)
-
-
-def active_copy(server_name: str) -> dict:
-    """Идёт ли сейчас копирование с этого сервера. Нужна сверке приёмника:
-    пока файл в дороге, «не доехал» — ложная тревога."""
-    if not os.path.exists(TRANSFER_STATE_FILE):
-        return None
-    return (load_state().get(server_name) or {}).get("run")
-
-
 # ─── Шаги цикла ──────────────────────────────────────────────
-
-def start_copy(server: dict, settings: dict, ready: dict) -> dict:
-    """Запускает скрипт копирования на сервере-источнике. Возвращает
-    запись о запуске; бросает исключение, если запустить не удалось."""
-    raw = run_ps(server["host"], launch_script_ps(settings["script"]),
-                 server.get("username"), server.get("password"))
-    data = ps_json(raw) or {}
-    pid = data.get("Pid")
-    if not pid:
-        raise RuntimeError("сервер не вернул PID запущенного скрипта")
-    return {
-        "pid": int(pid),
-        "started": _marker(_now()),
-        "source_finished": _marker(ready["finished"]),
-        "db": ready.get("db"),
-        "type": ready.get("type"),
-        "size_gb": ready.get("size_gb"),
-    }
-
 
 def _process_alive(server: dict, pid: int) -> bool:
     raw = run_ps(server["host"], check_process_ps(pid),
@@ -144,10 +92,10 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
                 )
         return False
 
-    # Процесс завершился. Успех это или обрыв — знает только приёмник:
-    # у SFTP оборванная загрузка выглядит успешной, поэтому вердикт
-    # выносит сверка размеров (shared/backup_mirror.py), а здесь мы лишь
-    # снимаем «в дороге» и запоминаем, сколько копия ехала.
+    # Процесс завершился. Успех это или обрыв — по самому процессу не
+    # видно (у SFTP оборванная загрузка выглядит успешной), поэтому здесь
+    # мы лишь снимаем «в дороге» и запоминаем, сколько копия ехала.
+    # Дальше за дело берётся обычная проверка каталога на приёмнике.
     started = datetime.strptime(run["started"], "%Y-%m-%d %H:%M:%S")
     minutes = round((now - started).total_seconds() / 60)
     entry["last_run"] = dict(run, ended=_marker(now), minutes=minutes)
@@ -194,7 +142,7 @@ def process_server_copy(server: dict, state: dict) -> bool:
           f"({type_label(ready['type'])}) готова {_marker(ready['finished'])} "
           f"— запускаю {settings['script']}", flush=True)
     try:
-        entry["run"] = start_copy(server, settings, ready)
+        entry["run"] = launch_copy(server, settings, ready)
     except Exception as e:
         if not is_muted(name):
             send_or_defer(

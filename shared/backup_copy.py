@@ -5,10 +5,10 @@ shared/backup_copy.py
 
 Зачем. Планировщик стартует по часам, а бэкап заканчивается когда придётся:
 сегодня в 3:00, завтра в 4:00, потому что шла проверка базы или сервер был
-занят. Из этого следуют обе беды сразу: скрипт копирования может стартовать
-раньше, чем файл готов, а сторож, который ждёт копию «через N минут после
-появления файла», либо звенит вхолостую, либо молчит слишком долго — 70 ГБ
-не уезжают за фиксированные три четверти часа.
+занят. Значит скрипт копирования может стартовать раньше, чем файл готов,
+а ждать копию «через N минут после появления файла» бессмысленно: момент
+старта копирования отсюда не виден, и 70 ГБ не уезжают за фиксированные
+три четверти часа.
 
 Точный сигнал «файл готов» знает сам SQL: `msdb.dbo.backupset` пишет
 `backup_finish_date` в момент, когда копия закончена и закрыта. По нему и
@@ -16,13 +16,20 @@ shared/backup_copy.py
 сервере-источнике; знаем момент старта — знаем, сколько копия реально едет,
 и ждём её ровно столько, сколько она идёт, а не сколько угадали.
 
+Всё это — опция: нет copy_script, значит копированием по-прежнему
+занимается планировщик, и ничего не меняется.
+
 Здесь только чистая логика: разбор настроек, выбор «той самой» записи
 из msdb, решение «пора» и «слишком долго», текст запускающего скрипта.
 Сеть и состояние — в monitor/backup_transfer.py.
 """
+import json
+import os
+import tempfile
 from datetime import datetime, timedelta
 
-from settings import int_env
+from settings import SERVERS_FILE, ALMATY, int_env
+from winrm_client import run_ps, ps_json
 
 
 # Типы копий в msdb: D — полная, I — разностная, L — журнал транзакций.
@@ -190,3 +197,129 @@ def check_process_ps(pid: int) -> str:
 
 def type_label(btype: str) -> str:
     return BACKUP_TYPE_LABELS.get(str(btype or "").upper()[:1], str(btype or "?"))
+
+
+# ─── Состояние копирований ───────────────────────────────────
+#
+# Файл общий для монитора и бота: монитор запускает копирование по
+# готовности копии, бот — кнопкой «📤 Скопировать сейчас», и оба обязаны
+# видеть одно и то же. /app/data примонтирован в оба контейнера.
+#
+#   {"<сервер>": {"last_finished": "...",
+#                 "run": {"pid", "started", "source_finished", "db", "type",
+#                         "size_gb", "by"},
+#                 "last_run": {... + "ended", "minutes"}}}
+
+TRANSFER_STATE_FILE = "/app/data/backup_transfer.json"
+
+
+def load_state(path: str = None) -> dict:
+    # Путь берётся при вызове, а не при объявлении: так его можно подменить
+    # в тестах, не трогая боевой /app/data.
+    path = path or TRANSFER_STATE_FILE
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state: dict, path: str = None):
+    """Атомарная запись: два процесса (монитор и бот) пишут один файл, и
+    обрыв на полуслове оставил бы битый JSON — а он читается как «состояний
+    нет», то есть копия поехала бы второй раз."""
+    path = path or TRANSFER_STATE_FILE
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def now_local() -> datetime:
+    """Местное время без tzinfo: msdb пишет backup_finish_date по часам
+    самого SQL-сервера, а серверы стоят в том же поясе, что и бот."""
+    return datetime.now(ALMATY).replace(tzinfo=None)
+
+
+def marker(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_servers(path: str = SERVERS_FILE) -> list:
+    with open(path) as f:
+        return json.load(f)
+
+
+def copy_servers() -> list:
+    """Серверы, у которых задан скрипт копирования, — им есть что запускать."""
+    try:
+        servers = load_servers()
+    except Exception as e:
+        print(f"[copy] Ошибка чтения {SERVERS_FILE}: {e}", flush=True)
+        return []
+    return [s["name"] for s in servers if copy_settings(s)]
+
+
+def find_server(server_name: str) -> dict:
+    for server in load_servers():
+        if server.get("name") == server_name:
+            return server
+    return None
+
+
+def launch_copy(server: dict, settings: dict, ready: dict = None,
+                by: str = "монитор") -> dict:
+    """Запускает скрипт копирования на сервере-источнике и возвращает запись
+    о запуске. Бросает исключение, если запустить не удалось.
+
+    Ждать окончания нельзя: сессия WinRM живёт минуты, а копия едет часами,
+    поэтому процесс отвязывается и дальше опознаётся по PID.
+    """
+    raw = run_ps(server["host"], launch_script_ps(settings["script"]),
+                 server.get("username"), server.get("password"))
+    data = ps_json(raw) or {}
+    pid = data.get("Pid")
+    if not pid:
+        raise RuntimeError("сервер не вернул PID запущенного скрипта")
+    return {
+        "pid": int(pid),
+        "started": marker(now_local()),
+        "source_finished": marker(ready["finished"]) if ready else None,
+        "db": (ready or {}).get("db"),
+        "type": (ready or {}).get("type"),
+        "size_gb": (ready or {}).get("size_gb"),
+        "by": by,
+    }
+
+
+def start_copy_now(server_name: str, by: str = "бот") -> dict:
+    """Ручной запуск копирования кнопкой в боте.
+
+    Отметку `last_finished` НЕ трогаем: ручной запуск не отменяет обычного
+    хода дел — если следом SQL закончит новую копию, её всё равно повезут.
+    """
+    server = find_server(server_name)
+    if not server:
+        raise RuntimeError(f"сервера {server_name} нет в конфиге")
+    settings = copy_settings(server)
+    if not settings:
+        raise RuntimeError("у сервера не задан скрипт копирования (copy_script)")
+
+    state = load_state()
+    entry = state.get(server_name) or {}
+    if entry.get("run"):
+        raise RuntimeError(
+            f"копирование уже идёт с {entry['run'].get('started')} "
+            f"(PID {entry['run'].get('pid')})"
+        )
+
+    entry["run"] = launch_copy(server, settings, by=by)
+    state[server_name] = entry
+    save_state(state)
+    return entry["run"]
