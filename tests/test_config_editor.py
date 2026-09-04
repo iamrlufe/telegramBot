@@ -151,6 +151,19 @@ def test_validate_rejects_bad_schedule_values():
 
 # ─── Управление копированием ─────────────────────────────────
 
+def test_copy_autostart_is_on_until_turned_off():
+    """Флаг «по умолчанию включено»: выключение обязано писать явный false,
+    иначе ответ «нет» бесследно исчезнет при чтении конфига."""
+    assert "copy_after_backup" in ce.DEFAULT_ON_FIELDS
+
+    server = {"name": "a", "host": "h", "copy_script": "C:\\c.ps1"}
+    apply_field(server, "copy_after_backup", False)
+    assert server["copy_after_backup"] is False
+
+    apply_field(server, "copy_after_backup", None)
+    assert "copy_after_backup" not in server
+
+
 def test_parse_script_requires_known_extension():
     ok, value, err = parse_field_value("copy_script", "C:\\Scripts\\copy.ps1")
     assert ok and value == "C:\\Scripts\\copy.ps1"
