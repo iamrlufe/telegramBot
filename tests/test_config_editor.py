@@ -149,6 +149,48 @@ def test_validate_rejects_bad_schedule_values():
         }))
 
 
+# ─── Управление копированием ─────────────────────────────────
+
+def test_parse_script_requires_known_extension():
+    ok, value, err = parse_field_value("copy_script", "C:\\Scripts\\copy.ps1")
+    assert ok and value == "C:\\Scripts\\copy.ps1"
+    ok, _, err = parse_field_value("copy_script", "C:\\Scripts\\copy.txt")
+    assert not ok and err
+
+
+def test_parse_copy_types():
+    ok, value, _ = parse_field_value("copy_types", "d, i")
+    assert ok and value == "D,I"
+    ok, _, err = parse_field_value("copy_types", "полная")
+    assert not ok and err
+
+
+def test_parse_minutes_range():
+    ok, value, _ = parse_field_value("copy_timeout_minutes", "360")
+    assert ok and value == 360
+    ok, _, err = parse_field_value("copy_timeout_minutes", "5000")
+    assert not ok and err
+
+
+def test_validate_rejects_copy_settings_without_script():
+    """Настройки есть, копированием никто не управляет — и об этом никто
+    не узнает. Лучше ошибка при сохранении."""
+    with pytest.raises(ValueError):
+        validate_config([{"name": "a", "host": "h", "copy_timeout_minutes": 60}])
+
+
+def test_validate_rejects_bad_copy_types():
+    with pytest.raises(ValueError):
+        validate_config([{"name": "a", "host": "h",
+                          "copy_script": "C:\\c.ps1", "copy_types": "X"}])
+
+
+def test_validate_accepts_copy_block():
+    validate_config([{"name": "a", "host": "h", "copy_script": "C:\\c.ps1",
+                      "copy_types": "D,I", "copy_delay_minutes": 5,
+                      "copy_timeout_minutes": 360, "copy_after_backup": True}])
+
+
 # ─── Сверка с источником (mirror_of) ─────────────────────────
 
 def test_validate_accepts_mirror():

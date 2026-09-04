@@ -20,6 +20,7 @@ from alerts import (
 )
 from onec_logs import ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, onec_targets
 from backup_mirror import mirror_findings, mirror_spec
+from backup_transfer import active_copy
 from backup_schedule import (
     ALMATY,
     most_recent_weekly_deadline,
@@ -905,6 +906,12 @@ def _check_mirror_alerts(server_name: str, backup_type: str, backup_path: str,
     """Сверка приёмника с источником: копия не приехала или приехала
     огрызком. Смысл проверки — в shared/backup_mirror.py."""
     if not spec or is_muted(server_name) or is_muted(spec["server"]):
+        return
+
+    # Копирование идёт прямо сейчас — файл в дороге. Сколько бы он ни
+    # ехал (70 ГБ едут часами), «не доехал» здесь будет ложью: за
+    # затянувшееся копирование отвечает свой таймаут в backup_transfer.
+    if active_copy(spec["server"]):
         return
 
     source = get_last_metrics(spec["server"], spec["type"], spec["path"])

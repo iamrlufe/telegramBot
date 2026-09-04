@@ -12,6 +12,7 @@ from server_check import check_server, server_type
 from service_details import save_details_from_info
 from winrm_errors import parse_status
 from backup_collector import run_backup_cycle
+from backup_transfer import run_transfer_cycle
 from log_collector import maybe_run_log_cycle
 from iis_collector import maybe_run_iis_cycle
 from firewall_maintenance import run_firewall_expiry
@@ -640,6 +641,14 @@ def run_cycle():
         maybe_send_self_report()
     except Exception as e:
         print(f"[monitor] Ошибка самоотчёта: {e}", flush=True)
+
+    # Запуск копирования копий на приёмник — каждый цикл, а не вместе
+    # с обходом каталогов: копию надо отправлять сразу, как SQL её
+    # закончил, иначе смысла отказываться от планировщика нет.
+    try:
+        run_transfer_cycle(servers)
+    except Exception as e:
+        print(f"[monitor] Ошибка запуска копирования: {e}", flush=True)
 
     # Сбор метрик бэкапов. Отдельный try: сбой внутри (недоступная БД,
     # битая запись в конфиге) раньше пробивался наружу через run_cycle()

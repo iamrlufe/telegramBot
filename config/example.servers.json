@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи.",
+    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи. copy_script: бот сам запускает копирование, как только SQL закончил копию (по msdb), — планировщик Windows для этого не нужен.",
     "name": "sql-01.example.local",
     "host": "192.0.2.10",
     "services": [
@@ -13,7 +13,10 @@
         "E:\\Backups\\daily"
       ]
     },
-    "verify_backup": true
+    "verify_backup": true,
+    "copy_script": "C:\\Scripts\\copy_to_sftp.ps1",
+    "copy_types": "D,I",
+    "copy_timeout_minutes": 360
   },
   {
     "_comment": "Все поддерживаемые поля Windows-сервера сразу, для справки. firewall=true открывает кнопку блокировки адресов. На Windows это 🛡 Блокировка IP правилом Windows Firewall (нужны права администратора у учётки WinRM), на Linux — 🛡 Блокировка (fail2ban): бот показывает клетки и банит через fail2ban-client, для чего учётке SSH нужно правило sudo без пароля на эту команду.",
@@ -135,7 +138,7 @@
             "server": "sql-01.example.local",
             "path": "E:\\Backups\\daily"
           },
-          "mirror_lag_minutes": 45
+          "mirror_lag_minutes": 240
         }
       ]
     }

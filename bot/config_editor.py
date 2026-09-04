@@ -254,6 +254,40 @@ def validate_config(servers) -> None:
             if rd < 3:
                 raise ValueError(f"Сервер «{name}»: retention_days минимум 3")
 
+        # Управление копированием. Пустой copy_script с заданными
+        # таймаутами — типичная опечатка: настройки есть, копированием
+        # никто не управляет, и об этом никто не узнает.
+        script = server.get("copy_script")
+        if script is not None and not str(script).strip():
+            raise ValueError(f"Сервер «{name}»: copy_script не может быть пустым")
+        copy_extra = ("copy_types", "copy_delay_minutes",
+                      "copy_timeout_minutes", "copy_after_backup")
+        if not script and any(server.get(f) is not None for f in copy_extra):
+            raise ValueError(
+                f"Сервер «{name}»: настройки копирования заданы, "
+                f"а copy_script — нет"
+            )
+        types = server.get("copy_types")
+        if types is not None:
+            letters = types if isinstance(types, list) else str(types).split(",")
+            for letter in letters:
+                if str(letter).strip().upper()[:1] not in ("D", "I", "L"):
+                    raise ValueError(
+                        f"Сервер «{name}»: copy_types — только D, I, L "
+                        f"(полная, разностная, журнал)"
+                    )
+        for field in ("copy_delay_minutes", "copy_timeout_minutes"):
+            if server.get(field) is None:
+                continue
+            try:
+                minutes = int(server[field])
+            except (TypeError, ValueError):
+                raise ValueError(f"Сервер «{name}»: {field} должно быть числом")
+            if minutes < 0 or minutes > 2880:
+                raise ValueError(
+                    f"Сервер «{name}»: {field} должно быть от 0 до 2880 минут"
+                )
+
         bah = server.get("backup_alert_hours")
         if bah is not None:
             try:
@@ -265,7 +299,7 @@ def validate_config(servers) -> None:
 
         for flag in ("dbsize", "exchange", "firewall", "zimbra",
                      "verify_backup", "backup_size_check", "verify_ssl",
-                     "legacy_tls"):
+                     "legacy_tls", "copy_after_backup"):
             if flag in server and not isinstance(server[flag], bool):
                 raise ValueError(f"Сервер «{name}»: {flag} должно быть true/false")
 
@@ -539,6 +573,53 @@ FIELD_DEFS = {
                   "Пропусти — по размеру не проверять.",
         "kind": "int",
     },
+    "copy_script": {
+        "label": "Скрипт копирования",
+        "prompt": "Полный путь к скрипту копирования НА САМОМ СЕРВЕРЕ.\n"
+                  "Например: C:\\Scripts\\copy_to_sftp.ps1 (годятся .ps1, "
+                  ".bat, .cmd, .exe)\n\n"
+                  "Бот запустит его САМ, как только SQL закончит копию — "
+                  "по записи в msdb, а не по часам. Планировщик Windows "
+                  "для этого больше не нужен: он стартует в назначенное "
+                  "время, а бэкап заканчивается когда придётся.\n"
+                  "Пропусти — копированием бот не управляет.",
+        "kind": "script",
+    },
+    "copy_after_backup": {
+        "label": "Копировать автоматически",
+        "prompt": "Запускать скрипт копирования сразу после копии? (да/нет)\n"
+                  "«Нет» — скрипт настроен, но бот его не запускает "
+                  "(например, пока проверяешь).\n"
+                  "Пропусти — запускать (значение по умолчанию).",
+        "kind": "bool_on",
+    },
+    "copy_types": {
+        "label": "Какие копии возить",
+        "prompt": "Типы копий, за которыми следить: D — полная, "
+                  "I — разностная, L — журнал.\n"
+                  "Например: D,I\n"
+                  "Пропусти — полные и разностные (журналы делают каждые "
+                  "15–60 минут, возить их скриптом бессмысленно).",
+        "kind": "backup_types",
+    },
+    "copy_delay_minutes": {
+        "label": "Пауза перед копированием (мин)",
+        "prompt": "Сколько ждать после отметки «копия закончена», прежде "
+                  "чем запускать копирование. Например: 5\n"
+                  "SQL закрывает файл чуть раньше, чем система дописывает "
+                  "его на диск.\n"
+                  "Пропусти — общее значение из .env (5 мин).",
+        "kind": "minutes",
+    },
+    "copy_timeout_minutes": {
+        "label": "Копирование зависло (мин)",
+        "prompt": "Через сколько минут считать копирование зависшим. "
+                  "Например: 360\n"
+                  "Считается от запуска скрипта, а не от появления файла: "
+                  "70 ГБ едут часами, и ставить сюда десятки минут нельзя.\n"
+                  "Пропусти — общее значение из .env (360 мин).",
+        "kind": "minutes",
+    },
     "reg_file": {
         "label": "Reg-файл",
         "prompt": "Полный путь к .reg файлу НА САМОМ СЕРВЕРЕ. Бот импортирует его "
@@ -555,7 +636,10 @@ WIZARD_ORDER = [
     "dbsize", "exchange", "firewall", "zimbra", "retention_days",
     "backup_alert_hours",
     "backup_size_check",
-    "verify_backup", "reg_file",
+    "verify_backup",
+    "copy_script", "copy_after_backup", "copy_types",
+    "copy_delay_minutes", "copy_timeout_minutes",
+    "reg_file",
     "verify_ssl", "legacy_tls", "snapshot_alert_days", "snapshot_alert_gb",
 ]
 REQUIRED_FIELDS = {"name", "host"}
@@ -576,6 +660,10 @@ REQUIRED_FIELDS = {"name", "host"}
 WINDOWS_ONLY_FIELDS = {
     "onec_logs", "dbsize", "exchange", "retention_days",
     "verify_backup", "reg_file",
+    # Копированием управляет PowerShell на самом сервере, а сигнал
+    # «копия готова» читается из msdb — и то, и другое только Windows.
+    "copy_script", "copy_after_backup", "copy_types",
+    "copy_delay_minutes", "copy_timeout_minutes",
 }
 
 # Поля только для Linux: почтовые журналы Zimbra читаются по SSH, и на
@@ -682,16 +770,18 @@ EDIT_FIELDS = [
     ["backups_sql", "backups_1c"],
     ["backups_veeam", "retention_days"],
     ["backup_alert_hours"],
+    ["copy_script", "copy_types"],
+    ["copy_delay_minutes", "copy_timeout_minutes"],
     ["reg_file"],
     ["snapshot_alert_days", "snapshot_alert_gb"],
 ]
 TOGGLE_FIELDS = ["dbsize", "exchange", "firewall", "zimbra", "verify_backup",
-                 "backup_size_check"]
+                 "backup_size_check", "copy_after_backup"]
 
 # Флаги, отсутствие которых в конфиге означает «включено», а не «выключено».
 # Для них выключение пишется явным false — иначе ответ «нет» бесследно
 # исчезает при чтении конфига.
-DEFAULT_ON_FIELDS = {"verify_ssl"}
+DEFAULT_ON_FIELDS = {"verify_ssl", "copy_after_backup"}
 
 
 # ─── Разбор значений (чистые функции) ────────────────────────
@@ -733,6 +823,37 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
 
     if kind in ("text", "secret"):
         return True, text, None
+
+    if kind == "script":
+        low = text.lower()
+        if not low.endswith((".ps1", ".bat", ".cmd", ".exe")):
+            return False, None, "Путь должен указывать на .ps1, .bat, .cmd или .exe"
+        return True, text, None
+
+    if kind == "backup_types":
+        letters = []
+        for part in text.replace(";", ",").replace(" ", ",").split(","):
+            part = part.strip().upper()
+            if not part:
+                continue
+            if part[0] not in ("D", "I", "L"):
+                return False, None, "Типы: D (полная), I (разностная), L (журнал)"
+            letters.append(part[0])
+        if not letters:
+            return True, None, None
+        # Порядок и повторы не важны — важен состав
+        return True, ",".join(sorted(set(letters))), None
+
+    if kind == "minutes":
+        try:
+            value = int(text)
+        except ValueError:
+            return False, None, "Нужно число минут (или пропусти)"
+        if value < 0:
+            return False, None, "Минуты не могут быть отрицательными"
+        if value > 2880:
+            return False, None, "Максимум 2880 минут (двое суток)"
+        return True, value, None
 
     if kind == "regpath":
         if not text.lower().endswith(".reg"):
@@ -2550,7 +2671,7 @@ HELP_MIRROR = """🔗 КОПИИ ПРИЕЗЖАЮТ С РЕГИОНА
 Только в config/servers.json, у пути приёмника:
 
   "mirror_of": { "server": "sql-01", "path": "E:\\Backups\\daily" },
-  "mirror_lag_minutes": 45
+  "mirror_lag_minutes": 240
 
 server — имя сервера-источника КАК В КОНФИГЕ (опечатка тихо выключает
 проверку: такого сервера просто нет в базе).
@@ -2582,6 +2703,59 @@ mirror_lag_minutes — сколько ждать копию, прежде чем
 • источник недоступен и его данные старее часа — «на источнике новее»
   тогда ничего не значит;
 • расхождение часов до 3 минут пропажей не считается."""
+
+
+HELP_COPY = """📤 КОПИРОВАНИЕ ПО ГОТОВНОСТИ
+
+Бот сам запускает скрипт копирования на сервере-источнике, как только
+SQL закончил копию. Планировщик Windows для этого больше не нужен.
+
+Почему так лучше. Планировщик стартует в назначенный час, а бэкап
+заканчивается когда придётся: сегодня в 3:00, завтра в 4:00 — шла
+проверка базы или сервер был занят. Значит скрипт может стартовать
+раньше, чем файл готов, а ждать копию «через N минут после появления
+файла» бессмысленно: 70 ГБ не уезжают за фиксированные 45 минут.
+
+Точное время знает сам SQL: msdb пишет момент, когда копия закончена
+и файл закрыт. По нему и работаем.
+
+━━━━━━━━━━━━━━━━━━━━
+⚙️ ЧТО НАСТРОИТЬ
+
+⚙️ Настройка → сервер-ИСТОЧНИК (регион), поля:
+
+📜 Скрипт копирования — полный путь НА САМОМ СЕРВЕРЕ
+   (.ps1, .bat, .cmd, .exe). Задал — управление включилось.
+🔁 Копировать автоматически — можно временно выключить, не стирая путь.
+💾 Какие копии возить — D полная, I разностная, L журнал.
+   По умолчанию D,I: журналы делают каждые 15–60 минут, скрипт работал
+   бы непрерывно.
+⏸ Пауза перед копированием — сколько ждать после отметки «закончена»
+   (SQL закрывает файл раньше, чем система дописывает его на диск).
+⏰ Копирование зависло — порог, после которого зовём на помощь.
+   Считается ОТ СТАРТА СКРИПТА, поэтому большая база не даёт ложной
+   тревоги. Для 70 ГБ ставь с запасом: 360 минут и больше.
+
+━━━━━━━━━━━━━━━━━━━━
+🔔 ЧТО ПРИХОДИТ
+
+🆘 КОПИРОВАНИЕ НЕ ЗАПУСТИЛОСЬ — скрипт не стартовал. Файл готов, но
+   никуда не поедет: нужно запускать руками.
+🆘 КОПИРОВАНИЕ ЗАВИСЛО — процесс жив дольше порога.
+
+Про успех бот молчит специально: успешные копии и так видны в
+💾 Бэкапы, а лента не должна состоять из «всё хорошо».
+
+━━━━━━━━━━━━━━━━━━━━
+🔗 КАК ЭТО ДРУЖИТ СО СВЕРКОЙ
+
+Пока копирование идёт, сверка приёмника с источником МОЛЧИТ — файл в
+дороге, и «не доехал» было бы ложью, сколько бы он ни ехал. Как только
+процесс закончился, приёмник проверяется обычным порядком, и сравнение
+размера с оригиналом ловит обрыв (для SFTP обрыв выглядит успехом).
+
+Одна копия отправляется один раз. Копию старше трёх часов бот не везёт
+вовсе — иначе после перезапуска он погнал бы копировать вчерашний файл."""
 
 
 # Разделы справки: порядок = порядок кнопок
@@ -3335,6 +3509,7 @@ HELP_SECTIONS = {
     "servers": ("🖧 Серверы и поля",       HELP_SERVERS),
     "backups": ("💾 Бэкапы",               HELP_BACKUPS),
     "mirror":  ("🔗 Сверка с источником",  HELP_MIRROR),
+    "copy":    ("📤 Копирование копий",     HELP_COPY),
     "vmware":  ("🖥 VMware",               HELP_VMWARE),
     "alerts":  ("🔔 Алерты",               HELP_ALERTS),
     "quiet":   ("🔕 Тишина и доставка",    HELP_QUIET),
