@@ -281,6 +281,76 @@ def test_healthy_server_gives_no_findings():
     assert findings_for("mail-01", mail, audit, {"10.20.30.5": ""}) == []
 
 
+# ─── Флаги и кнопка блокировки в алерте ──────────────────────
+
+SPRAY_EVENTS = [
+    {"account": "kuz@example.local", "ip": "203.0.113.5", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 01:00:00"},
+    {"account": "kuz@example.local", "ip": "198.51.100.7", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 02:00:00"},
+    {"account": "kuz@example.local", "ip": "192.0.2.9", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 03:00:00"},
+    {"account": "kuz@example.local", "ip": "10.20.30.5", "protocol": "smtp",
+     "ok": False, "count": 1, "last": "2026-09-01 04:00:00"},
+]
+
+SPRAY_GEO = {"203.0.113.5": "🇳🇱 Amsterdam", "198.51.100.7": "🇹🇷 Istanbul",
+             "192.0.2.9": "🇷🇺 Moscow", "10.20.30.5": ""}
+
+
+def _spray_finding():
+    from zimbra_collector import findings_for
+
+    mail = {"origins": [], "local_domains": [], "senders": [], "queue": 3}
+    found = findings_for("mail-01", {"queue": 3, **mail},
+                         {"events": SPRAY_EVENTS}, SPRAY_GEO)
+    return next(item for _s, item in found if item["key"].startswith("zm_spray:"))
+
+
+def test_spray_addresses_carry_flags():
+    """Страна отвечает на первый вопрос про адрес: свои так не ходят."""
+    text = _spray_finding()["text"]
+
+    assert "203.0.113.5 🇳🇱" in text
+    assert "198.51.100.7 🇹🇷" in text
+    # Город в перечислении не нужен — он занимает полстроки на каждый адрес.
+    assert "Amsterdam" not in text
+
+
+def test_spray_finding_offers_only_outside_addresses():
+    """Кнопка под алертом банит сразу, поэтому внутренний адрес не должен
+    попасть в предложение даже случайно: за ним шлюз или рабочее место."""
+    ips = _spray_finding()["ips"]
+
+    assert "203.0.113.5" in ips
+    assert "10.20.30.5" not in ips
+
+
+def test_ban_buttons_appear_under_alert():
+    from alerts import BAN_BUTTONS, ban_buttons_kb
+
+    kb = ban_buttons_kb("mail-01", ["203.0.113.5", "198.51.100.7",
+                                    "192.0.2.9", "192.0.2.10"])
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    bans = [b for b in buttons if b["callback_data"].startswith("al_ban:")]
+
+    assert len(bans) == BAN_BUTTONS
+    assert bans[0]["callback_data"] == "al_ban:mail-01:203.0.113.5"
+    # Кнопки алерта никуда не делись.
+    assert any(b["callback_data"].startswith("al_refresh:") for b in buttons)
+
+
+def test_too_long_callback_is_not_drawn():
+    """Telegram режет callback_data длиннее 64 байт, и кнопка молча
+    перестаёт работать — лучше её не рисовать вовсе."""
+    from alerts import ban_buttons_kb
+
+    kb = ban_buttons_kb("s" * 60, ["203.0.113.5"])
+    data = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+
+    assert not [d for d in data if d.startswith("al_ban:")]
+
+
 # ─── Справка ─────────────────────────────────────────────────
 
 def test_help_explains_message_counting():

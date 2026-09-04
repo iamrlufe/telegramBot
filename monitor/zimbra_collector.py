@@ -74,6 +74,31 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
     def place(ip):
         return f" ({tag[ip]})" if tag.get(ip) else ""
 
+    def flag(ip):
+        """Только флаг, без города. В перечислении из трёх адресов город
+        занимает полстроки, а страна и так отвечает на главный вопрос:
+        свои так не ходят."""
+        label = (tag.get(ip) or "").strip()
+        if len(label) >= 2 and all(0x1F1E6 <= ord(c) <= 0x1F1FF for c in label[:2]):
+            return f" {label[:2]}"
+        return ""
+
+    def attackers(addresses):
+        """Адреса, которые имеет смысл предлагать к блокировке.
+
+        Внутренние не предлагаются никогда: за ними шлюз или рабочее место,
+        и блокировка отрезала бы своих. То же правило стоит в кандидатах
+        раздела 🛡 Блокировка — здесь оно нужно ещё раз, потому что кнопка
+        под алертом банит сразу, без списка."""
+        from geoip import is_private
+
+        out = []
+        for ip in addresses or []:
+            ip = (ip or "").strip()
+            if ip and ip not in ("?", "-") and not is_private(ip) and ip not in out:
+                out.append(ip)
+        return out
+
     for item in foreign_logins(audit.get("events"), codes):
         found.append((server_name, {
             "level": "crit",
@@ -100,13 +125,14 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
                         if item["guessed"] else "")),
             "hint": f"{item['count']} неудачных входов",
             "key": f"zm_brute:{server_name}:{item['account']}:{item['ip']}",
+            "ips": attackers([item["ip"]]),
         }))
 
     # Распылённый перебор: порог по одному адресу его не берёт, а это самая
     # обычная форма — по одной попытке с десятков адресов из разных стран.
     louder = {item["account"] for item in brute_force(audit.get("events"))}
     for item in spray_targets(audit.get("events"), skip=louder):
-        where = ", ".join(item["addresses"][:3])
+        where = ", ".join(f"{ip}{flag(ip)}" for ip in item["addresses"][:3])
         more = (f" и ещё {len(item['addresses']) - 3}"
                 if len(item["addresses"]) > 3 else "")
         how = (" по " + ", ".join(item["protocols"])) if item["protocols"] else ""
@@ -122,6 +148,7 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
             "hint": f"перебор с {len(item['addresses'])} адресов",
             # Ключ без чисел: иначе каждая новая попытка — новая находка.
             "key": f"zm_spray:{server_name}:{item['account']}",
+            "ips": attackers(item["addresses"]),
         }))
 
     for item in outside_senders(mail.get("origins"), mail.get("local_domains")):

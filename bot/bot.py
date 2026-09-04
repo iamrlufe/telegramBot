@@ -36,10 +36,12 @@ from iis_bot import has_iis, iis_token, iis_callback
 from exchange_bot import has_exchange, ex_token, exchange_callback
 from zimbra_bot import zm_token, zimbra_callback
 from zimbra_log import has_zimbra
-from fail2ban_bot import f2b_token, fail2ban_callback
-from fail2ban import has_fail2ban
+from fail2ban_bot import default_jail, f2b_token, fail2ban_callback
+from fail2ban import ban as f2b_ban, has_fail2ban, read_state as f2b_state
+from firewall_store import DEFAULT_DAYS as FW_BLOCK_DAYS
 from firewall_bot import (
     has_firewall, fw_token, firewall_callback, handle_firewall_text,
+    do_block as fw_block,
     AWAIT_KEY as FW_AWAIT_KEY,
 )
 from remote_ops import get_top_dirs, restart_service, reboot_server
@@ -809,6 +811,32 @@ def server_disks_kb(server_name: str, disks: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def block_address(server_name: str, address: str, user=None) -> tuple:
+    """Блокировка адреса по кнопке из алерта. Возвращает (получилось, чем).
+
+    Механизм выбирается по серверу, а не по кнопке: на Linux это fail2ban
+    со своим сроком, на Windows — правило фаервола. Оба уже есть в разделе
+    🛡, здесь только короткий путь к ним из самого алерта.
+    """
+    server = load_server(server_name)
+
+    if has_fail2ban(server):
+        jail = default_jail(f2b_state(server))
+        if not jail:
+            return False, "fail2ban не отвечает или клеток нет"
+        f2b_ban(server, jail, address)
+        return True, f"fail2ban, клетка {jail}"
+
+    if has_firewall(server):
+        author = str(getattr(user, "id", "") or "")
+        fw_block(server_name, address, FW_BLOCK_DAYS,
+                 "заблокирован из алерта", author)
+        return True, f"фаервол, {FW_BLOCK_DAYS} дн."
+
+    return False, ("у сервера не включён флаг firewall — блокировать нечем. "
+                   "Включить: ⚙️ Настройка → сервер → блокировка IP")
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await safe_answer_query(query)
@@ -963,6 +991,54 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text(
                 f"❌ Не удалось перезапустить {service_name} на {server_name}:\n{status}"
+            )
+
+    # Кнопка «🛡 Заблокировать» под алертом почты: адрес уже назван в самой
+    # находке, и переносить его руками в раздел блокировки не нужно.
+    # Подтверждение обязательно — за адресом может стоять живой человек.
+    elif query.data.startswith("al_ban:"):
+        if not can_configure(query.from_user):
+            await query.message.reply_text(
+                "⛔ Блокировкой управляют только пользователи из TELEGRAM_DELETE_USERS."
+            )
+            return
+        _, server_name, address = query.data.split(":", 2)
+        await query.message.reply_text(
+            f"🛡 Заблокировать {address} на {server_name}?\n\n"
+            f"На Linux адрес уходит в fail2ban и снимется по его сроку, "
+            f"на Windows — в правило фаервола на {FW_BLOCK_DAYS} дн.\n"
+            f"Снять блокировку можно в разделе 🛡 в карточке сервера.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, заблокировать",
+                                     callback_data=f"al_bango:{server_name}:{address}"),
+                InlineKeyboardButton("❌ Отмена", callback_data="al_bancancel"),
+            ]])
+        )
+
+    elif query.data == "al_bancancel":
+        await safe_edit_message(query, "❌ Блокировка отменена.")
+
+    elif query.data.startswith("al_bango:"):
+        if not can_configure(query.from_user):
+            await query.message.reply_text("⛔ Нет прав на блокировку.")
+            return
+        _, server_name, address = query.data.split(":", 2)
+        await safe_edit_message(query, f"🛡 Блокирую {address} на {server_name}...")
+        try:
+            done, where = await asyncio.to_thread(block_address, server_name, address,
+                                                  query.from_user)
+        except Exception as e:
+            done, where = False, str(e).splitlines()[0][:200]
+        if done:
+            audit.log_config_change(query.from_user, "alert ban",
+                                    target=f"{server_name}:{address}", details=where)
+            await query.message.reply_text(
+                f"✅ {address} заблокирован на {server_name} ({where}).\n"
+                f"Снять — раздел 🛡 в карточке сервера."
+            )
+        else:
+            await query.message.reply_text(
+                f"❌ Не удалось заблокировать {address} на {server_name}:\n{where}"
             )
 
     elif query.data.startswith("srv_reboot:"):

@@ -1229,6 +1229,36 @@ IIS_KEEP_HOURS = int_env("IIS_ALERT_KEEP_HOURS", 12)
 # Сколько находок показывать в сообщении: остальное — в карточке сервера.
 IIS_IN_MESSAGE = 5
 
+# Сколько кнопок блокировки вешать под алертом. Распылённый перебор идёт с
+# десятков адресов, и все они в клавиатуру не поместятся — да и не нужно:
+# кнопка здесь для случая «вижу явного чужака, отрезать сейчас», а разбор
+# списком живёт в разделе 🛡 Блокировка.
+BAN_BUTTONS = 3
+
+# Telegram обрезает callback_data длиннее 64 байт, и кнопка молча перестаёт
+# работать. Длинное имя сервера плюс IPv6 в лимит не влезают — такую кнопку
+# лучше не рисовать вовсе, чем рисовать нерабочую.
+CALLBACK_LIMIT = 64
+
+
+def ban_buttons_kb(server_name: str, addresses: list) -> dict:
+    """Кнопки «заблокировать» под алертом с находками.
+
+    Адреса приходят из самих находок: перебор пароля и распылённый перебор
+    называют конкретных нарушителей, и до сих пор их приходилось переносить
+    руками в раздел 🛡 Блокировка. Механизм блокировки выбирает бот при
+    нажатии — fail2ban на Linux, правило фаервола на Windows.
+    """
+    kb = server_alert_kb(server_name)
+    rows = []
+    for address in addresses[:BAN_BUTTONS]:
+        data = f"al_ban:{server_name}:{address}"
+        if len(data.encode()) > CALLBACK_LIMIT:
+            continue
+        rows.append([{"text": f"🛡 Заблокировать {address}", "callback_data": data}])
+    kb["inline_keyboard"][1:1] = rows
+    return kb
+
 
 def _findings_alert(findings: list, state_file: str, title: str,
                     hint: str, prefix: str):
@@ -1276,8 +1306,16 @@ def _findings_alert(findings: list, state_file: str, title: str,
         lines.append("")
         lines.append(hint)
 
+        # Адреса берутся только из показанных находок: кнопка под адресом,
+        # которого в сообщении не видно, непонятна.
+        suspects = []
+        for item in fresh[:IIS_IN_MESSAGE]:
+            for address in item.get("ips") or []:
+                if address not in suspects:
+                    suspects.append(address)
+
         send_or_defer("\n".join(lines),
-                      reply_markup=server_alert_kb(server_name),
+                      reply_markup=ban_buttons_kb(server_name, suspects),
                       ack_key=f"{prefix}:{server_name}")
 
 
