@@ -239,9 +239,30 @@ def test_launch_writes_log_and_exit_code():
     """Одного PID мало: упавший на первой строке скрипт выглядел бы как
     идущая копия. Код возврата и журнал — единственный честный ответ."""
     text = launch_script_ps("C:\\a.bat", "20260905-102701-I")
-    assert "%ERRORLEVEL%" in text
+    assert "ERRORLEVEL" in text
     assert "20260905-102701-I.log" in text
     assert "20260905-102701-I.done" in text
+
+
+def test_exit_code_is_taken_after_the_script_ran():
+    """Регрессия: %ERRORLEVEL% в составной команде подставляется при
+    РАЗБОРЕ строки, то есть до запуска скрипта. Нужна отложенная
+    подстановка (/v:on и !ERRORLEVEL!), иначе в метку попадает код,
+    который был ДО копирования."""
+    text = launch_script_ps("C:\\a.bat", "id")
+    assert "/v:on" in text
+    assert "!ERRORLEVEL!" in text
+    assert "%ERRORLEVEL%" not in text
+
+
+def test_marker_write_is_not_a_stream_redirect():
+    """Регрессия: `echo !ERRORLEVEL!> файл` без пробела перед `>` — это
+    перенаправление потока с таким номером (0> это stdin), а не запись в
+    файл. Метка не появлялась, и удачный рейс выглядел как «процесс
+    исчез, не дописав код возврата»."""
+    text = launch_script_ps("C:\\a.bat", "id")
+    assert "!ERRORLEVEL! > " in text
+    assert "!ERRORLEVEL!>" not in text
 
 
 def test_old_logs_are_cleaned_on_launch():

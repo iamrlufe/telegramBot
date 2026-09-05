@@ -264,7 +264,7 @@ def run_verdict(run: dict, settings: dict, now: datetime) -> str:
 # Куда складывать журнал запуска и код возврата. Каталог общий и
 # предсказуемый: логи должны переживать перезапуск бота и открываться
 # на сервере руками, когда захочется посмотреть глазами.
-WORK_DIR_PS = "Join-Path $env:ProgramData 'AgroTNKbot\\copy'"
+WORK_DIR_PS = "Join-Path $env:ProgramData 'bot\\copy'"
 
 # Сколько строк журнала показывать в алерте. Больше — простыня в
 # Telegram, меньше — не видно самой ошибки, она обычно в конце.
@@ -312,6 +312,16 @@ def launch_script_ps(script: str, ident: str) -> str:
     строку командной строки целиком, и её не переписывает разбор массива
     аргументов — с перенаправлениями и кавычками это единственный
     предсказуемый способ.
+
+    Две ловушки cmd, на которых это уже ломалось, — обе в одной строке:
+
+    * `%ERRORLEVEL%` в составной команде подставляется при РАЗБОРЕ строки,
+      то есть ДО запуска скрипта. Нужен `/v:on` и `!ERRORLEVEL!` —
+      отложенная подстановка, в момент выполнения;
+    * `echo !ERRORLEVEL!> файл` без пробела перед `>` — это не вывод в
+      файл, а перенаправление ПОТОКА с таким номером: `0>` для cmd значит
+      stdin. Файл-метка не появлялась вовсе, и удачный рейс выглядел как
+      «процесс исчез, не дописав код возврата».
     """
     if '"' in script:
         raise ValueError("в пути к скрипту не должно быть кавычек")
@@ -325,7 +335,7 @@ def launch_script_ps(script: str, ident: str) -> str:
     $log = Join-Path $dir '{ident}.log'
     $done = Join-Path $dir '{ident}.done'
     if (Test-Path -LiteralPath $done) {{ Remove-Item -LiteralPath $done -Force }}
-    $line = 'cmd.exe /c {invoke} >> "' + $log + '" 2>&1 & echo %ERRORLEVEL%> "' + $done + '"'
+    $line = 'cmd.exe /v:on /c {invoke} >> "' + $log + '" 2>&1 & echo !ERRORLEVEL! > "' + $done + '"'
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $line }}
     ConvertTo-Json @{{ Pid = $r.ProcessId; Ret = $r.ReturnValue; Log = $log; Done = $done }} -Compress
     """
