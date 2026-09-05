@@ -531,3 +531,48 @@ def test_size_check_looks_at_filepart_too():
     """WinSCP пишет в .filepart и переименовывает в конце — пока файл
     едет, под конечным именем его нет вовсе."""
     assert ".filepart" in backup_copy.file_size_ps("E:\\B\\file.bak")
+
+
+# ─── Поиск приёмника по имени ────────────────────────────────
+
+SERVERS = [
+    {"name": "is-cc.rcku.net", "host": "192.0.2.38"},
+    {"name": "akt1c8.rcku.net", "host": "192.0.2.10"},
+]
+
+
+def _servers(monkeypatch):
+    monkeypatch.setattr(backup_copy, "load_servers", lambda *a, **kw: SERVERS)
+
+
+def test_exact_name_wins(monkeypatch):
+    _servers(monkeypatch)
+    assert backup_copy.find_server_loose("is-cc.rcku.net")["host"] == "192.0.2.38"
+
+
+def test_short_name_is_understood(monkeypatch):
+    """«is-cc» вместо «is-cc.rcku.net» — обычная описка при вводе руками.
+    Отказ «такого сервера нет» тут формально верен и бесполезен."""
+    _servers(monkeypatch)
+    assert backup_copy.find_server_loose("is-cc")["name"] == "is-cc.rcku.net"
+
+
+def test_host_also_works(monkeypatch):
+    _servers(monkeypatch)
+    assert backup_copy.find_server_loose("192.0.2.38")["name"] == "is-cc.rcku.net"
+
+
+def test_ambiguous_prefix_is_refused(monkeypatch):
+    """Два сервера с общим началом имени — повод спросить человека,
+    а не угадывать за него."""
+    monkeypatch.setattr(backup_copy, "load_servers", lambda *a, **kw: [
+        {"name": "is-cc.rcku.net", "host": "h1"},
+        {"name": "is-cc.backup.rcku.net", "host": "h2"},
+    ])
+    assert backup_copy.find_server_loose("is-cc") is None
+
+
+def test_unknown_name_gives_nothing(monkeypatch):
+    _servers(monkeypatch)
+    assert backup_copy.find_server_loose("нет-такого") is None
+    assert backup_copy.find_server_loose("") is None

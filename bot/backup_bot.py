@@ -37,6 +37,7 @@ from backup_copy import (
     copy_servers,
     copy_settings,
     find_server,
+    find_server_loose,
     load_state as load_copy_state,
     read_remote_log_info,
     remote_file_size,
@@ -817,10 +818,12 @@ async def _fill_progress(server: dict, summary: dict):
     if not running:
         return
 
-    receiver = await asyncio.to_thread(find_server, target["server"])
+    receiver = await asyncio.to_thread(find_server_loose, target["server"])
     if not receiver:
-        summary["target_error"] = (f"сервера-приёмника {target['server']} "
-                                   f"нет в конфиге")
+        summary["target_error"] = (
+            f"сервера-приёмника «{target['server']}» нет в списке серверов "
+            f"бота. Добавьте его: ⚙️ Настройка → ➕ Добавить сервер — и имя "
+            f"должно совпадать с тем, что записано в «Приёмник копий»")
         return
 
     for entry in running:

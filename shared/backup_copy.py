@@ -576,6 +576,35 @@ def find_server(server_name: str) -> dict:
     return None
 
 
+def find_server_loose(name: str) -> dict:
+    """Сервер по имени, а если точного совпадения нет — по хосту или по
+    началу имени.
+
+    Имя приёмника человек вводит руками, и «is-cc» вместо
+    «is-cc.rcku.net» — самая обычная описка. Отказ «такого сервера нет»
+    в этом случае формально верен и совершенно бесполезен.
+    """
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return None
+    try:
+        servers = load_servers()
+    except Exception:
+        return None
+
+    for server in servers:
+        if str(server.get("name") or "").lower() == wanted:
+            return server
+    for server in servers:
+        if str(server.get("host") or "").lower() == wanted:
+            return server
+    matches = [s for s in servers
+               if str(s.get("name") or "").lower().startswith(wanted + ".")]
+    # Только когда совпадение одно: два сервера с общим началом имени —
+    # повод спросить человека, а не угадывать за него.
+    return matches[0] if len(matches) == 1 else None
+
+
 def launch_copy(server: dict, settings: dict, ready: dict = None,
                 by: str = "монитор") -> dict:
     """Запускает скрипт копирования на сервере-источнике и возвращает запись
