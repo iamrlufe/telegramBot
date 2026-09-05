@@ -38,8 +38,16 @@ from backup_copy import (
     copy_settings,
     find_server,
     load_state as load_copy_state,
+    read_remote_log,
     start_copy_now,
     type_label,
+)
+from copy_log import (
+    common_log,
+    database_log,
+    log_dir,
+    parse_common_log,
+    summary_lines,
 )
 from backup_schedule import (
     load_schedule_map,
@@ -47,7 +55,7 @@ from backup_schedule import (
     weekly_age_text,
     weekly_backup_missed,
 )
-from tg_utils import safe_edit_message, split_message
+from tg_utils import TELEGRAM_TEXT_LIMIT, safe_edit_message, split_message
 import audit
 from settings import ALMATY
 
@@ -630,6 +638,16 @@ async def show_copy_status(query, context, page: int = 0):
         run_rows = [[InlineKeyboardButton(
             "📤 Скопировать сейчас",
             callback_data="backup_copy_run_servers")]]
+
+    # Журнал самого скрипта: он знает то, чего не знает бот, — сколько
+    # баз обошли, что залито, что пропущено.
+    for name in names:
+        data = f"backup_copy_log:{name}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            continue
+        run_rows.append([InlineKeyboardButton(
+            f"📄 Журнал{'' if len(names) == 1 else ' · ' + name}",
+            callback_data=data)])
     rows[-1:-1] = run_rows
 
     # Рейс, который числится идущим: если он завис или его убили руками,
@@ -644,6 +662,126 @@ async def show_copy_status(query, context, page: int = 0):
             f"⏹ Сбросить рейс{'' if len(names) == 1 else ' · ' + name}",
             callback_data=data)])
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+def _copy_script_path(server: dict, btype: str = None) -> str:
+    """Скрипт, от которого считается каталог журналов. Скрипты разных
+    типов обычно лежат рядом, поэтому для каталога годится любой."""
+    scripts = (copy_settings(server) or {}).get("scripts") or {}
+    if btype and scripts.get(btype):
+        return scripts[btype]
+    return next(iter(scripts.values()), "")
+
+
+async def show_copy_log_types(query, context, server_name: str):
+    """Какой журнал смотреть: у каждого типа копии он свой."""
+    server = await asyncio.to_thread(find_server, server_name)
+    settings = copy_settings(server) if server else None
+    if not settings:
+        await safe_edit_message(query, f"⚠️ У {server_name} не задан скрипт "
+                                       f"копирования.", reply_markup=back_kb())
+        return
+
+    directory = log_dir(_copy_script_path(server))
+    rows = []
+    for btype in settings["scripts"]:
+        data = f"backup_copy_logt:{server_name}:{btype}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"📄 {type_label(btype).capitalize()}", callback_data=data)])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_copy")])
+
+    await safe_edit_message(
+        query,
+        f"📄 ЖУРНАЛ СКРИПТА · {server_name}\n\n"
+        f"Каталог за сегодня:\n{directory}\n\n"
+        f"Это журнал вашего скрипта, а не бота: в нём видно, какие базы "
+        f"обошли, что залито и что пропущено.\n\nВыбери тип копии:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def show_copy_log(query, context, server_name: str, btype: str):
+    server = await asyncio.to_thread(find_server, server_name)
+    if not server:
+        await safe_edit_message(query, f"❌ Сервер {server_name} не найден.",
+                                reply_markup=back_kb())
+        return
+
+    script = _copy_script_path(server, btype)
+    path = common_log(script, btype)
+    try:
+        text = await asyncio.to_thread(read_remote_log, server, path)
+    except Exception as e:
+        await safe_edit_message(
+            query,
+            f"❌ Не прочитать журнал {path}:\n{str(e)[:300]}",
+            reply_markup=back_kb()
+        )
+        return
+
+    back = [InlineKeyboardButton("◀️ Назад",
+                                 callback_data=f"backup_copy_log:{server_name}")]
+    if not text:
+        await safe_edit_message(
+            query,
+            f"📄 {server_name} · {type_label(btype)}\n\n"
+            f"Журнала за сегодня нет:\n{path}\n\n"
+            f"Это нормально, если копий этого типа сегодня ещё не было.",
+            reply_markup=InlineKeyboardMarkup([back])
+        )
+        return
+
+    summary = parse_common_log(text)
+    lines = [f"🖥 {server_name}"] + summary_lines(summary)
+
+    rows = []
+    for entry in summary.get("databases") or []:
+        data = f"backup_copy_logdb:{server_name}:{btype}:{entry['name']}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            continue
+        rows.append([InlineKeyboardButton(f"🔎 {entry['name']}",
+                                          callback_data=data)])
+    rows.append(back)
+
+    # Баз может быть много: обрезаем с конца, чтобы шапка со сводкой
+    # осталась на месте — она и есть ответ на «как прошло».
+    await safe_edit_message(query, "\n".join(lines)[:TELEGRAM_TEXT_LIMIT],
+                            reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_copy_log_db(query, context, server_name: str, btype: str,
+                           database: str):
+    """Подробности WinSCP по одной базе — как есть, хвостом."""
+    server = await asyncio.to_thread(find_server, server_name)
+    if not server:
+        await safe_edit_message(query, f"❌ Сервер {server_name} не найден.",
+                                reply_markup=back_kb())
+        return
+
+    path = database_log(_copy_script_path(server, btype), btype, database)
+    try:
+        text = await asyncio.to_thread(read_remote_log, server, path, None, 40)
+    except Exception as e:
+        text, error = "", str(e)[:300]
+    else:
+        error = ""
+
+    back = [InlineKeyboardButton(
+        "◀️ Назад", callback_data=f"backup_copy_logt:{server_name}:{btype}")]
+    if error:
+        body = f"❌ Не прочитать: {error}"
+    elif not text:
+        body = f"Файла нет:\n{path}"
+    else:
+        body = f"{path}\n\n{text}"
+
+    await safe_edit_message(
+        query,
+        f"🔎 {database} · {type_label(btype)}\n\n{body}"[-TELEGRAM_TEXT_LIMIT:],
+        reply_markup=InlineKeyboardMarkup([back])
+    )
 
 
 async def ask_copy_reset(query, context, server_name: str):
@@ -1430,6 +1568,20 @@ async def backup_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("backup_copy_run:"):
         server_name = data.split(":", 1)[1]
         await do_copy_run(query, context, server_name)
+
+    elif data.startswith("backup_copy_logdb:"):
+        rest = data[len("backup_copy_logdb:"):]
+        server_name, btype, database = rest.split(":", 2)
+        await safe_edit_message(query, "⏳ Читаю журнал...")
+        await show_copy_log_db(query, context, server_name, btype, database)
+
+    elif data.startswith("backup_copy_logt:"):
+        server_name, btype = data[len("backup_copy_logt:"):].rsplit(":", 1)
+        await safe_edit_message(query, "⏳ Читаю журнал...")
+        await show_copy_log(query, context, server_name, btype)
+
+    elif data.startswith("backup_copy_log:"):
+        await show_copy_log_types(query, context, data.split(":", 1)[1])
 
     elif data.startswith("backup_copy_reset:"):
         await ask_copy_reset(query, context, data.split(":", 1)[1])

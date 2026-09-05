@@ -624,6 +624,74 @@ def _only_script(settings: dict) -> str:
     return scripts[0] if len(scripts) == 1 else ""
 
 
+# ─── Чтение журналов скрипта с сервера ───────────────────────
+
+def read_tail_ps(path: str, tail_bytes: int = None) -> str:
+    """PowerShell: хвост файла байтами в base64.
+
+    Байтами по той же причине, что и журнал бота: в одном файле
+    соседствуют кодировка консоли и UTF-8 от WinSCP (см. decode_log_tail).
+    Файл читается с общим доступом — его прямо сейчас может писать
+    идущий рейс.
+    """
+    quoted = str(path).replace("'", "''")
+    tail_bytes = tail_bytes or LOG_TAIL_BYTES
+    return PS_OUT_B64_HELPER + f"""
+    $tail = ''
+    $size = 0
+    if (Test-Path -LiteralPath '{quoted}') {{
+        try {{
+            $fs = [IO.File]::Open('{quoted}', 'Open', 'Read', 'ReadWrite')
+            $size = $fs.Length
+            $len = [Math]::Min($fs.Length, {tail_bytes})
+            $null = $fs.Seek(-$len, 'End')
+            $buf = New-Object byte[] $len
+            $null = $fs.Read($buf, 0, $len)
+            $fs.Close()
+            $tail = [Convert]::ToBase64String($buf)
+        }} catch {{ $tail = '' }}
+    }}
+    Out-B64 @{{ TailB64 = $tail; Size = $size }}
+    """
+
+
+def read_remote_log(server: dict, path: str, tail_bytes: int = None,
+                    lines: int = 400) -> str:
+    """Хвост файла на сервере как текст. Пустая строка — файла нет."""
+    raw = run_ps(server["host"], read_tail_ps(path, tail_bytes),
+                 server.get("username"), server.get("password"))
+    data = ps_json(raw) or {}
+    if not data.get("Size"):
+        return ""
+    return decode_log_tail(data.get("TailB64"), lines=lines)
+
+
+def list_dir_ps(path: str) -> str:
+    """PowerShell: что лежит в каталоге журналов за дату."""
+    quoted = str(path).replace("'", "''")
+    return PS_OUT_B64_HELPER + f"""
+    $items = @()
+    if (Test-Path -LiteralPath '{quoted}') {{
+        $items = @(Get-ChildItem -LiteralPath '{quoted}' -ErrorAction SilentlyContinue |
+            ForEach-Object {{ @{{ Name = $_.Name; Dir = $_.PSIsContainer;
+                                 Size = $(if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}) }} }})
+    }}
+    Out-B64 @{{ Items = $items }}
+    """
+
+
+def list_remote_dir(server: dict, path: str) -> list:
+    """[{name, dir, size}] — содержимое каталога на сервере."""
+    raw = run_ps(server["host"], list_dir_ps(path),
+                 server.get("username"), server.get("password"))
+    data = ps_json(raw) or {}
+    items = data.get("Items") or []
+    if isinstance(items, dict):
+        items = [items]
+    return [{"name": i.get("Name"), "dir": bool(i.get("Dir")),
+             "size": int(i.get("Size") or 0)} for i in items]
+
+
 def clear_run(server_name: str) -> dict:
     """Забыть идущий рейс. Процесс на сервере при этом НЕ убивается —
     бот его не рождал управляемым и убивать чужую работу не должен.
