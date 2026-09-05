@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from backup_copy import (
+    check_run_ps,
     copy_settings,
     decode_log_tail,
     run_outcome,
@@ -411,6 +412,25 @@ def test_old_run_without_marker_still_ends_by_pid():
     old_run = {"pid": 10848, "started": "2026-09-05 10:27:01"}
     assert run_outcome({"Alive": False}, old_run)["state"] == "ok"
     assert run_outcome({"Alive": True}, old_run)["state"] == "running"
+
+
+def test_process_is_identified_by_run_number():
+    """Регрессия: PID переиспользуются, и через пару часов под тем же
+    номером работает чужая программа — закончившийся рейс висел «идёт»
+    до самого таймаута. Процесс опознаём по номеру рейса в его
+    командной строке."""
+    text = check_run_ps({"pid": 14520, "ident": "20260905-110228-I",
+                         "log": "C:\\l", "done": "C:\\d"})
+    assert "ProcessId=14520" in text
+    assert "20260905-110228-I" in text
+    assert "CommandLine -like" in text
+
+
+def test_old_run_without_number_falls_back_to_pid():
+    """Рейсы, заведённые прошлой версией, номера не знают — для них
+    остаётся прежняя проверка, иначе они зависли бы навсегда."""
+    text = check_run_ps({"pid": 14520, "log": "C:\\l", "done": "C:\\d"})
+    assert "$alive = $true" in text
 
 
 # ─── Ручной запуск из бота ───────────────────────────────────

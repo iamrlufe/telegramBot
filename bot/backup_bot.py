@@ -600,22 +600,37 @@ async def show_copy_status(query, context, page: int = 0):
         callback_prefix="backup_copy_page"
     )
     rows = list(keyboard.inline_keyboard)
-    run_row = []
+    run_rows = []
     if len(names) == 1:
+        # Источник один: сразу кнопки типов, без лишнего выбора сервера.
         server = await asyncio.to_thread(find_server, names[0])
         settings = copy_settings(server) if server else None
-        if settings:
-            run_row = copy_type_buttons(names[0], settings)
-    if not run_row:
-        # Сервер один и скрипт у него один — незачем спрашивать, какой
-        # именно сервер: кнопка запускает сразу.
-        data = (f"backup_copy_run:{names[0]}" if len(names) == 1
-                and len(f"backup_copy_run:{names[0]}".encode()) <= COPY_CALLBACK_LIMIT
-                else "backup_copy_run_servers")
-        run_row = [InlineKeyboardButton("📤 Скопировать сейчас", callback_data=data)]
-    # По кнопке в ряд, если типов больше двух: подписи длинные
-    rows[-1:-1] = ([run_row] if len(run_row) <= 2
-                   else [[button] for button in run_row])
+        buttons = copy_type_buttons(names[0], settings or {}) if settings else []
+        if buttons:
+            # По кнопке в ряд, если типов больше двух: подписи длинные
+            run_rows = [buttons] if len(buttons) <= 2 else [[b] for b in buttons]
+        else:
+            data = f"backup_copy_run:{names[0]}"
+            if len(data.encode()) > COPY_CALLBACK_LIMIT:
+                data = "backup_copy_run_servers"
+            run_rows = [[InlineKeyboardButton("📤 Скопировать сейчас",
+                                              callback_data=data)]]
+    elif len(names) <= SERVER_PICKER_PAGE_SIZE:
+        # Источников немного: кнопка на каждый ведёт сразу к выбору типа,
+        # отдельный экран «выбери сервер» тут был бы лишним шагом.
+        for name in names:
+            data = f"backup_copy_run:{name}"
+            if len(data.encode()) > COPY_CALLBACK_LIMIT:
+                run_rows = []
+                break
+            run_rows.append([InlineKeyboardButton(f"📤 {name}",
+                                                  callback_data=data)])
+
+    if not run_rows:
+        run_rows = [[InlineKeyboardButton(
+            "📤 Скопировать сейчас",
+            callback_data="backup_copy_run_servers")]]
+    rows[-1:-1] = run_rows
 
     # Рейс, который числится идущим: если он завис или его убили руками,
     # без сброса следующая копия не поедет — бот считает сервер занятым.
