@@ -62,6 +62,17 @@ ERROR_MARKERS = ("Error code:", "No such file or directory",
                  "Access denied", "Permission denied", "Connection failed",
                  "Timeout", "Network error", "Host does not exist")
 
+# Ругань, которая ошибкой не является. Скрипт на всякий случай делает
+# mkdir на каталог назначения; когда он уже есть, сервер отвечает отказом
+# — и WinSCP печатает целую простыню с «Error code: 4». Передаче это не
+# мешает, а база из-за таких строк помечалась бы аварийной каждый раз.
+BENIGN_MARKERS = (
+    "Cannot create a file when that file already exists",
+    "Error creating folder",
+    "Common reasons for the Error code",
+    "Script: mkdir",
+)
+
 DIR_DATE_FORMAT = "%Y-%m-%d"
 
 
@@ -121,9 +132,20 @@ def parse_common_log(text: str) -> dict:
         if not match:
             # Строка без отметки времени — вывод WinSCP. Свои ошибки он
             # печатает именно так, и они относятся к последней базе.
-            if (current and current.get("uploading")
-                    and any(m in line for m in ERROR_MARKERS)):
+            if not (current and current.get("uploading")):
+                continue
+            if any(m in line for m in BENIGN_MARKERS):
+                # Следом за такой строкой WinSCP печатает «Error code: N»
+                # и «Error message from server» про тот же безобидный
+                # отказ — их тоже пропускаем.
+                current["_benign"] = True
+                continue
+            if any(m in line for m in ERROR_MARKERS):
+                if current.get("_benign"):
+                    continue
                 current["errors"].append(line.strip())
+            else:
+                current["_benign"] = False
             continue
 
         stamp, database, btype, message = match.groups()
@@ -325,12 +347,24 @@ WINSCP_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 def winscp_highlights(text: str, limit: int = 20) -> list:
-    """Значимые строки из протокольного лога WinSCP."""
+    """Значимые строки из протокольного лога WinSCP.
+
+    Простыня про «mkdir: каталог уже есть» сюда не идёт: это обычный
+    ответ сервера на профилактический mkdir, и в списке важного он
+    вытеснял бы то, ради чего этот список нужен.
+    """
     kept = []
+    benign = False
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             continue
+        if any(m in line for m in BENIGN_MARKERS):
+            benign = True
+            continue
+        if benign and ("Error code:" in line or "Error message from server" in line):
+            continue
+        benign = False
         if line.startswith("! "):
             kept.append(line[2:].strip())
             continue

@@ -242,3 +242,37 @@ def test_percent_shows_up_in_the_summary():
     text = "\n".join(summary_lines(summary))
 
     assert "28%" in text and "12.4 ГБ" in text
+
+
+# ─── Ругань, которая не ошибка ───────────────────────────────
+
+MKDIR_NOISE = """[05.09.2026 12:26:19,00] [new_pro_akt] [FULL] Режим: UPLOAD
+Script: mkdir "/new_pro_akt/FULL"
+Error creating folder '/new_pro_akt/FULL'.
+Error code: 4
+Error message from server: failure: mkdir Cannot create a file when that file already exists.
+Copying "AKT1C8.bak" to remote directory started.
+"""
+
+
+def test_mkdir_on_existing_folder_is_not_an_error():
+    """Скрипт на всякий случай делает mkdir; каталог уже есть, сервер
+    отвечает отказом с «Error code: 4». Передаче это не мешает — иначе
+    база помечалась бы аварийной на каждом рейсе."""
+    entry = parse_common_log(MKDIR_NOISE)["databases"][0]
+    assert entry["errors"] == []
+    assert entry["status"] == "upload"
+
+
+def test_real_error_after_benign_one_still_counts():
+    text = MKDIR_NOISE + "Connection failed\n"
+    entry = parse_common_log(text)["databases"][0]
+    assert any("Connection failed" in e for e in entry["errors"])
+
+
+def test_mkdir_noise_is_not_a_highlight():
+    """В списке важного простыня про mkdir вытесняла бы то, ради чего
+    этот список нужен."""
+    kept = winscp_highlights(MKDIR_NOISE)
+    assert not any("Error code: 4" in line for line in kept)
+    assert any("Copying" in line for line in kept)
