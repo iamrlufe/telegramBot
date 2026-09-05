@@ -849,19 +849,32 @@ def _winscp_body(path: str, info: dict) -> str:
     return "\n".join(lines)
 
 
-async def _fill_progress(server: dict, summary: dict):
-    """Дописывает процент к базам, которые ещё в пути.
+# Насколько файл на приёмнике может быть короче домашнего, чтобы это ещё
+# считалось тем же файлом. Не ноль: сжатие тут ни при чём (возится .bak
+# как есть), но округления и докачка дают расхождение в байтах, а поднимать
+# тревогу из-за них — значит приучить к ней не относиться.
+SHORTFALL_RATIO = 0.999
 
-    Спрашиваем приёмник: у SFTP нет обратной связи о ходе передачи, и на
-    стороне отправителя процента взять неоткуда. Ходим только за теми,
-    кто реально едет, — обычно это одна база.
+
+async def _fill_progress(server: dict, summary: dict):
+    """Спрашивает приёмник про каждую базу из журнала.
+
+    Двум вещам верить нельзя, и обе выясняются только у приёмника:
+
+    * сколько уже доехало — у SFTP нет обратной связи о ходе передачи, и
+      на стороне отправителя процента взять неоткуда;
+    * что «залито» и «пропущено» — правда. Оборванная заливка по SFTP
+      выглядит успешной, а скрипт, сверяющий размеры средствами cmd,
+      может объявить огрызок в 2.59 ГБ равным домашним 42.22 и
+      пропускать базу каждый рейс. Дома об этом не узнать никак.
     """
     target = target_settings(server)
     if not target:
         return
-    running = [e for e in summary.get("databases") or []
-               if e["status"] == "upload" and e.get("remote") and e.get("bytes")]
-    if not running:
+    wanted = [e for e in summary.get("databases") or []
+              if e.get("remote") and e.get("bytes")
+              and e["status"] in ("upload", "skip", "done")]
+    if not wanted:
         return
 
     receiver = await asyncio.to_thread(find_server_loose, target["server"])
@@ -872,13 +885,24 @@ async def _fill_progress(server: dict, summary: dict):
             f"должно совпадать с тем, что записано в «Приёмник копий»")
         return
 
-    for entry in running:
+    for entry in wanted:
         path = target_path(target["root"], entry["remote"])
         try:
             size = await asyncio.to_thread(remote_file_size, receiver, path)
         except Exception as e:
             summary["target_error"] = str(e)[:120]
             return
+
+        if entry["status"] != "upload":
+            # Скрипт считает базу законченной. Проверяем это по приёмнику:
+            # файла нет вовсе или он короче домашнего — значит не доехал.
+            if size is None:
+                entry["truncated"] = True
+            elif size < entry["bytes"] * SHORTFALL_RATIO:
+                entry["truncated"] = True
+                entry["remote_gb"] = round(size / 1024 ** 3, 2)
+            continue
+
         if size is None:
             continue
         entry["percent"] = progress_percent(entry["bytes"], size)

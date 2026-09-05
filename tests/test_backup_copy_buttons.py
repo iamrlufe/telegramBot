@@ -115,3 +115,75 @@ def test_missing_database_log_explains_a_skipped_database(monkeypatch):
 
     assert "Файла нет" in shown[0]
     assert "пропущена" in shown[0]
+
+
+# ─── Сверка с приёмником: «пропущено» ещё не значит «доехало» ─
+
+def _wire_target(monkeypatch, remote_size):
+    monkeypatch.setattr(backup_bot, "target_settings",
+                        lambda s: {"server": "sftp-01", "root": "E:\\B"})
+    monkeypatch.setattr(backup_bot, "find_server_loose",
+                        lambda n: {"name": n, "host": "h"})
+    monkeypatch.setattr(backup_bot, "remote_file_size",
+                        lambda srv, path: remote_size)
+
+
+def _summary(status="skip"):
+    return {"databases": [{"name": "new_pro_akt", "status": status,
+                           "remote": "/new_pro_akt/FULL/f.bak",
+                           "bytes": 45330792448, "size_gb": 42.22,
+                           "errors": [], "attempts": 0}]}
+
+
+def test_skipped_database_is_checked_on_the_target(monkeypatch):
+    """Обрыв заливки по SFTP выглядит успешным: скрипт видит файл с
+    правильным именем и пропускает базу навсегда. Дома об этом не
+    узнать — только у приёмника."""
+    _wire_target(monkeypatch, 2776498176)
+    summary = _summary()
+
+    asyncio.run(backup_bot._fill_progress({"name": "akt1c8"}, summary))
+
+    assert summary["databases"][0]["truncated"] is True
+    assert summary["databases"][0]["remote_gb"] == 2.59
+
+
+def test_skipped_database_that_really_arrived_is_left_alone(monkeypatch):
+    _wire_target(monkeypatch, 45330792448)
+    summary = _summary()
+
+    asyncio.run(backup_bot._fill_progress({"name": "akt1c8"}, summary))
+
+    assert "truncated" not in summary["databases"][0]
+
+
+def test_uploaded_database_is_checked_too(monkeypatch):
+    """SUCCESS от скрипта — тоже лишь его мнение: он спрашивал WinSCP,
+    а не приёмник."""
+    _wire_target(monkeypatch, 1024)
+    summary = _summary(status="done")
+
+    asyncio.run(backup_bot._fill_progress({"name": "akt1c8"}, summary))
+
+    assert summary["databases"][0]["truncated"] is True
+
+
+def test_file_gone_from_the_target_is_truncated_too(monkeypatch):
+    _wire_target(monkeypatch, None)
+    summary = _summary()
+
+    asyncio.run(backup_bot._fill_progress({"name": "akt1c8"}, summary))
+
+    assert summary["databases"][0]["truncated"] is True
+    assert "remote_gb" not in summary["databases"][0]
+
+
+def test_running_database_still_gets_a_percent(monkeypatch):
+    _wire_target(monkeypatch, 22665396224)
+    summary = _summary(status="upload")
+
+    asyncio.run(backup_bot._fill_progress({"name": "akt1c8"}, summary))
+
+    entry = summary["databases"][0]
+    assert entry["percent"] == 50
+    assert "truncated" not in entry

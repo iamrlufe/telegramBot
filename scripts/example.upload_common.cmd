@@ -120,14 +120,62 @@ set "DB_LOG_DIR=%LOG_DIR%\%DB%"
 if not exist "%DB_LOG_DIR%" mkdir "%DB_LOG_DIR%"
 set "DB_LOG=%DB_LOG_DIR%\%TYPE%.log"
 
-rem Есть ли файл на приёмнике. «No such file or directory / Error code: 2»
-rem в этот момент — нормальный ответ «нет, заливай»; бот такие строки
-rem до «Режим: UPLOAD» ошибками не считает.
+rem ─── Что лежит на приёмнике ─────────────────────────────────
+rem
+rem Проверять ТОЛЬКО существование файла нельзя. Оборванная заливка по
+rem SFTP оставляет на приёмнике файл с правильным именем и неправильным
+rem размером — и выглядит как удачная. Такой огрызок пропускался бы
+rem каждый следующий рейс, то есть навсегда: копии как бы есть, а
+rem восстановить из них нечего.
+rem
+rem «No such file or directory / Error code: 2» в этот момент — нормальный
+rem ответ «нет, заливай»; бот такие строки до «Режим: UPLOAD» ошибками
+rem не считает.
 call :log "[%DB%] [%TYPE%] Проверка remote-файла..."
-"%WINSCP%" /command "open %SESSION%" "stat %REMOTE%" "exit" >> "%DB_LOG%" 2>&1
-if not errorlevel 1 (
-    call :log "[%DB%] [%TYPE%] SKIP: %FILE%"
-    goto :eof
+set "LS_TMP=%TEMP%\winscp_ls_%DB%_%TYPE%.txt"
+"%WINSCP%" /command "open %SESSION%" "ls %REMOTE%" "exit" > "%LS_TMP%" 2>&1
+type "%LS_TMP%" >> "%DB_LOG%"
+
+rem Размер из строки ls. Столбцы СЛЕВА считать нельзя: владельца и группы
+rem может не быть вовсе (у SFTPGo они пустые), и номер столбца уезжает.
+rem Справа порядок постоянный, это формат unix ls:
+rem     … РАЗМЕР Sep  4 15:53:43 2026 имя_файла.bak
+rem то есть размер — шестой токен с конца. Его и берём кольцом из шести
+rem переменных, не заглядывая в начало строки.
+set "RSIZE="
+for /f "usebackq delims=" %%L in (`findstr /c:"%FILE%" "%LS_TMP%" 2^>nul`) do (
+    set "T1=" & set "T2=" & set "T3=" & set "T4=" & set "T5=" & set "T6="
+    for %%T in (%%L) do (
+        set "T6=!T5!" & set "T5=!T4!" & set "T4=!T3!"
+        set "T3=!T2!" & set "T2=!T1!" & set "T1=%%T"
+    )
+    set "RSIZE=!T6!"
+)
+del "%LS_TMP%" 2>nul
+
+rem СРАВНЕНИЕ СТРОКАМИ, не числами. Копия в 45 330 792 448 байт в
+rem арифметику cmd не влезает: и set /a, и IF EQU/GEQ считают 32-битными
+rem знаковыми, 45 ГБ превращаются в отрицательное число, и сравнение
+rem даёт что угодно. Ровно на этом файл в 2.59 ГБ был объявлен равным
+rem домашним 42.22 ГБ и «пропускался» каждый рейс.
+rem
+rem Десятичные записи двух равных чисел совпадают посимвольно, поэтому
+rem строковое сравнение здесь и точнее, и безопаснее. Кавычки обязательны:
+rem пустой RSIZE иначе развалит разбор строки.
+rem
+rem И главное правило: сомневаешься — ЗАЛИВАЙ. Не разобрали размер, не
+rem нашли строку, ответил не тот сервер — все эти случаи ведут в UPLOAD.
+rem Лишняя заливка стоит времени, пропущенная — всей копии.
+if defined RSIZE (
+    call :log "[%DB%] [%TYPE%] Remote размер: !RSIZE! bytes"
+    if "!RSIZE!"=="!SIZE!" (
+        call :log "[%DB%] [%TYPE%] Remote == Local"
+        call :log "[%DB%] [%TYPE%] SKIP: %FILE%"
+        goto :eof
+    )
+    call :log "[%DB%] [%TYPE%] Remote ^!= Local: !RSIZE! против !SIZE! — перезаливаю"
+) else (
+    call :log "[%DB%] [%TYPE%] На приёмнике файла нет"
 )
 
 call :log "[%DB%] [%TYPE%] Режим: UPLOAD"

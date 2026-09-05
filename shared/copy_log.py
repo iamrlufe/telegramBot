@@ -304,6 +304,22 @@ def progress_percent(local_bytes, remote_bytes):
     return min(100, round(remote_bytes / local_bytes * 100))
 
 
+def _shortfall(entry: dict) -> str:
+    """Что на приёмнике лежит не то, что скрипт считает залитым.
+
+    Скрипт говорит «SKIP: файл уже полностью загружен», а на приёмнике
+    огрызок в 2.59 ГБ из 42.22 — обрыв заливки выглядит как удачная.
+    Заполняется снаружи: сам журнал знает только домашний размер.
+    """
+    if not entry.get("truncated"):
+        return ""
+    there = entry.get("remote_gb")
+    if there is None:
+        return "\n    ❗ на приёмнике этого файла НЕТ вовсе"
+    return (f"\n    ❗ на приёмнике {there} ГБ из {entry.get('size_gb')} — "
+            f"файл НЕ доехал")
+
+
 def _took(entry: dict) -> str:
     """Сколько шла заливка этой базы — от первой её строки до SUCCESS."""
     started, done = entry.get("started_at"), entry.get("done_at")
@@ -323,6 +339,7 @@ def summary_lines(summary: dict) -> list:
     unknown = [d for d in databases if d["status"] == "unknown"]
     failed = [d for d in databases
               if d["status"] == "failed" or (d["errors"] and d["status"] != "done")]
+    truncated = [d for d in databases if d.get("truncated")]
 
     head = f"📄 Журнал скрипта · {summary.get('type') or '?'}"
     started, ended = summary.get("started"), summary.get("ended")
@@ -340,6 +357,7 @@ def summary_lines(summary: dict) -> list:
         f"пропущено {len(skipped)}"
         + (f" · в пути {len(running)}" if running else "")
         + (f" · с ошибками {len(failed)}" if failed else "")
+        + (f" · ОГРЫЗКОВ {len(truncated)}" if truncated else "")
     )
     if not summary.get("finished"):
         lines.append("⏳ Журнал не закончен — рейс ещё идёт "
@@ -347,18 +365,28 @@ def summary_lines(summary: dict) -> list:
     lines.append("")
 
     for entry in databases:
-        icon = {"done": "✅", "skip": "⏭", "upload": "⏳",
-                "failed": "❌"}.get(entry["status"], "⏳")
+        # Огрызок важнее собственного мнения скрипта о базе: «пропущено»
+        # с обрезанным файлом на приёмнике — это не пропуск, это беда.
+        icon = "❗" if entry.get("truncated") else {
+            "done": "✅", "skip": "⏭", "upload": "⏳",
+            "failed": "❌"}.get(entry["status"], "⏳")
         size = f", {entry['size_gb']} ГБ" if entry.get("size_gb") else ""
         attempts = (f", попыток {entry['attempts']}"
                     if entry.get("attempts", 0) > 1 else "")
         lines.append(f"{icon} {entry['name']}{size}{attempts}"
-                     f"{_took(entry)}{_progress(entry)}")
+                     f"{_took(entry)}{_progress(entry)}{_shortfall(entry)}")
         if entry.get("file"):
             lines.append(f"    {entry['file']}")
         for error in entry["errors"][:2]:
             lines.append(f"    ⛔ {error[:120]}")
 
+    if truncated:
+        lines.append("")
+        lines.append("❗ Скрипт счёл эти файлы залитыми, а на приёмнике "
+                     "лежит огрызок. Сам он это не исправит: пока обрезок "
+                     "лежит на месте, каждый следующий рейс будет снова "
+                     "«пропускать» базу. Удалите файл на приёмнике — "
+                     "следующий рейс увезёт копию заново.")
     if running:
         lines.append("")
         lines.append("⏳ — заливка ещё идёт: скрипт не сказал SUCCESS")

@@ -303,3 +303,42 @@ def test_mkdir_noise_is_not_a_highlight():
     kept = winscp_highlights(MKDIR_NOISE)
     assert not any("Error code: 4" in line for line in kept)
     assert any("Copying" in line for line in kept)
+
+
+# ─── Огрызок на приёмнике ────────────────────────────────────
+
+def _skipped(**over):
+    entry = {"name": "new_pro_akt", "status": "skip", "file": "f.bak",
+             "size_gb": 42.22, "attempts": 0, "errors": [], "bytes": 45330792448}
+    entry.update(over)
+    return entry
+
+
+def test_truncated_file_shouts_over_the_scripts_verdict():
+    """Скрипт сказал «SKIP: файл уже полностью загружен», а на приёмнике
+    2.59 ГБ из 42.22. Верить надо приёмнику."""
+    summary = {"type": "FULL", "finished": True,
+               "databases": [_skipped(truncated=True, remote_gb=2.59)]}
+    text = "\n".join(summary_lines(summary))
+
+    assert "❗ new_pro_akt" in text
+    assert "2.59 ГБ из 42.22" in text
+    assert "ОГРЫЗКОВ 1" in text
+    assert "Удалите файл на приёмнике" in text
+
+
+def test_missing_file_on_target_is_named_as_such():
+    summary = {"type": "FULL", "finished": True,
+               "databases": [_skipped(truncated=True)]}
+    text = "\n".join(summary_lines(summary))
+
+    assert "НЕТ вовсе" in text
+
+
+def test_honest_skip_stays_a_skip():
+    """Файл действительно доехал — знак прежний, паники нет."""
+    summary = {"type": "FULL", "finished": True, "databases": [_skipped()]}
+    text = "\n".join(summary_lines(summary))
+
+    assert "⏭ new_pro_akt" in text
+    assert "ОГРЫЗК" not in text
