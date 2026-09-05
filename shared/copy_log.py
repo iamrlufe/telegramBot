@@ -236,6 +236,48 @@ def _size_gb(message: str):
     return round(int(digits.group(1)) / 1024 ** 3, 2)
 
 
+# Шкала рисуется символами блока: ▰ прошло, ▱ осталось. Десять делений —
+# по одному на 10%, больше в строку Telegram не втиснуть без переносов.
+BAR_WIDTH = 10
+BAR_DONE = "▰"
+BAR_LEFT = "▱"
+
+
+def progress_bar(percent, width: int = BAR_WIDTH) -> str:
+    """Шкала готовности: «▰▰▰▱▱▱▱▱▱▱»."""
+    if percent is None:
+        return ""
+    filled = max(0, min(width, round(width * percent / 100)))
+    return BAR_DONE * filled + BAR_LEFT * (width - filled)
+
+
+def eta_minutes(done_bytes, total_bytes, elapsed_minutes):
+    """Сколько ещё ехать, по средней скорости с начала заливки.
+
+    Средняя, а не мгновенная: мгновенную по двум замерам не измерить, а
+    у большого файла с докачкой она всё равно скачет. Поэтому в тексте
+    стоит «≈» — это оценка, а не обещание.
+    """
+    if not done_bytes or not total_bytes or not elapsed_minutes:
+        return None
+    if done_bytes >= total_bytes:
+        return 0
+    speed = done_bytes / elapsed_minutes
+    if speed <= 0:
+        return None
+    return round((total_bytes - done_bytes) / speed)
+
+
+def human_minutes(minutes) -> str:
+    """«2 ч 20 мин» вместо «140 мин»: для длинных копий так понятнее."""
+    if minutes is None:
+        return ""
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, rest = divmod(int(minutes), 60)
+    return f"{hours} ч {rest} мин" if rest else f"{hours} ч"
+
+
 def _progress(entry: dict) -> str:
     """Сколько уже доехало. Заполняется снаружи (progress_percent):
     сам журнал процента не знает, его знает только приёмник."""
@@ -244,7 +286,9 @@ def _progress(entry: dict) -> str:
         return ""
     done_gb = entry.get("remote_gb")
     where = f", {done_gb} ГБ" if done_gb is not None else ""
-    return f" — {percent}%{where}"
+    eta = entry.get("eta_minutes")
+    left = (f", ещё ≈{human_minutes(eta)}" if eta else "")
+    return (f"\n    {progress_bar(percent)} {percent}%{where}{left}")
 
 
 def progress_percent(local_bytes, remote_bytes):

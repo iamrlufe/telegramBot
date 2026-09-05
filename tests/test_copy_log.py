@@ -8,6 +8,9 @@ from datetime import datetime
 
 from copy_log import (
     common_log,
+    eta_minutes,
+    human_minutes,
+    progress_bar,
     progress_percent,
     winscp_highlights,
     winscp_is_transferring,
@@ -234,6 +237,29 @@ def test_percent_needs_both_sizes():
     assert progress_percent(0, 10) is None
 
 
+def test_progress_bar_is_ten_wide():
+    assert progress_bar(0) == "▱" * 10
+    assert progress_bar(100) == "▰" * 10
+    assert progress_bar(32) == "▰▰▰▱▱▱▱▱▱▱"
+    assert progress_bar(None) == ""
+
+
+def test_eta_by_average_speed():
+    """Мгновенную скорость по двум замерам не измерить, да и у большого
+    файла с докачкой она скачет — считаем среднюю с начала."""
+    # 10 ГБ за 20 минут → осталось 30 ГБ → ещё 60 минут
+    assert eta_minutes(10, 40, 20) == 60
+    assert eta_minutes(40, 40, 20) == 0
+    assert eta_minutes(0, 40, 20) is None
+    assert eta_minutes(10, 40, 0) is None
+
+
+def test_long_eta_is_human():
+    assert human_minutes(45) == "45 мин"
+    assert human_minutes(140) == "2 ч 20 мин"
+    assert human_minutes(120) == "2 ч"
+
+
 def test_percent_shows_up_in_the_summary():
     summary = parse_common_log(SAMPLE.split("[05.09.2026 11:52:03,10]")[0])
     entry = summary["databases"][0]
@@ -242,6 +268,7 @@ def test_percent_shows_up_in_the_summary():
     text = "\n".join(summary_lines(summary))
 
     assert "28%" in text and "12.4 ГБ" in text
+    assert "▰" in text and "▱" in text
 
 
 # ─── Ругань, которая не ошибка ───────────────────────────────

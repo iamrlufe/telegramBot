@@ -50,6 +50,7 @@ from copy_log import (
     common_log,
     database_log,
     log_dir,
+    eta_minutes,
     parse_common_log,
     progress_percent,
     summary_lines,
@@ -837,6 +838,12 @@ async def _fill_progress(server: dict, summary: dict):
             continue
         entry["percent"] = progress_percent(entry["bytes"], size)
         entry["remote_gb"] = round(size / 1024 ** 3, 2)
+        # Оценка остатка по средней скорости с начала заливки этой базы.
+        started = entry.get("started_at")
+        if started:
+            elapsed = (datetime.now(ALMATY).replace(tzinfo=None)
+                       - started).total_seconds() / 60
+            entry["eta_minutes"] = eta_minutes(size, entry["bytes"], elapsed)
 
 
 async def show_copy_log_db(query, context, server_name: str, btype: str,
