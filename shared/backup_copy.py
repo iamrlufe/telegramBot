@@ -801,6 +801,61 @@ def read_remote_log_info(server: dict, path: str, tail_bytes: int = None,
             "size": size}
 
 
+def check_run(server: dict, run: dict) -> dict:
+    """Спросить сервер, чем закончился рейс: {state, code, tail}."""
+    raw = run_ps(server["host"], check_run_ps(run),
+                 server.get("username"), server.get("password"))
+    return run_outcome(ps_json(raw) or {}, run)
+
+
+def finish_run(entry: dict, outcome: dict, now: datetime = None) -> dict:
+    """Перевести закончившийся рейс из `run` в `last_run`.
+
+    Общая точка для монитора и бота: закрывать рейс двумя разными
+    способами нельзя — от этого зависит отметка «эту копию уже увезли»,
+    и разойдись они, копия поехала бы второй раз или не поехала вовсе.
+    """
+    now = now or now_local()
+    run = entry.get("run") or {}
+    started = parse_finished(run.get("started")) or now
+    minutes = round((now - started).total_seconds() / 60)
+    entry["last_run"] = dict(run, ended=marker(now), minutes=minutes,
+                             state=outcome["state"], code=outcome["code"])
+    # Отмечаем отправленным только удачный рейс: после неудачного копия
+    # осталась дома, и следующий цикл обязан попробовать снова.
+    if outcome["state"] == "ok" and run.get("source_finished"):
+        mark_sent(entry, run.get("type"), run["source_finished"])
+    entry["run"] = None
+    return entry
+
+
+def refresh_run(server: dict) -> str:
+    """Догнать действительность по одному серверу перед показом карточки.
+
+    Зачем. За идущим рейсом следит монитор, и до его следующего цикла
+    карточка показывает «идёт» по памяти. Рейс, где все базы уже лежат на
+    приёмнике, заканчивается за полминуты — и всё это время бот врёт про
+    копирование, которого давно нет.
+
+    Закрываем здесь ТОЛЬКО удачный рейс. Неудачный — дело монитора: он
+    шлёт по нему тревогу, и закрой его бот молча, тревога не ушла бы
+    никому. Возвращаем состояние рейса ('' — рейс не числился идущим).
+    """
+    state = load_state()
+    entry = state.get(server["name"]) or {}
+    if not entry.get("run"):
+        return ""
+
+    outcome = check_run(server, entry["run"])
+    if outcome["state"] != "ok":
+        return outcome["state"]
+
+    finish_run(entry, outcome)
+    state[server["name"]] = entry
+    save_state(state)
+    return "ok"
+
+
 def clear_run(server_name: str) -> dict:
     """Забыть идущий рейс. Процесс на сервере при этом НЕ убивается —
     бот его не рождал управляемым и убивать чужую работу не должен.

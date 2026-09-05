@@ -18,12 +18,12 @@ from datetime import datetime
 
 from settings import SERVERS_FILE
 from server_check import server_type
-from winrm_client import run_ps, ps_json
 from mssql_log import read_backup_history, read_running_backups
 from backup_copy import (
     TRANSFER_STATE_FILE,
-    check_run_ps,
+    check_run,
     copy_settings,
+    finish_run,
     launch_copy,
     load_servers,
     load_state,
@@ -32,7 +32,6 @@ from backup_copy import (
     pick_ready_backups,
     next_to_send,
     now_local as _now,
-    run_outcome,
     run_verdict,
     save_state,
     script_for,
@@ -49,13 +48,6 @@ HISTORY_LIMIT = 20
 
 
 # ─── Шаги цикла ──────────────────────────────────────────────
-
-def _check_run(server: dict, run: dict) -> dict:
-    """Чем закончился рейс: {state, code, tail}. См. run_outcome."""
-    raw = run_ps(server["host"], check_run_ps(run),
-                 server.get("username"), server.get("password"))
-    return run_outcome(ps_json(raw) or {}, run)
-
 
 def _alert(name: str, key_level: str, text: str, ack_key: str):
     """Тревога о копировании с обычной защитой от повторов."""
@@ -90,7 +82,7 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
     now = _now()
 
     try:
-        outcome = _check_run(server, run)
+        outcome = check_run(server, run)
     except Exception as e:
         # Сервер не ответил: сам по себе это не авария копирования —
         # процесс может идти. Ждём следующего цикла, но не вечно: таймаут
@@ -114,24 +106,18 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
             )
         return False
 
-    started = datetime.strptime(run["started"], "%Y-%m-%d %H:%M:%S")
-    minutes = round((now - started).total_seconds() / 60)
-    entry["last_run"] = dict(run, ended=_marker(now), minutes=minutes,
-                             state=outcome["state"], code=outcome["code"])
+    # Отметку «увезли» и перевод рейса в last_run делает finish_run: та же
+    # функция закрывает рейс, когда его застаёт законченным бот.
+    finish_run(entry, outcome, now)
+    minutes = entry["last_run"]["minutes"]
 
     if outcome["state"] == "ok":
         # Скрипт отработал без ошибки. Доехал ли файл целиком — вопрос уже
         # к приёмнику: у SFTP оборванная загрузка выглядит успешной, это
         # ловит обычная проверка каталога.
-        if run.get("source_finished"):
-            # Отметка своя на каждый тип: увезли разностную — полная
-            # остаётся в очереди и поедет следующим циклом.
-            mark_sent(entry, run.get("type"), run["source_finished"])
         print(f"[copy] {name}: копирование закончилось за {minutes} мин",
               flush=True)
     else:
-        # Неудачный рейс НЕ отмечаем отправленным: копия осталась дома,
-        # и следующий цикл обязан попробовать снова.
         reason = (f"скрипт вернул код {outcome['code']}"
                   if outcome["state"] == "failed" else
                   "процесс исчез, не дописав код возврата "
@@ -148,7 +134,6 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
         )
         print(f"[copy] {name}: рейс не удался — {reason}", flush=True)
 
-    entry["run"] = None
     state[state_key] = entry
     return True
 

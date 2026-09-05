@@ -40,6 +40,7 @@ from backup_copy import (
     find_server_loose,
     load_state as load_copy_state,
     read_remote_log_info,
+    refresh_run,
     remote_file_size,
     running_copies,
     start_copy_now,
@@ -588,6 +589,46 @@ def copy_type_buttons(server_name: str, settings: dict) -> list:
     return buttons
 
 
+async def _refresh_running(names: list, state: dict):
+    """Проверить на сервере рейсы, которые числятся идущими.
+
+    За рейсом следит монитор, и до его следующего цикла карточка
+    показывала бы «идёт» по памяти. Рейс, где все базы уже лежат на
+    приёмнике, заканчивается за полминуты — и всё это время бот врал бы
+    про копирование, которого давно нет. Ходов на сервер столько, сколько
+    рейсов числится идущими, то есть обычно ни одного.
+
+    Возвращает свежее состояние и заметки о том, чего не сходится.
+    """
+    stale = [n for n in names if (state.get(n) or {}).get("run")]
+    if not stale:
+        return state, []
+
+    notes = []
+    touched = False
+    for name in stale:
+        server = await asyncio.to_thread(find_server, name)
+        if not server:
+            continue
+        try:
+            outcome = await asyncio.to_thread(refresh_run, server)
+        except Exception as e:
+            notes.append(f"⚠️ {name}: не спросить сервер о рейсе — "
+                         f"{str(e).splitlines()[0][:120]}")
+            continue
+        if outcome == "ok":
+            touched = True
+        elif outcome in ("failed", "lost"):
+            # Закрывать неудачный рейс бот не имеет права: тревогу по нему
+            # шлёт монитор, и молчаливое закрытие оставило бы всех без неё.
+            notes.append(f"⚠️ {name}: рейс уже закончился неудачно — "
+                         f"монитор разберёт его в ближайшем цикле и "
+                         f"пришлёт подробности.")
+    if touched:
+        state = await asyncio.to_thread(load_copy_state)
+    return state, notes
+
+
 async def show_copy_status(query, context, page: int = 0):
     names = await asyncio.to_thread(copy_servers)
     if not names:
@@ -604,12 +645,15 @@ async def show_copy_status(query, context, page: int = 0):
         return
 
     state = await asyncio.to_thread(load_copy_state)
+    state, notes = await _refresh_running(names, state)
     blocks = []
     for name in names:
         server = await asyncio.to_thread(find_server, name)
         if not server:
             continue
         blocks.append("\n".join(_copy_server_lines(server, state.get(name))))
+    if notes:
+        blocks.append("\n".join(notes))
 
     text, keyboard = paginate_text_blocks(
         f"📤 КОПИРОВАНИЕ\n\nСерверов-источников: {len(blocks)}\n\n{'━'*20}\n\n",
@@ -870,7 +914,15 @@ async def show_copy_log_db(query, context, server_name: str, btype: str,
     if error:
         body = f"❌ Не прочитать: {error}"
     elif not info["size"]:
-        body = f"Файла нет:\n{path}"
+        # Самый частый случай — база помечена ⏭ в сводке: файл уже лежал
+        # на приёмнике, WinSCP не запускали, и писать ему было нечего.
+        body = (f"Файла нет:\n{path}\n\n"
+                f"Этот журнал ведёт WinSCP, и появляется он только когда "
+                f"базу реально заливали. Если в сводке рейса база помечена "
+                f"⏭ (пропущена — копия уже на приёмнике) или её файл ещё "
+                f"не нашли, заливки не было, и подробностям взяться "
+                f"неоткуда. Ход рейса целиком виден в общем журнале — "
+                f"кнопка «◀️ Назад».")
     else:
         body = _winscp_body(path, info)
 

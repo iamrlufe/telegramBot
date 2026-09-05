@@ -27,3 +27,91 @@ def test_three_types_give_three_buttons():
                                                        "I": "d.cmd",
                                                        "L": "l.cmd"}})
     assert len(buttons) == 3
+
+
+# ─── Карточка копирования и подробности по базе ──────────────
+
+import asyncio
+
+import backup_bot
+
+
+def _capture(monkeypatch):
+    """Подменяет отправку сообщения: возвращает список показанных текстов."""
+    shown = []
+
+    async def fake_edit(query, text, **kw):
+        shown.append(text)
+
+    monkeypatch.setattr(backup_bot, "safe_edit_message", fake_edit)
+    return shown
+
+
+def test_card_closes_a_run_that_already_ended(monkeypatch):
+    """Рейс кончился, а состояние об этом ещё не знает — спрашиваем сервер,
+    иначе карточка показывает «идёт» до следующего цикла монитора."""
+    monkeypatch.setattr(backup_bot, "find_server",
+                        lambda n: {"name": n, "host": "h"})
+    monkeypatch.setattr(backup_bot, "refresh_run", lambda s: "ok")
+    monkeypatch.setattr(backup_bot, "load_copy_state", lambda: {"akt1c8": {}})
+
+    state, notes = asyncio.run(backup_bot._refresh_running(
+        ["akt1c8"], {"akt1c8": {"run": {"pid": 8276}}}))
+
+    assert state["akt1c8"].get("run") is None
+    assert notes == []
+
+
+def test_card_warns_about_a_failed_run(monkeypatch):
+    """Закрывать неудачный рейс боту нельзя — тревогу по нему шлёт
+    монитор. Но молчать о нём в карточке тоже нельзя."""
+    monkeypatch.setattr(backup_bot, "find_server",
+                        lambda n: {"name": n, "host": "h"})
+    monkeypatch.setattr(backup_bot, "refresh_run", lambda s: "failed")
+
+    state, notes = asyncio.run(backup_bot._refresh_running(
+        ["akt1c8"], {"akt1c8": {"run": {"pid": 8276}}}))
+
+    assert state["akt1c8"]["run"]["pid"] == 8276
+    assert notes and "монитор" in notes[0]
+
+
+def test_card_survives_an_unreachable_server(monkeypatch):
+    def boom(server):
+        raise RuntimeError("WinRM: таймаут")
+
+    monkeypatch.setattr(backup_bot, "find_server",
+                        lambda n: {"name": n, "host": "h"})
+    monkeypatch.setattr(backup_bot, "refresh_run", boom)
+
+    _, notes = asyncio.run(backup_bot._refresh_running(
+        ["akt1c8"], {"akt1c8": {"run": {"pid": 8276}}}))
+
+    assert notes and "таймаут" in notes[0]
+
+
+def test_card_does_not_touch_the_server_without_a_run(monkeypatch):
+    """Ходов на сервер столько, сколько рейсов числится идущими."""
+    def boom(server):
+        raise AssertionError("сервер спрашивать не за чем")
+
+    monkeypatch.setattr(backup_bot, "refresh_run", boom)
+    state, notes = asyncio.run(backup_bot._refresh_running(["akt1c8"], {}))
+    assert (state, notes) == ({}, [])
+
+
+def test_missing_database_log_explains_a_skipped_database(monkeypatch):
+    """«Файла нет» без объяснения читается как поломка. А это обычный
+    случай: базу пропустили, WinSCP не запускали, писать было нечего."""
+    shown = _capture(monkeypatch)
+    monkeypatch.setattr(backup_bot, "find_server",
+                        lambda n: {"name": n, "host": "h",
+                                   "copy_script": "C:\\roman\\upload_full.cmd"})
+    monkeypatch.setattr(backup_bot, "read_remote_log_info",
+                        lambda *a, **kw: {"text": "", "size": 0})
+
+    asyncio.run(backup_bot.show_copy_log_db(object(), None, "akt1c8", "D",
+                                            "new_pro_akt"))
+
+    assert "Файла нет" in shown[0]
+    assert "пропущена" in shown[0]

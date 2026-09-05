@@ -615,3 +615,62 @@ def test_launch_refuses_when_the_check_fails(monkeypatch):
 
     with pytest.raises(RuntimeError, match="не проверить"):
         backup_copy.launch_copy({"name": "s", "host": "h"}, settings)
+
+
+# ─── Закрытие закончившегося рейса ───────────────────────────
+
+def _run(**over):
+    run = {"pid": 8276, "started": "2026-09-05 18:55:53", "type": "D",
+           "db": "new_pro_akt", "source_finished": "2026-09-05 01:30:00",
+           "script": "C:\\roman\\2026\\upload_full.cmd",
+           "ident": "20260905-185553-D", "log": "C:\\l", "done": "C:\\d"}
+    run.update(over)
+    return run
+
+
+def test_finish_run_marks_the_copy_as_sent():
+    entry = {"run": _run()}
+    backup_copy.finish_run(entry, {"state": "ok", "code": 0},
+                           datetime(2026, 9, 5, 18, 56, 53))
+
+    assert entry["run"] is None
+    assert entry["last_run"]["minutes"] == 1
+    assert entry["last_run"]["state"] == "ok"
+    assert sent_marker(entry, "D") == "2026-09-05 01:30:00"
+
+
+def test_finish_run_keeps_a_failed_copy_in_the_queue():
+    """Копия осталась дома — следующий цикл обязан попробовать снова."""
+    entry = {"run": _run()}
+    backup_copy.finish_run(entry, {"state": "failed", "code": 1},
+                           datetime(2026, 9, 5, 19, 0, 0))
+
+    assert entry["run"] is None
+    assert sent_marker(entry, "D") is None
+
+
+def test_refresh_closes_a_run_that_already_ended(monkeypatch, tmp_path):
+    """Рейс, где все базы уже на приёмнике, кончается за полминуты, а
+    следит за ним монитор — до его цикла карточка врала бы «идёт»."""
+    _wire_state(monkeypatch, tmp_path, {"sql-region": {"run": _run()}})
+    monkeypatch.setattr(backup_copy, "check_run",
+                        lambda s, r: {"state": "ok", "code": 0, "tail": ""})
+
+    assert backup_copy.refresh_run(_server()) == "ok"
+    assert backup_copy.load_state()["sql-region"]["run"] is None
+
+
+def test_refresh_leaves_a_failed_run_to_the_monitor(monkeypatch, tmp_path):
+    """Тревогу по неудачному рейсу шлёт монитор: закрой его бот молча —
+    она не ушла бы никому."""
+    _wire_state(monkeypatch, tmp_path, {"sql-region": {"run": _run()}})
+    monkeypatch.setattr(backup_copy, "check_run",
+                        lambda s, r: {"state": "failed", "code": 1, "tail": ""})
+
+    assert backup_copy.refresh_run(_server()) == "failed"
+    assert backup_copy.load_state()["sql-region"]["run"]["pid"] == 8276
+
+
+def test_refresh_says_nothing_when_no_run(monkeypatch, tmp_path):
+    _wire_state(monkeypatch, tmp_path, {"sql-region": {}})
+    assert backup_copy.refresh_run(_server()) == ""
