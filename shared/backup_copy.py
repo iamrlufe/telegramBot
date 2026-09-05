@@ -195,6 +195,30 @@ def mark_sent(state: dict, btype: str, marker_text: str) -> dict:
     return state
 
 
+def queued_behind_run(ready: dict, state: dict, now: datetime) -> bool:
+    """Копия появилась, пока канал был занят предыдущим рейсом?
+
+    Окно свежести (COPY_FRESH_MINUTES) стоит против вчерашней копии в
+    msdb после перезапуска монитора. Но под него попадала и копия,
+    которую бот отложил сам: полная едет часами, разностная, готовая в
+    начале рейса, к его концу «стареет» и не уезжает вовсе — тихо, без
+    тревоги. Она не лежала со вчера, она стояла в очереди.
+
+    Отсюда два условия, и оба обязательны: копия закончилась ВНУТРИ
+    прошлого рейса и сам рейс кончился недавно. Второе и оставляет
+    защиту от простоя: молчал монитор сутки — прошлый рейс давно
+    закрыт, и старую копию по-прежнему никто не повезёт.
+    """
+    last = (state or {}).get("last_run") or {}
+    started = parse_finished(last.get("started"))
+    ended = parse_finished(last.get("ended"))
+    if not started or not ended:
+        return False
+    if not (started <= ready["finished"] <= ended):
+        return False
+    return (now - ended).total_seconds() / 60 <= COPY_FRESH_MINUTES
+
+
 def should_start(ready: dict, state: dict, settings: dict, now: datetime):
     """Пора ли запускать копирование. Возвращает (да/нет, причина отказа).
 
@@ -220,7 +244,7 @@ def should_start(ready: dict, state: dict, settings: dict, now: datetime):
     waited = (now - ready["finished"]).total_seconds() / 60
     if waited < settings["delay_minutes"]:
         return False, f"копия закончена {round(waited)} мин назад, ждём дозаписи"
-    if waited > COPY_FRESH_MINUTES:
+    if waited > COPY_FRESH_MINUTES and not queued_behind_run(ready, state, now):
         # Первый цикл после перезапуска монитора: состояние пустое, а в msdb
         # лежит вчерашняя копия. Её везти незачем — она давно уехала.
         return False, "копия слишком старая, копирование не нужно"

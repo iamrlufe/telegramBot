@@ -204,6 +204,53 @@ def test_stale_backup_is_not_shipped():
     assert not ok and "старая" in reason
 
 
+def test_copy_that_waited_out_a_trip_is_still_shipped():
+    """Полная едет часами, разностная готова в начале рейса — к его концу
+    она старше окна свежести. Раньше она не уезжала вовсе и молча: окно
+    стоит против вчерашней копии, а эта стояла в очереди."""
+    state = {"last_run": {"started": "2026-09-04 22:00:00",
+                          "ended": "2026-09-05 03:50:00", "state": "ok"}}
+    ok, reason = should_start(_ready(minutes_ago=330), state,
+                              copy_settings(_server()), NOW)
+    assert ok and reason is None
+
+
+def test_downtime_does_not_revive_a_stale_copy():
+    """Послабление не должно съесть саму защиту: молчал монитор сутки —
+    прошлый рейс давно закрыт, и старую копию по-прежнему не везут."""
+    state = {"last_run": {"started": "2026-09-04 03:00:00",
+                          "ended": "2026-09-04 05:00:00", "state": "ok"}}
+    ready = {"db": "base", "type": "I",
+             "finished": datetime(2026, 9, 4, 4, 0, 0)}
+    ok, reason = should_start(ready, state, copy_settings(_server()), NOW)
+    assert not ok and "старая" in reason
+
+
+def test_copy_made_outside_a_trip_gets_no_exemption():
+    """Послабление — только тем, кто ждал рейса. Копия, законченная до
+    его начала, просто старая."""
+    state = {"last_run": {"started": "2026-09-05 03:00:00",
+                          "ended": "2026-09-05 03:50:00", "state": "ok"}}
+    ok, reason = should_start(_ready(minutes_ago=600), state,
+                              copy_settings(_server()), NOW)
+    assert not ok and "старая" in reason
+
+
+def test_queued_copy_leaves_as_soon_as_the_channel_is_free():
+    """Тот же случай целиком: пока рейс идёт — «ещё идёт», закрылся —
+    отложенная разностная уезжает следующим циклом."""
+    s = copy_settings(_server(copy_script=dict(FULL_DIFF)))
+    rows = [{"db": "base", "btype": "I", "finished": "2026-09-04 22:30:00"}]
+
+    busy = {"run": {"pid": 1, "started": "2026-09-04 22:00:00"}}
+    assert next_to_send(rows, busy, s, NOW)[0] is None
+
+    free = {"last_run": {"started": "2026-09-04 22:00:00",
+                         "ended": "2026-09-05 03:50:00", "state": "ok"}}
+    ready, _ = next_to_send(rows, free, s, NOW)
+    assert ready["type"] == "I"
+
+
 def test_auto_off_blocks_start():
     ok, _ = should_start(_ready(), {}, copy_settings(_server(copy_after_backup=False)), NOW)
     assert not ok
