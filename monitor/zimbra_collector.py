@@ -83,6 +83,12 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
             return f" {label[:2]}"
         return ""
 
+    def countries(addresses):
+        """Код страны по каждому адресу — из него автоблокировка решает,
+        свой это адрес или чужой. Неизвестная страна не значит «чужой»:
+        такой адрес остаётся человеку, кнопкой под алертом."""
+        return {ip: codes[ip] for ip in addresses or [] if codes.get(ip)}
+
     def attackers(addresses):
         """Адреса, которые имеет смысл предлагать к блокировке.
 
@@ -126,6 +132,10 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
             "hint": f"{item['count']} неудачных входов",
             "key": f"zm_brute:{server_name}:{item['account']}:{item['ip']}",
             "ips": attackers([item["ip"]]),
+            # Метка для автоблокировки: перебор пароля — единственная
+            # находка, по которой боту разрешено отрезать адрес самому.
+            "attack": "brute",
+            "ip_country": countries([item["ip"]]),
         }))
 
     # Распылённый перебор: порог по одному адресу его не берёт, а это самая
@@ -149,6 +159,8 @@ def findings_for(server_name: str, mail: dict, audit: dict, geo: dict) -> list:
             # Ключ без чисел: иначе каждая новая попытка — новая находка.
             "key": f"zm_spray:{server_name}:{item['account']}",
             "ips": attackers(item["addresses"]),
+            "attack": "brute",
+            "ip_country": countries(item["addresses"]),
         }))
 
     for item in outside_senders(mail.get("origins"), mail.get("local_domains")):

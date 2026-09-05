@@ -11,6 +11,7 @@ from alerts_ack import (
     ACK_HOURS, is_acked, with_ack_button, purge_acks_for_server,
 )
 from winrm_errors import error_to_status
+from autoban import report_lines, run_autoban
 from settings import ALMATY, int_env
 
 
@@ -1306,12 +1307,24 @@ def _findings_alert(findings: list, state_file: str, title: str,
         lines.append("")
         lines.append(hint)
 
+        # Автоблокировка: только по свежим находкам о переборе пароля и
+        # только если она включена у сервера. Блокируем до отправки, чтобы
+        # в сообщении был готовый список — человек сразу видит, что уже
+        # отрезано, а что осталось на его усмотрение.
+        try:
+            banned = run_autoban(server_name, fresh)
+        except Exception as e:
+            banned = {"error": str(e)[:200]}
+            print(f"[autoban] {server_name}: {e}", flush=True)
+        lines += report_lines(banned)
+
         # Адреса берутся только из показанных находок: кнопка под адресом,
         # которого в сообщении не видно, непонятна.
+        already = {b["ip"] for b in banned.get("blocked") or []}
         suspects = []
         for item in fresh[:IIS_IN_MESSAGE]:
             for address in item.get("ips") or []:
-                if address not in suspects:
+                if address not in suspects and address not in already:
                     suspects.append(address)
 
         send_or_defer("\n".join(lines),

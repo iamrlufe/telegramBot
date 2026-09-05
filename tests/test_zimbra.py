@@ -261,6 +261,35 @@ def test_findings_cover_three_reasons():
     assert "zm_outside:" in keys
 
 
+def test_bruteforce_findings_carry_countries_for_autoban():
+    """Автоблокировка решает по стране адреса, а страна известна только
+    здесь: без неё находка молча перестала бы работать как улика."""
+    from zimbra_collector import findings_for
+
+    mail = {"origins": [], "local_domains": ["example.local"], "senders": [],
+            "queue": 3}
+    audit = {"events": EVENTS}
+    geo = {"203.0.113.5": "🇳🇱 Amsterdam", "198.51.100.7": "🇹🇷 Istanbul"}
+    brute = [item for _s, item in findings_for("mail-01", mail, audit, geo)
+             if item["key"].startswith("zm_brute:")]
+
+    assert brute, "перебор пароля должен находиться"
+    for item in brute:
+        assert item["attack"] == "brute"
+        for ip in item["ips"]:
+            assert item["ip_country"].get(ip) in ("NL", "TR")
+
+
+def test_only_bruteforce_is_marked_for_autoban():
+    """Всплеск отправки и очередь баном не лечатся — метки на них быть
+    не должно, иначе бот отрежет адрес ни за что."""
+    from zimbra_collector import findings_for
+
+    mail = {"queue": 5000, "origins": [], "local_domains": [], "senders": []}
+    found = findings_for("mail-01", mail, {}, {})
+    assert all(item.get("attack") != "brute" for _s, item in found)
+
+
 def test_queue_finding_key_has_no_number():
     """Иначе каждое изменение очереди — новая находка, и алерт повторяется
     при каждом проходе."""

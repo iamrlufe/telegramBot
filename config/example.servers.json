@@ -112,7 +112,7 @@
     "legacy_tls": false
   },
   {
-    "_comment": "Почтовый сервер Zimbra/Postfix. zimbra=true открывает кнопку 📬 Почта (Zimbra): отправители, входы, очередь, отбитые. Раздел появится и без флага, если среди services есть zimbra или postfix. Учётке нужен доступ на чтение /var/log/mail.log (группа adm) и /opt/zimbra/log/audit.log (группа zimbra) либо sudo без пароля на cat и zcat. mail_log и audit_log задаются, только если пути нестандартные.",
+    "_comment": "Почтовый сервер Zimbra/Postfix. zimbra=true открывает кнопку 📬 Почта (Zimbra): отправители, входы, очередь, отбитые. Раздел появится и без флага, если среди services есть zimbra или postfix. Учётке нужен доступ на чтение /var/log/mail.log (группа adm) и /opt/zimbra/log/audit.log (группа zimbra) либо sudo без пароля на cat и zcat. mail_log и audit_log задаются, только если пути нестандартные. firewall + autoban_brute: бот сам банит адреса, которые перебирают пароли к ящикам, — только внешние и только с известной чужой страной.",
     "name": "mail-01.example.local",
     "host": "192.0.2.40",
     "type": "linux",
@@ -123,6 +123,8 @@
       "zimbra",
       "ssh"
     ],
-    "zimbra": true
+    "zimbra": true,
+    "firewall": true,
+    "autoban_brute": true
   }
 ]
