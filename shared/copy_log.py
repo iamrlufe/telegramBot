@@ -44,7 +44,11 @@ MARKERS = {
     "skip": "SKIP",
     "upload": "Режим: UPLOAD",
     "attempt": "Попытка",
-    "done": "END upload_common",
+    "success": "SUCCESS",
+    "uploaded": "Файл успешно загружен",
+    "exit": "WinSCP exit code=",
+    "failed": "FAILED",
+    "end": "END upload_common",
 }
 
 # Признаки беды в строках WinSCP: у него свой формат, отметки времени нет.
@@ -129,7 +133,7 @@ def parse_common_log(text: str) -> dict:
 
         if message.startswith("TYPE="):
             summary["type"] = message.split("=", 1)[1].strip()
-        if MARKERS["done"] in message:
+        if MARKERS["end"] in message:
             summary["finished"] = True
 
         if not database:
@@ -141,17 +145,39 @@ def parse_common_log(text: str) -> dict:
         if current is None:
             current = {"name": database, "status": "unknown", "file": None,
                        "size_gb": None, "attempts": 0, "errors": [],
-                       "uploading": False}
+                       "uploading": False, "started_at": None,
+                       "ended_at": None, "done_at": None, "exit_code": None}
             by_name[database] = current
             summary["databases"].append(current)
 
-        _apply_message(current, message)
+        _apply_message(current, message, when)
 
     return summary
 
 
-def _apply_message(entry: dict, message: str):
-    if message.startswith(MARKERS["found"]):
+def _apply_message(entry: dict, message: str, when=None):
+    if when:
+        entry["started_at"] = entry.get("started_at") or when
+        entry["ended_at"] = when
+
+    if message.startswith(MARKERS["success"]) or \
+            message.startswith(MARKERS["uploaded"]):
+        # Скрипт говорит об успехе сам: «SUCCESS», «WinSCP exit code=0»
+        # и «Файл успешно загружен». Без этого залитая база оставалась бы
+        # в состоянии «заливается» до конца времён.
+        entry["status"] = "done"
+        entry["uploading"] = False
+        entry["done_at"] = when or entry.get("ended_at")
+    elif message.startswith(MARKERS["failed"]):
+        entry["status"] = "failed"
+        entry["uploading"] = False
+    elif message.startswith(MARKERS["exit"]):
+        code = message.split("=", 1)[-1].strip()
+        entry["exit_code"] = code
+        if code and code != "0":
+            entry["status"] = "failed"
+            entry["uploading"] = False
+    elif message.startswith(MARKERS["found"]):
         entry["file"] = message.split(":", 1)[-1].strip()
     elif message.startswith(MARKERS["size"]):
         entry["size_gb"] = _size_gb(message)
@@ -176,14 +202,25 @@ def _size_gb(message: str):
     return round(int(digits.group(1)) / 1024 ** 3, 2)
 
 
+def _took(entry: dict) -> str:
+    """Сколько шла заливка этой базы — от первой её строки до SUCCESS."""
+    started, done = entry.get("started_at"), entry.get("done_at")
+    if not started or not done or done <= started:
+        return ""
+    minutes = round((done - started).total_seconds() / 60)
+    return f", за {minutes} мин" if minutes else ", меньше минуты"
+
+
 def summary_lines(summary: dict) -> list:
     """Сводка человеческим текстом. Отдельно от разбора: разбор проверяем
     тестами, а вид сообщения меняется чаще правил."""
     databases = summary.get("databases") or []
     skipped = [d for d in databases if d["status"] == "skip"]
-    uploaded = [d for d in databases if d["status"] == "upload"]
+    done = [d for d in databases if d["status"] == "done"]
+    running = [d for d in databases if d["status"] == "upload"]
     unknown = [d for d in databases if d["status"] == "unknown"]
-    failed = [d for d in databases if d["errors"]]
+    failed = [d for d in databases
+              if d["status"] == "failed" or (d["errors"] and d["status"] != "done")]
 
     head = f"📄 Журнал скрипта · {summary.get('type') or '?'}"
     started, ended = summary.get("started"), summary.get("ended")
@@ -197,8 +234,9 @@ def summary_lines(summary: dict) -> list:
     if when:
         lines.append(f"🕒 {when}")
     lines.append(
-        f"💾 Баз: {len(databases)} · залито {len(uploaded)} · "
+        f"💾 Баз: {len(databases)} · залито {len(done)} · "
         f"пропущено {len(skipped)}"
+        + (f" · в пути {len(running)}" if running else "")
         + (f" · с ошибками {len(failed)}" if failed else "")
     )
     if not summary.get("finished"):
@@ -207,18 +245,20 @@ def summary_lines(summary: dict) -> list:
     lines.append("")
 
     for entry in databases:
-        icon = {"skip": "✅", "upload": "⬆️"}.get(entry["status"], "⏳")
-        if entry["errors"]:
-            icon = "❌"
+        icon = {"done": "✅", "skip": "⏭", "upload": "⏳",
+                "failed": "❌"}.get(entry["status"], "⏳")
         size = f", {entry['size_gb']} ГБ" if entry.get("size_gb") else ""
         attempts = (f", попыток {entry['attempts']}"
                     if entry.get("attempts", 0) > 1 else "")
-        lines.append(f"{icon} {entry['name']}{size}{attempts}")
+        lines.append(f"{icon} {entry['name']}{size}{attempts}{_took(entry)}")
         if entry.get("file"):
             lines.append(f"    {entry['file']}")
         for error in entry["errors"][:2]:
             lines.append(f"    ⛔ {error[:120]}")
 
+    if running:
+        lines.append("")
+        lines.append("⏳ — заливка ещё идёт: скрипт не сказал SUCCESS")
     if unknown and summary.get("finished"):
         lines.append("")
         lines.append("⏳ — журнал не сказал, чем кончилось: смотрите "
