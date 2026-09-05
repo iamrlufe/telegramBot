@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи. copy_script: бот сам запускает копирование, как только SQL закончил копию (по msdb), — планировщик Windows для этого не нужен. Скрипт свой на каждый тип копии: полную и разностную обычно возят разными.",
+    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи. copy_script: бот сам запускает копирование, как только SQL закончил копию (по msdb), — планировщик Windows для этого не нужен. Скрипт свой на каждый тип копии: полную и разностную обычно возят разными. copy_target и copy_target_root нужны только для процента готовности: бот спрашивает у приёмника, сколько байт уже доехало. copy_target — имя ПРИЁМНИКА в этом же файле (ниже sftp-01).",
     "name": "sql-01.example.local",
     "host": "192.0.2.10",
     "services": [
@@ -18,7 +18,12 @@
       "D": "C:\\Scripts\\upload_full.cmd",
       "I": "C:\\Scripts\\upload_diff.cmd"
     },
-    "copy_timeout_minutes": 360
+    "copy_timeout_minutes": 360,
+    "copy_types": "D,I",
+    "copy_after_backup": true,
+    "copy_delay_minutes": 5,
+    "copy_target": "sftp-01.example.local",
+    "copy_target_root": "E:\\Backups\\SQL01"
   },
   {
     "_comment": "Все поддерживаемые поля Windows-сервера сразу, для справки. firewall=true открывает кнопку блокировки адресов. На Windows это 🛡 Блокировка IP правилом Windows Firewall (нужны права администратора у учётки WinRM), на Linux — 🛡 Блокировка (fail2ban): бот показывает клетки и банит через fail2ban-client, для чего учётке SSH нужно правило sudo без пароля на эту команду.",
@@ -101,6 +106,7 @@
     "_comment": "VMware: vCenter или отдельный ESXi. Опрос по HTTPS/443, роль Read-only с Propagate to children. services — имена ВМ, за которыми следим. legacy_tls нужен только для vSphere 6.0/6.5, которые не договариваются с современным TLS.",
     "name": "vcenter.example.local",
     "host": "192.0.2.50",
+    "port": 443,
     "type": "vmware",
     "username": "monitor@vsphere.local",
     "password": "",
@@ -127,6 +133,22 @@
     ],
     "zimbra": true,
     "firewall": true,
-    "autoban_brute": true
+    "autoban_brute": true,
+    "mail_log": "/var/log/mail.log",
+    "audit_log": "/opt/zimbra/log/audit.log"
+  },
+  {
+    "_comment": "Приёмник копий: сюда уезжают файлы со скриптов copy_script. Для бота это обычный Windows-сервер; ссылка на него из поля copy_target источника нужна, чтобы бот мог спросить размер файла на приёмнике и показать процент готовности едущей копии.",
+    "name": "sftp-01.example.local",
+    "host": "192.0.2.60",
+    "services": [
+      "sshd"
+    ],
+    "backups": {
+      "sql": [
+        "E:\\Backups\\SQL01"
+      ]
+    },
+    "backup_alert_hours": 30
   }
 ]

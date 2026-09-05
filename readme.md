@@ -108,6 +108,7 @@ bot/
   net_tools.py           — проверка TCP-портов и HTTP/TLS рядом с пингом
   refresh.py             — принудительное обновление сервера по кнопке
   audit.py                — журнал изменений конфига (config_audit)
+  dirdig.py                — навигация по каталогам в разборе «кто съел место»
   tg_utils.py              — safe_edit/answer, mute-файл, разбивка длинных сообщений
   sqllog_bot.py             — раздел 🗄 SQL-логи в карточке сервера
   winlog_bot.py              — раздел 📜 Логи Windows в карточке сервера
@@ -124,6 +125,7 @@ monitor/
   iis_collector.py        — сводка IIS: логи сайта по смещению, HTTPERR, конфигурация
   zimbra_collector.py     — разбор почтовых журналов Zimbra, находки для алертов и сводка для дашборда
   exchange_collector.py    — сводка почты Exchange для дашборда (OWA, ActiveSync, отказы входа)
+  backup_transfer.py      — запуск копирования копий на приёмник (msdb, WinRM, состояние)
   firewall_maintenance.py — снятие блокировок IP, у которых истёк срок
   backup_maintenance.py  — ретеншн и RESTORE VERIFYONLY (раз в сутки, свой поток)
   alerts.py                — вся логика алертов, тихие часы, отложенная отправка
@@ -145,6 +147,9 @@ shared/
   remote_ops.py             — топ-каталоги, restart_service, reboot_server
   backup_files.py            — листинг/удаление backup-файлов (Windows — WinRM, Linux/NAS — SSH)
   backup_schedule.py          — недельное расписание бэкапа (общее правило для bot и monitor)
+  backup_copy.py               — копирование копий: разбор настроек, «пора»/«зависло», текст запуска
+  copy_log.py                   — разбор журнала самого скрипта копирования (что залито, что в пути)
+  onec_logs.py                   — блок onec_logs из servers.json: путь, название, пороги размера
   backup_verify.py             — RESTORE VERIFYONLY (общая для bot и monitor)
   disk_forecast.py              — прогноз заполнения диска (МНК по истории disk_metrics)
   disk_health.py                 — RAID/температуры/причина недоступности SMART в JSON-файле
@@ -160,6 +165,7 @@ shared/
   firewall.py                          — правило Windows Firewall со списком адресов
   firewall_store.py                     — блокировки и белый список в БД (fw_blocks/fw_whitelist)
   fail2ban.py                            — блокировка на Linux через fail2ban (клетки, баны, ignoreip)
+  autoban.py                              — автоблокировка тех, кто перебирает пароли к почте
 tests/                    — pytest на «чистые» функции (без внешних зависимостей)
 .github/workflows/ci.yml  — тесты и ruff на каждый push и pull request
 .ruff.toml                — настройки линтера (тот же набор правил, что в CI)
@@ -2847,11 +2853,11 @@ HTTPS.
 
 ```
 🛡 Заблокировано автоматически: 5 (fail2ban, клетка zimbra-auth)
-  103.148.45.88 🇮🇩
-  103.190.17.25 🇧🇩
-  161.65.64.215 🇳🇿
-  105.111.178.55 🇩🇿
-  154.244.141.237 🇩🇿
+  198.51.100.21 🇮🇩
+  198.51.100.34 🇧🇩
+  203.0.113.77 🇳🇿
+  203.0.113.90 🇩🇿
+  198.51.100.152 🇩🇿
 Снять — раздел 🛡 в карточке сервера.
 ```
 
@@ -3175,6 +3181,15 @@ pytest
 (`test_db_batch.py`), атомарность файлов состояния с обеих сторон
 (`test_state_files.py`), разбор `.env` (`test_settings.py`) и судьба
 недоставленного алерта (`test_alerts.py`).
+
+Отдельно стерегутся сами документы. `test_env_example.py` сверяет `.env.example`
+с кодом и с блоком переменных в этом файле; `test_example_servers.py` —
+`config/example.servers.json` с таблицей «Поля servers.json» в обе стороны
+(поле, описанное в readme, обязано встречаться в примере, и наоборот) и
+прогоняет пример через `validate_config` бота. `test_docs_addresses.py`
+проверяет, что в публичных файлах нет настоящих адресов: только
+192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 и частные сети. Повод —
+пять реальных адресов, скопированных сюда из живого алерта автобана.
 
 Те же тесты и `ruff` прогоняются в GitHub Actions на каждый push
 (`.github/workflows/ci.yml`). Набор правил линтера узкий — ошибки, которые
