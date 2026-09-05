@@ -187,3 +187,112 @@ def test_running_database_still_gets_a_percent(monkeypatch):
     entry = summary["databases"][0]
     assert entry["percent"] == 50
     assert "truncated" not in entry
+
+
+# ─── Вложенное меню: список серверов → карточка одного ───────
+
+def _capture_kb(monkeypatch):
+    """Как _capture, но запоминает и клавиатуру: тексты кнопок и callback."""
+    shown = []
+
+    async def fake_edit(query, text, reply_markup=None, **kw):
+        rows = []
+        if reply_markup is not None:
+            for row in reply_markup.inline_keyboard:
+                rows.append([(b.text, b.callback_data) for b in row])
+        shown.append((text, rows))
+
+    monkeypatch.setattr(backup_bot, "safe_edit_message", fake_edit)
+    return shown
+
+
+class _Button:
+    def __init__(self, text, callback_data=None, **kw):
+        self.text, self.callback_data = text, callback_data
+
+
+class _Markup:
+    def __init__(self, keyboard):
+        self.inline_keyboard = [list(row) for row in keyboard]
+
+
+def _real_keyboard(monkeypatch):
+    """Заглушка telegram отдаёт MagicMock — кнопки на нём не разобрать."""
+    monkeypatch.setattr(backup_bot, "InlineKeyboardButton", _Button)
+    monkeypatch.setattr(backup_bot, "InlineKeyboardMarkup", _Markup)
+
+
+def _wire_two_servers(monkeypatch, state):
+    _real_keyboard(monkeypatch)
+    monkeypatch.setattr(backup_bot, "copy_servers", lambda: ["akt1c8", "shmsql"])
+    monkeypatch.setattr(backup_bot, "find_server",
+                        lambda n: {"name": n, "host": "h"})
+    monkeypatch.setattr(backup_bot, "copy_settings",
+                        lambda s: {"scripts": {"D": "full.cmd", "I": "diff.cmd"},
+                                   "auto": True})
+    monkeypatch.setattr(backup_bot, "load_copy_state", lambda: state)
+    monkeypatch.setattr(backup_bot, "refresh_run", lambda s: "busy")
+
+
+def test_list_gives_one_button_per_server(monkeypatch):
+    """Список — это выбор сервера, а не свалка кнопок всех серверов:
+    запустить копирование не тому серверу отсюда нельзя."""
+    shown = _capture_kb(monkeypatch)
+    _wire_two_servers(monkeypatch, {})
+
+    asyncio.run(backup_bot.show_copy_status(object(), None))
+
+    _, rows = shown[0]
+    data = [b[1] for row in rows for b in row]
+    assert data == ["backup_copy_srv:akt1c8", "backup_copy_srv:shmsql",
+                    "backup_menu"]
+
+
+def test_list_shows_which_server_is_busy(monkeypatch):
+    """Идущий рейс видно до захода в карточку — за этим сюда и приходят."""
+    shown = _capture_kb(monkeypatch)
+    _wire_two_servers(monkeypatch, {
+        "shmsql": {"run": {"pid": 2320, "started": "2026-09-05 10:00:00"}}})
+
+    asyncio.run(backup_bot.show_copy_status(object(), None))
+
+    text, rows = shown[0]
+    assert "⏳ shmsql" in text and "PID 2320" in text
+    assert rows[1][0][0].startswith("⏳")
+
+
+def test_card_holds_every_action_for_its_server(monkeypatch):
+    """Внутри карточки — только этот сервер: запуск по типам, журнал,
+    сброс идущего рейса и возврат к списку."""
+    shown = _capture_kb(monkeypatch)
+    _wire_two_servers(monkeypatch, {
+        "shmsql": {"run": {"pid": 2320, "started": "2026-09-05 10:00:00"}}})
+
+    asyncio.run(backup_bot.show_copy_server(object(), None, "shmsql"))
+
+    text, rows = shown[0]
+    data = [b[1] for row in rows for b in row]
+    assert "🖥 shmsql" in text
+    assert data == ["backup_copy_go:shmsql:D", "backup_copy_go:shmsql:I",
+                    "backup_copy_log:shmsql", "backup_copy_reset:shmsql",
+                    "backup_copy"]
+
+
+def test_card_hides_reset_without_a_running_trip(monkeypatch):
+    """Сброс нужен только для рейса, который числится идущим."""
+    shown = _capture_kb(monkeypatch)
+    _wire_two_servers(monkeypatch, {})
+
+    asyncio.run(backup_bot.show_copy_server(object(), None, "akt1c8"))
+
+    data = [b[1] for row in shown[0][1] for b in row]
+    assert "backup_copy_reset:akt1c8" not in data
+
+
+def test_back_leads_into_the_card(monkeypatch):
+    """Из журнала и подтверждений возвращаемся в карточку сервера, а не
+    в общий список: работа идёт внутри одного сервера."""
+    assert backup_bot.copy_back_data("shmsql") == "backup_copy_srv:shmsql"
+    # Длинное имя в 64 байта callback_data не влезает — тогда общий список
+    assert backup_bot.copy_back_data("x" * 70) == "backup_copy"
+    assert backup_bot.copy_back_data() == "backup_copy"

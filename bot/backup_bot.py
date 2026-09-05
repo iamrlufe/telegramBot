@@ -629,7 +629,53 @@ async def _refresh_running(names: list, state: dict):
     return state, notes
 
 
+def copy_back_data(server_name: str = None) -> str:
+    """Куда ведёт «Назад»: в карточку сервера, если она влезает в кнопку."""
+    if server_name:
+        data = f"backup_copy_srv:{server_name}"
+        if len(data.encode()) <= COPY_CALLBACK_LIMIT:
+            return data
+    return "backup_copy"
+
+
+def copy_back_row(server_name: str = None) -> list:
+    return [InlineKeyboardButton("◀️ Назад",
+                                 callback_data=copy_back_data(server_name))]
+
+
+def copy_back_kb(server_name: str = None):
+    return InlineKeyboardMarkup([copy_back_row(server_name)])
+
+
+def copy_summary_line(server_name: str, entry: dict) -> str:
+    """Строка сервера в списке: чем он занят прямо сейчас, одной строкой.
+
+    Подробности — в карточке; здесь важно только, можно ли запускать.
+    """
+    entry = entry or {}
+    run = entry.get("run")
+    if run:
+        what = f" [{type_label(run['type'])}]" if run.get("type") else ""
+        return (f"⏳ {server_name} — идёт{what} с {run.get('started')} "
+                f"(PID {run.get('pid')})")
+
+    last = entry.get("last_run")
+    if not last:
+        return f"⏸ {server_name} — рейсов ещё не было"
+
+    icon = {"failed": "❌", "lost": "❌", "reset": "⏹"}.get(last.get("state"), "✅")
+    what = f" [{type_label(last['type'])}]" if last.get("type") else ""
+    return f"{icon} {server_name} — последний рейс{what}: {last.get('ended')}"
+
+
 async def show_copy_status(query, context, page: int = 0):
+    """Список серверов-источников. Работа — внутри карточки сервера.
+
+    Раньше все источники со всеми кнопками жили на одном экране: кнопки
+    запуска, журналов и сбросов шли вперемешку и подписывались именем
+    сервера. Промахнуться было легко, а второй запуск копирования поверх
+    идущего портит файл на приёмнике.
+    """
     names = await asyncio.to_thread(copy_servers)
     if not names:
         await safe_edit_message(
@@ -646,76 +692,107 @@ async def show_copy_status(query, context, page: int = 0):
 
     state = await asyncio.to_thread(load_copy_state)
     state, notes = await _refresh_running(names, state)
-    blocks = []
-    for name in names:
-        server = await asyncio.to_thread(find_server, name)
-        if not server:
+
+    total_pages = max(1, (len(names) + SERVER_PICKER_PAGE_SIZE - 1)
+                      // SERVER_PICKER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    shown = names[page * SERVER_PICKER_PAGE_SIZE:
+                  (page + 1) * SERVER_PICKER_PAGE_SIZE]
+
+    rows = []
+    for name in shown:
+        data = f"backup_copy_srv:{name}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            notes.append(f"⚠️ {name}: имя не помещается в кнопку Telegram "
+                         f"(лимит 64 байта) — карточка недоступна.")
             continue
-        blocks.append("\n".join(_copy_server_lines(server, state.get(name))))
+        rows.append([InlineKeyboardButton(
+            f"{copy_summary_line(name, state.get(name))[0]} {name}",
+            callback_data=data)])
+
+    # Страница одна — строка «1/1» только занимает место
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(
+                "◀️", callback_data=f"backup_copy_page:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}",
+                                            callback_data="backup_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(
+                "▶️", callback_data=f"backup_copy_page:{page + 1}"))
+        rows.append(nav_row)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_menu")])
+
+    lines = ["📤 КОПИРОВАНИЕ", "",
+             f"Серверов-источников: {len(names)}", ""]
+    lines += [copy_summary_line(name, state.get(name)) for name in shown]
     if notes:
-        blocks.append("\n".join(notes))
+        lines += [""] + notes
+    lines += ["", "Выбери сервер: запуск, журнал и сброс рейса — внутри."]
 
-    text, keyboard = paginate_text_blocks(
-        f"📤 КОПИРОВАНИЕ\n\nСерверов-источников: {len(blocks)}\n\n{'━'*20}\n\n",
-        blocks,
-        page=page,
-        callback_prefix="backup_copy_page"
-    )
-    rows = list(keyboard.inline_keyboard)
-    run_rows = []
-    if len(names) == 1:
-        # Источник один: сразу кнопки типов, без лишнего выбора сервера.
-        server = await asyncio.to_thread(find_server, names[0])
-        settings = copy_settings(server) if server else None
-        buttons = copy_type_buttons(names[0], settings or {}) if settings else []
-        if buttons:
-            # По кнопке в ряд, если типов больше двух: подписи длинные
-            run_rows = [buttons] if len(buttons) <= 2 else [[b] for b in buttons]
-        else:
-            data = f"backup_copy_run:{names[0]}"
-            if len(data.encode()) > COPY_CALLBACK_LIMIT:
-                data = "backup_copy_run_servers"
-            run_rows = [[InlineKeyboardButton("📤 Скопировать сейчас",
-                                              callback_data=data)]]
-    elif len(names) <= SERVER_PICKER_PAGE_SIZE:
-        # Источников немного: кнопка на каждый ведёт сразу к выбору типа,
-        # отдельный экран «выбери сервер» тут был бы лишним шагом.
-        for name in names:
-            data = f"backup_copy_run:{name}"
-            if len(data.encode()) > COPY_CALLBACK_LIMIT:
-                run_rows = []
-                break
-            run_rows.append([InlineKeyboardButton(f"📤 {name}",
-                                                  callback_data=data)])
+    await safe_edit_message(query, "\n".join(lines),
+                            reply_markup=InlineKeyboardMarkup(rows))
 
-    if not run_rows:
-        run_rows = [[InlineKeyboardButton(
-            "📤 Скопировать сейчас",
-            callback_data="backup_copy_run_servers")]]
+
+async def show_copy_server(query, context, server_name: str):
+    """Карточка одного источника: всё про него и все кнопки — тут."""
+    server = await asyncio.to_thread(find_server, server_name)
+    if not server:
+        await safe_edit_message(
+            query,
+            f"❌ Сервер {server_name} не найден в config/servers.json.",
+            reply_markup=copy_back_kb()
+        )
+        return
+
+    settings = copy_settings(server)
+    if not settings:
+        await safe_edit_message(
+            query,
+            f"⚠️ У {server_name} не задан скрипт копирования.",
+            reply_markup=copy_back_kb()
+        )
+        return
+
+    state = await asyncio.to_thread(load_copy_state)
+    state, notes = await _refresh_running([server_name], state)
+    entry = state.get(server_name)
+
+    text = "📤 КОПИРОВАНИЕ\n\n" + "\n".join(_copy_server_lines(server, entry))
+    if notes:
+        text += "\n\n" + "\n".join(notes)
+
+    rows = []
+    buttons = copy_type_buttons(server_name, settings)
+    if buttons:
+        # По кнопке в ряд, если типов больше двух: подписи длинные
+        rows = [buttons] if len(buttons) <= 2 else [[b] for b in buttons]
+    else:
+        data = f"backup_copy_run:{server_name}"
+        if len(data.encode()) <= COPY_CALLBACK_LIMIT:
+            rows.append([InlineKeyboardButton("📤 Скопировать сейчас",
+                                              callback_data=data)])
 
     # Журнал самого скрипта: он знает то, чего не знает бот, — сколько
     # баз обошли, что залито, что пропущено.
-    for name in names:
-        data = f"backup_copy_log:{name}"
-        if len(data.encode()) > COPY_CALLBACK_LIMIT:
-            continue
-        run_rows.append([InlineKeyboardButton(
-            f"📄 Журнал{'' if len(names) == 1 else ' · ' + name}",
-            callback_data=data)])
-    rows[-1:-1] = run_rows
+    data = f"backup_copy_log:{server_name}"
+    if len(data.encode()) <= COPY_CALLBACK_LIMIT:
+        rows.append([InlineKeyboardButton("📄 Журнал скрипта",
+                                          callback_data=data)])
 
     # Рейс, который числится идущим: если он завис или его убили руками,
     # без сброса следующая копия не поедет — бот считает сервер занятым.
-    for name in names:
-        if not (state.get(name) or {}).get("run"):
-            continue
-        data = f"backup_copy_reset:{name}"
-        if len(data.encode()) > COPY_CALLBACK_LIMIT:
-            continue
-        rows.insert(-1, [InlineKeyboardButton(
-            f"⏹ Сбросить рейс{'' if len(names) == 1 else ' · ' + name}",
-            callback_data=data)])
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(rows))
+    if (entry or {}).get("run"):
+        data = f"backup_copy_reset:{server_name}"
+        if len(data.encode()) <= COPY_CALLBACK_LIMIT:
+            rows.append([InlineKeyboardButton("⏹ Сбросить рейс",
+                                              callback_data=data)])
+
+    rows.append([InlineKeyboardButton("◀️ К списку серверов",
+                                      callback_data="backup_copy")])
+    await safe_edit_message(query, text,
+                            reply_markup=InlineKeyboardMarkup(rows))
 
 
 def _copy_script_path(server: dict, btype: str = None) -> str:
@@ -733,7 +810,8 @@ async def show_copy_log_types(query, context, server_name: str):
     settings = copy_settings(server) if server else None
     if not settings:
         await safe_edit_message(query, f"⚠️ У {server_name} не задан скрипт "
-                                       f"копирования.", reply_markup=back_kb())
+                                       f"копирования.",
+                                reply_markup=copy_back_kb())
         return
 
     directory = log_dir(_copy_script_path(server))
@@ -744,7 +822,7 @@ async def show_copy_log_types(query, context, server_name: str):
             continue
         rows.append([InlineKeyboardButton(
             f"📄 {type_label(btype).capitalize()}", callback_data=data)])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_copy")])
+    rows.append(copy_back_row(server_name))
 
     await safe_edit_message(
         query,
@@ -760,7 +838,7 @@ async def show_copy_log(query, context, server_name: str, btype: str):
     server = await asyncio.to_thread(find_server, server_name)
     if not server:
         await safe_edit_message(query, f"❌ Сервер {server_name} не найден.",
-                                reply_markup=back_kb())
+                                reply_markup=copy_back_kb(server_name))
         return
 
     script = _copy_script_path(server, btype)
@@ -771,7 +849,7 @@ async def show_copy_log(query, context, server_name: str, btype: str):
         await safe_edit_message(
             query,
             f"❌ Не прочитать журнал {path}:\n{str(e)[:300]}",
-            reply_markup=back_kb()
+            reply_markup=copy_back_kb(server_name)
         )
         return
 
@@ -921,7 +999,7 @@ async def show_copy_log_db(query, context, server_name: str, btype: str,
     server = await asyncio.to_thread(find_server, server_name)
     if not server:
         await safe_edit_message(query, f"❌ Сервер {server_name} не найден.",
-                                reply_markup=back_kb())
+                                reply_markup=copy_back_kb(server_name))
         return
 
     path = database_log(_copy_script_path(server, btype), btype, database)
@@ -1000,7 +1078,8 @@ async def ask_copy_reset(query, context, server_name: str):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Да, сбросить",
                                  callback_data=f"backup_copy_resetgo:{server_name}"),
-            InlineKeyboardButton("❌ Отмена", callback_data="backup_copy"),
+            InlineKeyboardButton("❌ Отмена",
+                                 callback_data=copy_back_data(server_name)),
         ]])
     )
 
@@ -1010,38 +1089,19 @@ async def do_copy_reset(query, context, server_name: str):
         await safe_edit_message(
             query,
             "⛔ Нет прав на сброс рейса.\n\nОбратитесь к администратору.",
-            reply_markup=back_kb()
+            reply_markup=copy_back_kb(server_name)
         )
         return
     try:
         run = await asyncio.to_thread(clear_run, server_name)
     except Exception as e:
-        await safe_edit_message(query, f"❌ {str(e)[:300]}", reply_markup=back_kb())
+        await safe_edit_message(query, f"❌ {str(e)[:300]}",
+                                reply_markup=copy_back_kb(server_name))
         return
 
     audit.log_config_change(query.from_user, "copy_reset", server_name,
                             f"pid={run.get('pid')}")
-    await show_copy_status(query, context)
-
-
-async def show_copy_run_servers(query, context, page: int = 0):
-    names = await asyncio.to_thread(copy_servers)
-    if not names:
-        await safe_edit_message(
-            query,
-            "⚠️ Ни у одного сервера не задан скрипт копирования.",
-            reply_markup=back_kb()
-        )
-        return
-
-    await safe_edit_message(
-        query,
-        "📤 ЗАПУСК КОПИРОВАНИЯ\n\n"
-        "Выбери сервер-источник. Скрипт запустится на нём самом; "
-        "большая база едет часами, ждать здесь не нужно.",
-        reply_markup=build_paginated_server_keyboard(
-            names, "backup_copy_run", page, back_callback="backup_copy")
-    )
+    await show_copy_server(query, context, server_name)
 
 
 async def show_copy_types(query, context, server_name: str, scripts: dict):
@@ -1049,7 +1109,7 @@ async def show_copy_types(query, context, server_name: str, scripts: dict):
     и разностная едут разными скриптами в разные каталоги."""
     rows = [[button] for button in
             copy_type_buttons(server_name, {"scripts": scripts})]
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_copy")])
+    rows.append(copy_back_row(server_name))
 
     await safe_edit_message(
         query,
@@ -1064,7 +1124,7 @@ async def do_copy_run(query, context, server_name: str, btype: str = None):
         await safe_edit_message(
             query,
             "⛔ Нет прав на запуск копирования.\n\nОбратитесь к администратору.",
-            reply_markup=back_kb()
+            reply_markup=copy_back_kb(server_name)
         )
         return
 
@@ -1075,7 +1135,7 @@ async def do_copy_run(query, context, server_name: str, btype: str = None):
             await safe_edit_message(
                 query,
                 f"⚠️ У {server_name} не задан скрипт копирования.",
-                reply_markup=back_kb()
+                reply_markup=copy_back_kb()
             )
             return
         scripts = settings["scripts"]
@@ -1091,7 +1151,7 @@ async def do_copy_run(query, context, server_name: str, btype: str = None):
         await safe_edit_message(
             query,
             f"❌ {server_name}: копирование не запущено.\n\n{str(e)[:300]}",
-            reply_markup=back_kb()
+            reply_markup=copy_back_kb(server_name)
         )
         return
 
@@ -1105,7 +1165,7 @@ async def do_copy_run(query, context, server_name: str, btype: str = None):
         f"Скрипт работает на самом сервере — ботом можно пользоваться "
         f"дальше. Если копирование затянется дольше порога, придёт алерт "
         f"«КОПИРОВАНИЕ ЗАВИСЛО».",
-        reply_markup=back_kb()
+        reply_markup=copy_back_kb(server_name)
     )
 
 
@@ -1758,12 +1818,17 @@ async def backup_callback(query, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split(":", 1)[1])
         await show_copy_status(query, context, page=page)
 
+    # Кнопки старых сообщений: отдельного экрана «выбери сервер» больше
+    # нет — список серверов и есть первый экран раздела.
     elif data == "backup_copy_run_servers":
-        await show_copy_run_servers(query, context)
+        await show_copy_status(query, context)
 
     elif data.startswith("backup_copy_run_servers:"):
         page = int(data.split(":", 1)[1])
-        await show_copy_run_servers(query, context, page=page)
+        await show_copy_status(query, context, page=page)
+
+    elif data.startswith("backup_copy_srv:"):
+        await show_copy_server(query, context, data.split(":", 1)[1])
 
     elif data.startswith("backup_copy_run:"):
         server_name = data.split(":", 1)[1]
