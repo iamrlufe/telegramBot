@@ -38,7 +38,7 @@ from backup_copy import (
     copy_settings,
     find_server,
     load_state as load_copy_state,
-    read_remote_log,
+    read_remote_log_info,
     start_copy_now,
     type_label,
 )
@@ -48,6 +48,9 @@ from copy_log import (
     log_dir,
     parse_common_log,
     summary_lines,
+    winscp_highlights,
+    winscp_is_transferring,
+    winscp_last_time,
 )
 from backup_schedule import (
     load_schedule_map,
@@ -712,7 +715,7 @@ async def show_copy_log(query, context, server_name: str, btype: str):
     script = _copy_script_path(server, btype)
     path = common_log(script, btype)
     try:
-        text = await asyncio.to_thread(read_remote_log, server, path)
+        text = (await asyncio.to_thread(read_remote_log_info, server, path))["text"]
     except Exception as e:
         await safe_edit_message(
             query,
@@ -751,6 +754,44 @@ async def show_copy_log(query, context, server_name: str, btype: str):
                             reply_markup=InlineKeyboardMarkup(rows))
 
 
+# Хвост протокольного лога WinSCP: 4 КБ там — это пара секунд обмена,
+# значимых строк в них может не оказаться вовсе.
+WINSCP_TAIL_BYTES = 65536
+
+# Журнал WinSCP крупнее этого — почти наверняка включён отладочный
+# уровень: на копии в 44 ГБ такой файл дорастает до гигабайта.
+WINSCP_BIG_LOG_MB = 200
+
+
+def _winscp_body(path: str, info: dict) -> str:
+    """Что показать по журналу WinSCP: он протокольный, не человеческий."""
+    size_mb = round(info["size"] / 1024 / 1024, 1)
+    lines = [path, f"📦 Размер журнала: {size_mb} МБ"]
+
+    last = winscp_last_time(info["text"])
+    if last:
+        lines.append(f"🕒 Последняя запись: {last}")
+    if winscp_is_transferring(info["text"]):
+        lines.append("⏳ В хвосте идёт передача файла")
+
+    if size_mb > WINSCP_BIG_LOG_MB:
+        lines.append("")
+        lines.append("⚠️ Журнал разросся: у WinSCP включён отладочный "
+                     "уровень, он пишет по строке на каждые 32 КБ данных. "
+                     "Понизьте /loglevel в скрипте, иначе на каждую "
+                     "большую копию уходит около гигабайта диска.")
+
+    highlights = winscp_highlights(info["text"])
+    lines.append("")
+    if highlights:
+        lines.append("📄 Значимое из хвоста:")
+        lines += [f"  {line}" for line in highlights]
+    else:
+        lines.append("📄 В хвосте только протокольный обмен — значимых "
+                     "строк нет. Это нормально для идущей передачи.")
+    return "\n".join(lines)
+
+
 async def show_copy_log_db(query, context, server_name: str, btype: str,
                            database: str):
     """Подробности WinSCP по одной базе — как есть, хвостом."""
@@ -762,9 +803,10 @@ async def show_copy_log_db(query, context, server_name: str, btype: str,
 
     path = database_log(_copy_script_path(server, btype), btype, database)
     try:
-        text = await asyncio.to_thread(read_remote_log, server, path, None, 40)
+        info = await asyncio.to_thread(read_remote_log_info, server, path,
+                                       WINSCP_TAIL_BYTES, 300)
     except Exception as e:
-        text, error = "", str(e)[:300]
+        info, error = {"text": "", "size": 0}, str(e)[:300]
     else:
         error = ""
 
@@ -772,10 +814,10 @@ async def show_copy_log_db(query, context, server_name: str, btype: str,
         "◀️ Назад", callback_data=f"backup_copy_logt:{server_name}:{btype}")]
     if error:
         body = f"❌ Не прочитать: {error}"
-    elif not text:
+    elif not info["size"]:
         body = f"Файла нет:\n{path}"
     else:
-        body = f"{path}\n\n{text}"
+        body = _winscp_body(path, info)
 
     await safe_edit_message(
         query,

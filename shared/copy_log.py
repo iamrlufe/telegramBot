@@ -224,3 +224,55 @@ def summary_lines(summary: dict) -> list:
         lines.append("⏳ — журнал не сказал, чем кончилось: смотрите "
                      "подробности по базе")
     return lines
+
+
+# ─── Журнал WinSCP по одной базе ─────────────────────────────
+#
+# Это не человеческий отчёт, а протокольный лог: на каждые 32 КБ данных
+# приходится десяток строк вида «Type: SSH_FXP_WRITE» и «Status code: 0».
+# На копии в 44 ГБ такого набегает под гигабайт, и читать его глазами
+# бессмысленно — нужны только значимые строки.
+#
+# Разметка WinSCP: «.» — отладка, «>» — отправлено, «<» — получено,
+# «!» — то, что он сам считает важным (ошибки и итоги).
+
+WINSCP_NOISE = (". ", "> ", "< ")
+
+WINSCP_KEEP = (
+    "Transfer done", "Copying", "Script:", "Session started", "Authenticated",
+    "Starting the session", "Disconnected", "Timeout", "Error", "error",
+    "Access denied", "Permission denied", "No such file", "abort",
+)
+
+WINSCP_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def winscp_highlights(text: str, limit: int = 20) -> list:
+    """Значимые строки из протокольного лога WinSCP."""
+    kept = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("! "):
+            kept.append(line[2:].strip())
+            continue
+        if line.startswith(WINSCP_NOISE):
+            body = line[2:].strip()
+            if any(word in body for word in WINSCP_KEEP):
+                kept.append(body)
+            continue
+        if any(word in line for word in WINSCP_KEEP):
+            kept.append(line)
+    return kept[-limit:]
+
+
+def winscp_last_time(text: str) -> str:
+    """Время последней записи в логе — по нему видно, жив ли перенос."""
+    stamps = WINSCP_TIME_RE.findall(text or "")
+    return stamps[-1] if stamps else ""
+
+
+def winscp_is_transferring(text: str) -> bool:
+    """Идёт ли прямо сейчас передача: в хвосте одни записи в файл."""
+    return "SSH_FXP_WRITE" in (text or "")

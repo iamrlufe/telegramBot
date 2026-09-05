@@ -8,6 +8,9 @@ from datetime import datetime
 
 from copy_log import (
     common_log,
+    winscp_highlights,
+    winscp_is_transferring,
+    winscp_last_time,
     database_log,
     log_dir,
     parse_common_log,
@@ -129,3 +132,36 @@ def test_summary_is_readable():
     assert "залито 1" in text
     assert "пропущено 1" in text
     assert "new_pro_akt" in text
+
+
+# ─── Протокольный лог WinSCP ─────────────────────────────────
+
+WINSCP_TAIL = """. 2026-09-05 11:40:21.697 Read 17 bytes (0 pending)
+< 2026-09-05 11:40:21.697 Type: SSH_FXP_STATUS, Size: 17, Number: 29413638
+< 2026-09-05 11:40:21.697 Status code: 0
+> 2026-09-05 11:40:21.728 Type: SSH_FXP_WRITE, Size: 32758, Number: 29418758
+. 2026-09-05 11:40:21.728 Sent 32762 bytes
+"""
+
+WINSCP_END = """. 2026-09-05 11:52:03.100 Transfer done: 'D:\\backup\\a.bak' => '/a.bak'
+! 2026-09-05 11:52:03.200 Error message from server: Permission denied
+. 2026-09-05 11:52:04.000 Session started.
+"""
+
+
+def test_protocol_noise_is_dropped():
+    """На 44 ГБ такого набегает под гигабайт — читать его глазами
+    бессмысленно, в сводку такие строки не идут."""
+    assert winscp_highlights(WINSCP_TAIL) == []
+
+
+def test_important_lines_survive():
+    kept = winscp_highlights(WINSCP_END)
+    assert any("Transfer done" in line for line in kept)
+    assert any("Permission denied" in line for line in kept)
+
+
+def test_last_time_and_transfer_state():
+    assert winscp_last_time(WINSCP_TAIL) == "2026-09-05 11:40:21"
+    assert winscp_is_transferring(WINSCP_TAIL) is True
+    assert winscp_is_transferring(WINSCP_END) is False

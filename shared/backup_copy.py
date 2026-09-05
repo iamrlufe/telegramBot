@@ -655,15 +655,28 @@ def read_tail_ps(path: str, tail_bytes: int = None) -> str:
     """
 
 
-def read_remote_log(server: dict, path: str, tail_bytes: int = None,
-                    lines: int = 400) -> str:
-    """Хвост файла на сервере как текст. Пустая строка — файла нет."""
+def read_remote_log_info(server: dict, path: str, tail_bytes: int = None,
+                         lines: int = 400) -> dict:
+    """{"text", "size"} — хвост файла и его полный размер.
+
+    Размер нужен не для красоты: журнал WinSCP на отладочном уровне
+    вырастает до гигабайта на одну большую копию, и сказать об этом
+    важнее, чем показать хвост.
+    """
     raw = run_ps(server["host"], read_tail_ps(path, tail_bytes),
                  server.get("username"), server.get("password"))
     data = ps_json(raw) or {}
-    if not data.get("Size"):
-        return ""
-    return decode_log_tail(data.get("TailB64"), lines=lines)
+    size = int(data.get("Size") or 0)
+    if not size:
+        return {"text": "", "size": 0}
+    return {"text": decode_log_tail(data.get("TailB64"), lines=lines),
+            "size": size}
+
+
+def read_remote_log(server: dict, path: str, tail_bytes: int = None,
+                    lines: int = 400) -> str:
+    """Хвост файла на сервере как текст. Пустая строка — файла нет."""
+    return read_remote_log_info(server, path, tail_bytes, lines)["text"]
 
 
 def list_dir_ps(path: str) -> str:
