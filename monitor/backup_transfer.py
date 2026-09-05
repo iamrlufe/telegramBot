@@ -214,7 +214,7 @@ def process_server_copy(server: dict, state: dict) -> bool:
                 f"🖥 {name}\n"
                 f"💾 {ready.get('db')} ({type_label(ready.get('type'))}), "
                 f"копия готова {_marker(ready['finished'])}\n"
-                f"📜 {settings['script']}\n\n"
+                f"📜 {script_for(settings, ready.get('type'))}\n\n"
                 f"❌ {str(e)[:200]}\n\n"
                 f"‼️ Файл на месте, но никуда не поедет — запустите вручную!",
                 ack_key=f"backup_copy_failed:{name}",

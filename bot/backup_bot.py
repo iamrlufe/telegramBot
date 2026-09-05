@@ -41,6 +41,7 @@ from backup_copy import (
     load_state as load_copy_state,
     read_remote_log_info,
     remote_file_size,
+    running_copies,
     start_copy_now,
     target_path,
     target_settings,
@@ -883,16 +884,43 @@ async def show_copy_log_db(query, context, server_name: str, btype: str,
 async def ask_copy_reset(query, context, server_name: str):
     state = await asyncio.to_thread(load_copy_state)
     run = (state.get(server_name) or {}).get("run") or {}
+
+    # Смотрим на сервер, а не на память: сброс нужен как раз тогда, когда
+    # состояние разошлось с действительностью, и главный вопрос перед
+    # ним — работает процесс или нет.
+    server = await asyncio.to_thread(find_server, server_name)
+    script = run.get("script") or (_copy_script_path(server) if server else "")
+    if server and script:
+        try:
+            busy = await asyncio.to_thread(running_copies, server, script)
+        except Exception as e:
+            busy, check_error = [], str(e)[:150]
+        else:
+            check_error = ""
+    else:
+        busy, check_error = [], "не знаю, какой скрипт проверять"
+
+    if check_error:
+        verdict = (f"❓ Проверить процессы на сервере не удалось: "
+                   f"{check_error}\nСбрасывайте, только если убедились сами.")
+    elif busy:
+        where = ", ".join(f"{b['name']} PID {b['pid']}" for b in busy[:3])
+        verdict = (f"🛑 На сервере ПРЯМО СЕЙЧАС работает копирование: "
+                   f"{where}.\nСбрасывать нельзя — бот запустит второе, и "
+                   f"два процесса будут писать в один файл. Сначала "
+                   f"снимите процесс на сервере.")
+    else:
+        verdict = ("✅ Процессов копирования на сервере не видно — "
+                   "сбрасывать безопасно.")
+
     await safe_edit_message(
         query,
         f"⏹ Сбросить рейс на {server_name}?\n\n"
         f"▶️ Числится идущим с {run.get('started')} (PID {run.get('pid')})\n"
-        f"📜 {run.get('script') or '?'}\n\n"
+        f"📜 {script or '?'}\n\n"
+        f"{verdict}\n\n"
         f"Бот перестанет считать сервер занятым и сможет запускать "
-        f"копирование снова.\n"
-        f"⚠️ Процесс на сервере при этом НЕ убивается: если он всё-таки "
-        f"работает, получится два копирования разом. Убедитесь, что в "
-        f"диспетчере задач его нет.",
+        f"копирование снова. Процесс на сервере кнопка НЕ убивает.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Да, сбросить",
                                  callback_data=f"backup_copy_resetgo:{server_name}"),

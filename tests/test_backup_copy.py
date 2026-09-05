@@ -576,3 +576,42 @@ def test_unknown_name_gives_nothing(monkeypatch):
     _servers(monkeypatch)
     assert backup_copy.find_server_loose("нет-такого") is None
     assert backup_copy.find_server_loose("") is None
+
+
+# ─── Предохранитель от второго рейса ─────────────────────────
+
+def test_guard_looks_for_wrapper_and_winscp():
+    """У WinSCP.com в командной строке скрипта нет — там временный файл
+    задания и путь к журналу. Журнал лежит рядом со скриптом, поэтому
+    вторым признаком идёт каталог: осиротевший WinSCP иначе прошёл бы
+    незамеченным, а он и есть самый опасный случай."""
+    text = backup_copy.running_copy_ps("C:\\roman\\2026\\upload_full.cmd")
+    assert "cmd.exe" in text and "WinSCP.com" in text
+    assert "C:\\roman\\2026\\upload_full.cmd" in text
+    assert "'*C:\\roman\\2026*'" in text
+
+
+def test_launch_refuses_while_a_copy_runs(monkeypatch):
+    """Две программы, дописывающие один файл на приёмнике, — худшее, что
+    может случиться с копией."""
+    monkeypatch.setattr(backup_copy, "running_copies",
+                        lambda server, script: [{"pid": 15344,
+                                                 "name": "WinSCP.com",
+                                                 "cmd": "..."}])
+    settings = copy_settings(_server())
+
+    with pytest.raises(RuntimeError, match="уже идёт"):
+        backup_copy.launch_copy({"name": "s", "host": "h"}, settings)
+
+
+def test_launch_refuses_when_the_check_fails(monkeypatch):
+    """Не смогли спросить — не запускаем: цена ошибки здесь выше цены
+    задержки, следующий цикл попробует снова."""
+    def _boom(server, script):
+        raise RuntimeError("WinRM не ответил")
+
+    monkeypatch.setattr(backup_copy, "running_copies", _boom)
+    settings = copy_settings(_server())
+
+    with pytest.raises(RuntimeError, match="не проверить"):
+        backup_copy.launch_copy({"name": "s", "host": "h"}, settings)

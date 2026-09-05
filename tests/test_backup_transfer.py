@@ -89,6 +89,28 @@ def test_other_jobs_do_not_trigger_anything(monkeypatch):
     assert changed is False
 
 
+def test_launch_failure_is_reported_not_swallowed(monkeypatch):
+    """Отказ предохранителя («копирование уже идёт») обязан дойти до
+    человека: молчаливый пропуск выглядел бы как «бот ничего не делает»."""
+    launched = []
+    _wire(monkeypatch, running=[],
+          rows=[{"db": "base1", "btype": "D", "finished": _finished(30)}],
+          launched=launched)
+
+    def _refuse(server, settings, ready=None, by="монитор"):
+        raise RuntimeError("копирование этим скриптом уже идёт на сервере")
+
+    monkeypatch.setattr(bt, "launch_copy", _refuse)
+    sent = []
+    monkeypatch.setattr(bt, "send_or_defer",
+                        lambda text, **kw: sent.append(text))
+    monkeypatch.setattr(bt, "is_muted", lambda name: False)
+
+    bt.process_server_copy(dict(SERVER), {})
+
+    assert sent and "уже идёт" in sent[0]
+
+
 def test_journal_backup_does_not_trigger_full_script(monkeypatch):
     """Журналы делают каждые 15–60 минут. Скрипта для них не задано —
     значит и рейса быть не должно."""

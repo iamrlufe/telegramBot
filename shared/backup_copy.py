@@ -605,6 +605,41 @@ def find_server_loose(name: str) -> dict:
     return matches[0] if len(matches) == 1 else None
 
 
+def running_copy_ps(script: str) -> str:
+    """PowerShell: не работает ли уже копирование этим скриптом.
+
+    Ищем два вида процессов. Обёртка `cmd` называет сам скрипт в
+    командной строке. А вот у самого WinSCP.com в командной строке
+    скрипта нет — там временный файл задания и путь к журналу; журнал
+    лежит рядом со скриптом, поэтому вторым признаком идёт каталог.
+    Без него осиротевший WinSCP (родителя сняли, он остался) прошёл бы
+    незамеченным — а он и есть самый опасный случай.
+    """
+    quoted = str(script).replace("'", "''")
+    directory = str(script).replace("/", "\\").rsplit("\\", 1)[0].replace("'", "''")
+    return PS_OUT_B64_HELPER + f"""
+    $items = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {{ ($_.Name -eq 'cmd.exe' -or $_.Name -eq 'WinSCP.com') -and
+                       $_.CommandLine -and
+                       ($_.CommandLine -like '*{quoted}*' -or
+                        $_.CommandLine -like '*{directory}*') }} |
+        ForEach-Object {{ @{{ Pid = $_.ProcessId; Name = $_.Name; Cmd = $_.CommandLine }} }})
+    Out-B64 @{{ Items = $items }}
+    """
+
+
+def running_copies(server: dict, script: str) -> list:
+    """[{pid, name, cmd}] — копирования этим скриптом, идущие сейчас."""
+    raw = run_ps(server["host"], running_copy_ps(script),
+                 server.get("username"), server.get("password"))
+    data = ps_json(raw) or {}
+    items = data.get("Items") or []
+    if isinstance(items, dict):
+        items = [items]
+    return [{"pid": int(i.get("Pid") or 0), "name": i.get("Name") or "",
+             "cmd": i.get("Cmd") or ""} for i in items if i.get("Pid")]
+
+
 def launch_copy(server: dict, settings: dict, ready: dict = None,
                 by: str = "монитор") -> dict:
     """Запускает скрипт копирования на сервере-источнике и возвращает запись
@@ -616,6 +651,23 @@ def launch_copy(server: dict, settings: dict, ready: dict = None,
     script = script_for(settings, (ready or {}).get("type")) or _only_script(settings)
     if not script:
         raise RuntimeError("не задан скрипт копирования для этого типа копии")
+    # Предохранитель от второго рейса. Состояние в файле может разойтись
+    # с действительностью — процесс убили руками, монитор перезапустили,
+    # рейс сбросили кнопкой, — и тогда бот запустил бы копирование поверх
+    # идущего. Две программы, дописывающие один файл на приёмнике, это
+    # худшее, что может случиться с копией. Поэтому спрашиваем сервер.
+    try:
+        busy = running_copies(server, script)
+    except Exception as e:
+        # Не смогли спросить — не запускаем: цена ошибки здесь выше цены
+        # задержки, следующий цикл попробует снова.
+        raise RuntimeError(f"не проверить, не идёт ли уже копирование: "
+                           f"{str(e).splitlines()[0][:150]}")
+    if busy:
+        where = ", ".join(f"{b['name']} PID {b['pid']}" for b in busy[:3])
+        raise RuntimeError(f"копирование этим скриптом уже идёт на сервере "
+                           f"({where}) — второй запуск испортил бы файл")
+
     ident = run_id(now_local(), (ready or {}).get("type"))
     raw = run_ps(server["host"], launch_script_ps(script, ident),
                  server.get("username"), server.get("password"))
