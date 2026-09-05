@@ -270,6 +270,12 @@ WORK_DIR_PS = "Join-Path $env:ProgramData 'AgroTNKbot\\copy'"
 # Telegram, меньше — не видно самой ошибки, она обычно в конце.
 LOG_TAIL_LINES = 15
 
+# Сколько дней держать журналы рейсов на сервере. Файлы крошечные, но
+# рейсов несколько в сутки, и без уборки каталог растёт вечно — а следом
+# за ним и время листинга. Чистится при запуске очередного рейса: своего
+# похода на сервер ради уборки не заводим.
+LOG_KEEP_DAYS = int_env("BACKUP_COPY_LOG_KEEP_DAYS", 30)
+
 
 def run_id(now: datetime = None, btype: str = None) -> str:
     """Имя пары файлов «журнал + код возврата» для одного рейса."""
@@ -297,6 +303,11 @@ def launch_script_ps(script: str, ident: str) -> str:
     журнал, код возврата — в файл-метку. Метка и есть ответ на вопрос
     «сработало ли», а журнал — на вопрос «почему нет».
 
+    Собственный журнал скрипта это не отменяет и не трогает: сюда попадает
+    то, что скрипт пишет в консоль (stdout и stderr), включая сообщения
+    оболочки о том, что запуск вообще не состоялся, — их в журнале самого
+    скрипта не будет по определению.
+
     Win32_Process.Create вместо Start-Process намеренно: он принимает одну
     строку командной строки целиком, и её не переписывает разбор массива
     аргументов — с перенаправлениями и кавычками это единственный
@@ -308,6 +319,9 @@ def launch_script_ps(script: str, ident: str) -> str:
     return f"""
     $dir = {WORK_DIR_PS}
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.LastWriteTime -lt (Get-Date).AddDays(-{LOG_KEEP_DAYS}) }} |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     $log = Join-Path $dir '{ident}.log'
     $done = Join-Path $dir '{ident}.done'
     if (Test-Path -LiteralPath $done) {{ Remove-Item -LiteralPath $done -Force }}

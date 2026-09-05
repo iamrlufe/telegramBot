@@ -244,6 +244,13 @@ def test_launch_writes_log_and_exit_code():
     assert "20260905-102701-I.done" in text
 
 
+def test_old_logs_are_cleaned_on_launch():
+    """Рейсов несколько в сутки: без уборки каталог рос бы вечно, а
+    отдельного похода на сервер ради этого заводить незачем."""
+    text = launch_script_ps("C:\\a.bat", "id")
+    assert "AddDays(-" in text and "Remove-Item" in text
+
+
 def test_quotes_do_not_break_the_script():
     assert "''" in launch_script_ps("C:\\Scripts\\it's copy.bat", "id")
 
