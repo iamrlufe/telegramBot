@@ -4,13 +4,11 @@
 амавис двумя очередями и оставляет 2-3 строки `from=`; наивный подсчёт
 строк завышает объём втрое, и порог всплеска становится бессмысленным.
 """
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monitor"))
-
+# Пути каталогов добавляет conftest.py. Переставлять их здесь нельзя:
+# bot/ впереди monitor/ меняет значение `import db` для всех последующих
+# тестов — монитор перестаёт видеть свой db.py.
 import zimbra_log
 
 SERVER = {"name": "mail-01.example.local", "host": "192.0.2.40",

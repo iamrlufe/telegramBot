@@ -3,12 +3,9 @@
 Главное, что здесь проверяется: свои адреса наружу не уходят, метка
 подсети сильнее геосервиса, и отсутствие геоданных не ломает раздел.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
-
+# Пути каталогов добавляет conftest.py. Переставлять их здесь нельзя:
+# bot/ впереди monitor/ меняет значение `import db` для всех последующих
+# тестов — монитор перестаёт видеть свой db.py.
 import geoip
 
 

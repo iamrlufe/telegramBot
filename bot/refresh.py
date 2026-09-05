@@ -1,11 +1,16 @@
 import json
 
-from pgconn import get_conn
 from ping_tools import ping_host
 from server_check import check_server, server_type
 from service_details import save_details_from_info
 from winrm_errors import parse_status
 from settings import SERVERS_FILE
+from metrics_store import (
+    save_disk_metrics,
+    save_server_status,
+    save_service_statuses,
+    save_process_metrics,
+)
 
 
 
@@ -25,96 +30,47 @@ def load_server(server_name: str) -> dict:
 
 
 def save_online(server_name: str, info: dict):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO server_status
-                (server_name, status, error, cpu_load, ram_total, ram_free, uptime_seconds)
-            VALUES (%s, 'online', NULL, %s, %s, %s, %s)
-            """,
-            (
-                server_name,
-                info["cpu_load"],
-                info["ram_total"],
-                info["ram_free"],
-                info["uptime_seconds"]
-            )
+    """Замеры разового опроса — теми же функциями, что и цикл монитора
+    (shared/metrics_store.py). Своя копия здесь писала каждый диск, службу и
+    процесс отдельным INSERT: на сервере 1С это полтора десятка запросов
+    вместо четырёх.
+
+    Порядок тот же, что в цикле: сначала статус, потом наборы. Каждая
+    функция пишет своей транзакцией — как и у монитора, отдельная кнопка
+    атомарности всей пачки не требует."""
+    save_server_status(
+        server_name, "online",
+        cpu_load=info["cpu_load"],
+        ram_total=info["ram_total"],
+        ram_free=info["ram_free"],
+        uptime_seconds=info["uptime_seconds"],
+    )
+    save_disk_metrics(server_name, [
+        (disk["Name"], float(disk["FreeGB"]), float(disk["UsedGB"]))
+        for disk in info["disks"]
+    ])
+    save_service_statuses(server_name, [
+        (
+            service["Name"],
+            service.get("Label") or service.get("DisplayName") or service["Name"],
+            service.get("Status", "unknown"),
         )
-
-        for disk in info["disks"]:
-            cur.execute(
-                """
-                INSERT INTO disk_metrics (server_name, disk_name, free_gb, used_gb)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (server_name, disk["Name"], float(disk["FreeGB"]), float(disk["UsedGB"]))
-            )
-
-        for service in info["services"]:
-            service_name = service.get("Name")
-            if not service_name:
-                continue
-            cur.execute(
-                """
-                INSERT INTO service_status (server_name, service_name, display_name, status)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (
-                    server_name,
-                    service_name,
-                    service.get("Label") or service.get("DisplayName") or service_name,
-                    service.get("Status", "unknown")
-                )
-            )
-
-        for metric_type, processes in (("cpu", info["top_cpu"]), ("memory", info["top_memory"])):
-            for process in processes:
-                cur.execute(
-                    """
-                    INSERT INTO process_metrics
-                        (server_name, metric_type, process_name, process_id,
-                         cpu_percent, cpu_seconds, memory_mb)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        server_name,
-                        metric_type,
-                        process.get("Name"),
-                        process.get("Id"),
-                        process.get("CpuPercent"),
-                        process.get("CpuSeconds"),
-                        process.get("MemoryMB")
-                    )
-                )
+        for service in info["services"] if service.get("Name")
+    ])
+    save_process_metrics(server_name, "cpu", info["top_cpu"])
+    save_process_metrics(server_name, "memory", info["top_memory"])
 
 
 def save_offline(server_name: str, status: str, error: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO server_status (server_name, status, error)
-            VALUES (%s, %s, %s)
-            """,
-            (server_name, status, error)
-        )
+    save_server_status(server_name, status, error)
 
 
 def save_ping_status(server_name: str, ok: bool):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO server_status (server_name, status, error)
-            VALUES (%s, %s, %s)
-            """,
-            (
-                server_name,
-                "online" if ok else "ping_down",
-                None if ok else "Ping не отвечает"
-            )
-        )
+    save_server_status(
+        server_name,
+        "online" if ok else "ping_down",
+        None if ok else "Ping не отвечает",
+    )
 
 
 def refresh_server(server_name: str):

@@ -4,12 +4,9 @@
 иначе: отказ блокировать адреса, которыми отрезаешь доступ себе, и сборка
 одного правила со списком вместо правила на адрес.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
-
+# Пути каталогов добавляет conftest.py. Переставлять их здесь нельзя:
+# bot/ впереди monitor/ меняет значение `import db` для всех последующих
+# тестов — монитор перестаёт видеть свой db.py.
 import firewall
 import firewall_bot
 

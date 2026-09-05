@@ -25,13 +25,16 @@ from mail_store import forget_server as forget_mail_data
 from backup_maintenance import run_backup_maintenance
 from db import (
     ensure_time_indexes,
+    get_disk_free_history,
+    cleanup_removed_servers,
+    cleanup_old_data
+)
+# Запись замеров — общая с ботом (кнопка «Обновить»), см. shared/metrics_store.py
+from metrics_store import (
     save_disk_metrics,
     save_server_status,
     save_service_statuses,
     save_process_metrics,
-    get_disk_free_history,
-    cleanup_removed_servers,
-    cleanup_old_data
 )
 from disk_forecast import free_space_trend
 from disk_health import purge_disk_health, save_disk_health

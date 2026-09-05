@@ -18,7 +18,18 @@ from backup_files import (
 )
 from backup_verify import path_str
 from backup_schedule import load_schedule_map, schedule_for, weekly_backup_missed
-from settings import SERVERS_FILE
+from settings import SERVERS_FILE, int_env
+
+# Окно для DISTINCT ON по backup_metrics и database_sizes. Без него запрос
+# читает всю историю (RETAIN_DAYS=30, запись каждые 5 минут на каждый путь)
+# ради последней строки на путь: Postgres не умеет index skip scan и проходит
+# индекс целиком. Неделя покрывает нормальную жизнь — сбор идёт каждый цикл.
+#
+# Окно не должно ПРЯТАТЬ данные: если за него попали не все настроенные пути
+# (сбор по какому-то из них давно не работает — а это ровно то, ради чего
+# раздел и открывают), запрос повторяется без окна. Дважды он ходит только
+# в этом редком случае.
+BACKUP_METRICS_WINDOW_DAYS = int_env("BACKUP_METRICS_WINDOW_DAYS", 7)
 
 SYSTEM_DATABASES = {"master", "model", "msdb", "tempdb"}
 COPY_DATABASE_MARKERS = ("copy", "коп", "backup", "bak", "old")
@@ -143,46 +154,62 @@ def get_latest_backup_metrics(include_missing: bool = False) -> list:
     сервер без настроенных бэкапов — то есть самая опасная ситуация была
     невидима. По умолчанию выключено, чтобы не менять остальных вызывающих.
     """
-    with get_conn() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT DISTINCT ON (server_name, backup_type, backup_path)
-                    server_name, backup_type, backup_path,
-                    file_count, oldest_file, newest_file,
-                    total_size_gb, disk_total_gb, disk_free_gb,
-                    status, error,
-                    created_at
-                FROM backup_metrics
-                ORDER BY server_name, backup_type, backup_path, created_at DESC
-            """)
-        except errors.UndefinedColumn:
-            conn.rollback()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT DISTINCT ON (server_name, backup_type, backup_path)
-                    server_name, backup_type, backup_path,
-                    file_count, oldest_file, newest_file,
-                    total_size_gb, disk_total_gb, disk_free_gb,
-                    NULL::TEXT AS status,
-                    NULL::TEXT AS error,
-                    created_at
-                FROM backup_metrics
-                ORDER BY server_name, backup_type, backup_path, created_at DESC
-            """)
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-
-    # Пути, переименованные/удалённые в servers.json, оставляют в БД старые
-    # строки навечно (monitor их больше не опрашивает, но и не удаляет) —
-    # без этого фильтра они годами висят в дайджесте как "устарел"/"пусто".
-    # Источник истины — текущий конфиг: путь показываем, только если он
-    # там всё ещё есть.
+    # Источник истины по составу путей — конфиг; он же решает, полон ли
+    # ответ окна (см. BACKUP_METRICS_WINDOW_DAYS), поэтому читается первым.
     valid_paths = {
         (server, item["backup_type"], item["backup_path"])
         for server, items in get_config_backup_targets().items()
         for item in items
     }
+
+    def _query(cur, status_cols: str, missing: tuple = None) -> list:
+        """Без missing — последние строки за окно; с missing — точечно те
+        пути, которых в окне не оказалось (поиск по индексу, не по всей
+        истории)."""
+        where = ("WHERE (server_name, backup_type, backup_path) IN %s"
+                 if missing else
+                 "WHERE created_at >= NOW() - make_interval(days => %s)")
+        cur.execute(f"""
+            SELECT DISTINCT ON (server_name, backup_type, backup_path)
+                server_name, backup_type, backup_path,
+                file_count, oldest_file, newest_file,
+                total_size_gb, disk_total_gb, disk_free_gb,
+                {status_cols},
+                created_at
+            FROM backup_metrics
+            {where}
+            ORDER BY server_name, backup_type, backup_path, created_at DESC
+        """, (missing,) if missing else (BACKUP_METRICS_WINDOW_DAYS,))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def _seen(rows: list) -> set:
+        return {(r["server_name"], r["backup_type"], r["backup_path"]) for r in rows}
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # status/error появились не сразу: на базе, поднятой до них, запрос
+        # падает UndefinedColumn — тогда те же строки берутся без них.
+        status_cols = "status, error"
+        try:
+            rows = _query(cur, status_cols)
+        except errors.UndefinedColumn:
+            conn.rollback()
+            cur = conn.cursor()
+            status_cols = "NULL::TEXT AS status,\n                NULL::TEXT AS error"
+            rows = _query(cur, status_cols)
+
+        missing = tuple(sorted(valid_paths - _seen(rows)))
+        if missing:
+            # Добор идёт строго по недостающим ключам: строка, уже пришедшая
+            # из окна, не должна попасть в ответ дважды.
+            rows += [row for row in _query(cur, status_cols, missing=missing)
+                     if (row["server_name"], row["backup_type"],
+                         row["backup_path"]) in set(missing)]
+
+    # Пути, переименованные/удалённые в servers.json, оставляют в БД старые
+    # строки навечно (monitor их больше не опрашивает, но и не удаляет) —
+    # без этого фильтра они годами висят в дайджесте как "устарел"/"пусто".
     rows = [
         row for row in rows
         if (row["server_name"], row["backup_type"], row["backup_path"]) in valid_paths
@@ -213,57 +240,77 @@ def get_latest_backup_metrics(include_missing: bool = False) -> list:
 
 
 def get_backup_report(server_name: str) -> list:
-    """Последние метрики конкретного сервера."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT DISTINCT ON (backup_type, backup_path)
-                    backup_type, backup_path,
-                    file_count, oldest_file, newest_file,
-                    total_size_gb, disk_total_gb, disk_free_gb,
-                    status, error
-                FROM backup_metrics
-                WHERE server_name = %s
-                ORDER BY backup_type, backup_path, created_at DESC
-            """, (server_name,))
-        except errors.UndefinedColumn:
-            conn.rollback()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT DISTINCT ON (backup_type, backup_path)
-                    backup_type, backup_path,
-                    file_count, oldest_file, newest_file,
-                    total_size_gb, disk_total_gb, disk_free_gb,
-                    NULL::TEXT AS status,
-                    NULL::TEXT AS error
-                FROM backup_metrics
-                WHERE server_name = %s
-                ORDER BY backup_type, backup_path, created_at DESC
-            """, (server_name,))
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    """Последние метрики конкретного сервера.
 
+    Окно и добор недостающих путей — как в get_latest_backup_metrics:
+    сначала быстрый запрос за BACKUP_METRICS_WINDOW_DAYS, потом точечно те
+    пути, по которым в окне ничего не нашлось.
+    """
     # См. get_latest_backup_metrics — те же старые пути после переименования в конфиге.
     valid_paths = {
         (item["backup_type"], item["backup_path"])
         for item in get_config_backup_targets(server_name).get(server_name, [])
     }
+
+    def _query(cur, status_cols: str, missing: tuple = None) -> list:
+        where = ("AND (backup_type, backup_path) IN %s" if missing
+                 else "AND created_at >= NOW() - make_interval(days => %s)")
+        cur.execute(f"""
+            SELECT DISTINCT ON (backup_type, backup_path)
+                backup_type, backup_path,
+                file_count, oldest_file, newest_file,
+                total_size_gb, disk_total_gb, disk_free_gb,
+                {status_cols}
+            FROM backup_metrics
+            WHERE server_name = %s
+            {where}
+            ORDER BY backup_type, backup_path, created_at DESC
+        """, (server_name, missing if missing else BACKUP_METRICS_WINDOW_DAYS))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        status_cols = "status, error"
+        try:
+            rows = _query(cur, status_cols)
+        except errors.UndefinedColumn:
+            conn.rollback()
+            cur = conn.cursor()
+            status_cols = "NULL::TEXT AS status,\n                NULL::TEXT AS error"
+            rows = _query(cur, status_cols)
+
+        missing = tuple(sorted(
+            valid_paths - {(r["backup_type"], r["backup_path"]) for r in rows}))
+        if missing:
+            rows += [row for row in _query(cur, status_cols, missing=missing)
+                     if (row["backup_type"], row["backup_path"]) in set(missing)]
+
     return [row for row in rows if (row["backup_type"], row["backup_path"]) in valid_paths]
 
 
 def get_db_sizes() -> list:
-    """Последние данные о размерах БД по всем серверам."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
+    """Последние данные о размерах БД по всем серверам.
+
+    Состав баз конфигом не описан (их приносит сам сбор), поэтому добрать
+    недостающее точечно, как в метриках бэкапов, не по чему: правило проще —
+    пусто в окне, значит сбор молчит дольше BACKUP_METRICS_WINDOW_DAYS, и
+    запрос повторяется без ограничения, чтобы список не исчез совсем.
+    """
+    def _query(cur, windowed: bool) -> list:
+        cur.execute(f"""
             SELECT DISTINCT ON (server_name, database_name)
                 server_name, database_name, size_gb
             FROM database_sizes
+            {"WHERE collected_at >= NOW() - make_interval(days => %s)" if windowed else ""}
             ORDER BY server_name, database_name, collected_at DESC
-        """)
+        """, (BACKUP_METRICS_WINDOW_DAYS,) if windowed else ())
         cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        rows = _query(cur, windowed=True) or _query(cur, windowed=False)
         return [
             row for row in rows
             if is_visible_database_name(row["database_name"])

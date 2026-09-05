@@ -28,11 +28,9 @@ def bot_main():
     os.environ.setdefault("TELEGRAM_ALLOWED_USER_ID", "1")
 
     saved_db = sys.modules.get("db")
-    for sub in ("shared", "bot"):
-        path = str(ROOT / sub)
-        if path not in sys.path:
-            sys.path.insert(0, path)
-
+    # sys.path трогать нельзя: conftest уже добавил shared/bot/monitor, и
+    # перестановка bot/ вперёд меняла бы значение `import db` для всех
+    # последующих тестов — монитор переставал видеть свой db.py.
     spec = importlib.util.spec_from_file_location("bot_db", ROOT / "bot" / "db.py")
     bot_db = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bot_db)

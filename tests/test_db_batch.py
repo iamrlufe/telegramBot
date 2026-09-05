@@ -1,5 +1,5 @@
 """
-Пакетная запись метрик (monitor/db.py).
+Пакетная запись метрик (shared/metrics_store.py).
 
 Цикл опроса пишет метрики по всем серверам каждые 5 минут. Раньше каждый диск,
 служба и процесс стоили отдельного INSERT; здесь проверяем, что теперь на набор
@@ -9,7 +9,7 @@ from contextlib import contextmanager
 
 import pytest
 
-import db
+import metrics_store as db
 
 
 class FakeCursor:
