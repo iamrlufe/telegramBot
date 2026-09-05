@@ -22,7 +22,7 @@ from winrm_client import run_ps, ps_json
 from mssql_log import read_backup_history
 from backup_copy import (
     TRANSFER_STATE_FILE,
-    check_process_ps,
+    check_run_ps,
     copy_settings,
     launch_copy,
     load_servers,
@@ -32,6 +32,7 @@ from backup_copy import (
     pick_ready_backups,
     next_to_send,
     now_local as _now,
+    run_outcome,
     run_verdict,
     save_state,
     script_for,
@@ -49,11 +50,36 @@ HISTORY_LIMIT = 20
 
 # ─── Шаги цикла ──────────────────────────────────────────────
 
-def _process_alive(server: dict, pid: int) -> bool:
-    raw = run_ps(server["host"], check_process_ps(pid),
+def _check_run(server: dict, run: dict) -> dict:
+    """Чем закончился рейс: {state, code, tail}. См. run_outcome."""
+    raw = run_ps(server["host"], check_run_ps(run),
                  server.get("username"), server.get("password"))
-    data = ps_json(raw) or {}
-    return bool(data.get("Alive"))
+    return run_outcome(ps_json(raw) or {}, run)
+
+
+def _alert(name: str, key_level: str, text: str, ack_key: str):
+    """Тревога о копировании с обычной защитой от повторов."""
+    if is_muted(name):
+        return
+    key = f"{name}:copy"
+    alert_state = load_json(TRANSFER_STATE_FILE + ".alerts")
+    if not alert_due(alert_state, key, key_level):
+        return
+    mark_alert_sent(alert_state, key, key_level)
+    save_json(TRANSFER_STATE_FILE + ".alerts", alert_state)
+    send_or_defer(text, ack_key=ack_key)
+
+
+def _run_head(name: str, run: dict) -> str:
+    return (f"🖥 {name}\n"
+            f"💾 {run.get('db') or 'копия'} ({type_label(run.get('type'))})"
+            + (f", {run['size_gb']} ГБ" if run.get("size_gb") else "") + "\n"
+            f"📜 {run.get('script') or '?'}\n"
+            f"▶️ Запущено: {run.get('started')}\n")
+
+
+def _tail_block(tail: str) -> str:
+    return f"\n📄 Конец журнала:\n{tail[-800:]}\n" if tail else ""
 
 
 def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
@@ -64,50 +90,66 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
     now = _now()
 
     try:
-        alive = _process_alive(server, run["pid"])
+        outcome = _check_run(server, run)
     except Exception as e:
         # Сервер не ответил: сам по себе это не авария копирования —
         # процесс может идти. Ждём следующего цикла, но не вечно: таймаут
         # ниже отработает и без связи.
-        print(f"[copy] {name}: не проверить процесс {run['pid']}: {e}", flush=True)
-        alive = True
+        print(f"[copy] {name}: не проверить рейс {run.get('pid')}: {e}", flush=True)
+        outcome = {"state": "running", "code": None, "tail": ""}
 
-    if alive:
-        if run_verdict(run, settings, now) == "timeout" and not is_muted(name):
-            key = f"{name}:copy"
-            alert_state = load_json(TRANSFER_STATE_FILE + ".alerts")
-            if alert_due(alert_state, key, "timeout"):
-                mark_alert_sent(alert_state, key, "timeout")
-                save_json(TRANSFER_STATE_FILE + ".alerts", alert_state)
-                minutes = round((now - datetime.strptime(
-                    run["started"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60)
-                send_or_defer(
-                    f"🆘🆘 КОПИРОВАНИЕ ЗАВИСЛО 🆘🆘\n\n"
-                    f"🖥 {name}\n"
-                    f"💾 {run.get('db')} ({type_label(run.get('type'))}), "
-                    f"{run.get('size_gb') or '?'} ГБ\n\n"
-                    f"▶️ Запущено: {run['started']}\n"
-                    f"⏰ Идёт уже {minutes} мин при пороге "
-                    f"{settings['timeout_minutes']} мин\n\n"
-                    f"‼️ Проверьте копирование на сервере вручную!",
-                    ack_key=f"backup_copy_stuck:{name}",
-                )
+    if outcome["state"] == "running":
+        if run_verdict(run, settings, now) == "timeout":
+            minutes = round((now - datetime.strptime(
+                run["started"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60)
+            _alert(
+                name, "timeout",
+                "🆘🆘 КОПИРОВАНИЕ ЗАВИСЛО 🆘🆘\n\n"
+                + _run_head(name, run)
+                + f"⏰ Идёт уже {minutes} мин при пороге "
+                  f"{settings['timeout_minutes']} мин\n"
+                + _tail_block(outcome["tail"])
+                + "\n‼️ Проверьте копирование на сервере вручную!",
+                ack_key=f"backup_copy_stuck:{name}",
+            )
         return False
 
-    # Процесс завершился. Успех это или обрыв — по самому процессу не
-    # видно (у SFTP оборванная загрузка выглядит успешной), поэтому здесь
-    # мы лишь снимаем «в дороге» и запоминаем, сколько копия ехала.
-    # Дальше за дело берётся обычная проверка каталога на приёмнике.
     started = datetime.strptime(run["started"], "%Y-%m-%d %H:%M:%S")
     minutes = round((now - started).total_seconds() / 60)
-    entry["last_run"] = dict(run, ended=_marker(now), minutes=minutes)
-    # Отметка своя на каждый тип: увезли разностную — полная остаётся
-    # в очереди и поедет следующим циклом.
-    if run.get("source_finished"):
-        mark_sent(entry, run.get("type"), run["source_finished"])
+    entry["last_run"] = dict(run, ended=_marker(now), minutes=minutes,
+                             state=outcome["state"], code=outcome["code"])
+
+    if outcome["state"] == "ok":
+        # Скрипт отработал без ошибки. Доехал ли файл целиком — вопрос уже
+        # к приёмнику: у SFTP оборванная загрузка выглядит успешной, это
+        # ловит обычная проверка каталога.
+        if run.get("source_finished"):
+            # Отметка своя на каждый тип: увезли разностную — полная
+            # остаётся в очереди и поедет следующим циклом.
+            mark_sent(entry, run.get("type"), run["source_finished"])
+        print(f"[copy] {name}: копирование закончилось за {minutes} мин",
+              flush=True)
+    else:
+        # Неудачный рейс НЕ отмечаем отправленным: копия осталась дома,
+        # и следующий цикл обязан попробовать снова.
+        reason = (f"скрипт вернул код {outcome['code']}"
+                  if outcome["state"] == "failed" else
+                  "процесс исчез, не дописав код возврата "
+                  "(убит или сервер перезагрузился)")
+        _alert(
+            name, "failed",
+            "🆘🆘 КОПИРОВАНИЕ НЕ УДАЛОСЬ 🆘🆘\n\n"
+            + _run_head(name, run)
+            + f"⛔ Закончилось за {minutes} мин: {reason}\n"
+            + _tail_block(outcome["tail"])
+            + "\n‼️ Копия осталась на сервере — проверьте скрипт "
+              "и запустите копирование вручную!",
+            ack_key=f"backup_copy_failed:{name}",
+        )
+        print(f"[copy] {name}: рейс не удался — {reason}", flush=True)
+
     entry["run"] = None
     state[state_key] = entry
-    print(f"[copy] {name}: копирование закончилось за {minutes} мин", flush=True)
     return True
 
 

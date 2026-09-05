@@ -10,6 +10,7 @@ import pytest
 
 from backup_copy import (
     copy_settings,
+    run_outcome,
     launch_script_ps,
     mark_sent,
     next_to_send,
@@ -224,22 +225,82 @@ def test_timeout_is_counted_from_start():
 # ─── Запуск скрипта ──────────────────────────────────────────
 
 def test_ps1_runs_through_powershell():
-    script = launch_script_ps("C:\\Scripts\\copy.ps1")
+    script = launch_script_ps("C:\\Scripts\\copy.ps1", "id")
     assert "powershell.exe" in script and "Bypass" in script
 
 
 def test_launch_returns_pid_immediately():
     """Ждать окончания нельзя: сессия WinRM живёт минуты, копия — часы."""
-    assert "-PassThru" in launch_script_ps("C:\\a.bat")
-    assert "Pid" in launch_script_ps("C:\\a.bat")
+    text = launch_script_ps("C:\\a.bat", "id")
+    assert "Win32_Process" in text and "Pid" in text
+
+
+def test_launch_writes_log_and_exit_code():
+    """Одного PID мало: упавший на первой строке скрипт выглядел бы как
+    идущая копия. Код возврата и журнал — единственный честный ответ."""
+    text = launch_script_ps("C:\\a.bat", "20260905-102701-I")
+    assert "%ERRORLEVEL%" in text
+    assert "20260905-102701-I.log" in text
+    assert "20260905-102701-I.done" in text
 
 
 def test_quotes_do_not_break_the_script():
-    assert "''" in launch_script_ps("C:\\Scripts\\it's copy.bat")
+    assert "''" in launch_script_ps("C:\\Scripts\\it's copy.bat", "id")
+
+
+def test_quotes_in_path_are_refused():
+    """Кавычка в пути разъехалась бы с перенаправлением вывода."""
+    with pytest.raises(ValueError):
+        launch_script_ps('C:\\a"b.cmd', "id")
 
 
 def test_type_label_is_readable():
     assert type_label("I") == "разностная"
+
+
+# ─── Чем закончился рейс ─────────────────────────────────────
+
+RUN = {"pid": 10848, "started": "2026-09-05 10:27:01",
+       "log": "C:\\log", "done": "C:\\done", "type": "D"}
+
+
+def test_running_while_process_lives_and_no_exit_code():
+    out = run_outcome({"Alive": True, "Code": None, "Tail": ""}, RUN)
+    assert out["state"] == "running"
+
+
+def test_exit_code_zero_is_success():
+    out = run_outcome({"Alive": False, "Code": "0", "Tail": "ok"}, RUN)
+    assert out["state"] == "ok" and out["code"] == 0
+
+
+def test_nonzero_exit_code_is_failure():
+    """Главная поломка, ради которой это писалось: скрипт падал на первой
+    строке, а бот показывал «идёт копирование»."""
+    out = run_outcome({"Alive": False, "Code": "1", "Tail": "Access denied"},
+                      RUN)
+    assert out["state"] == "failed" and out["code"] == 1
+    assert "Access denied" in out["tail"]
+
+
+def test_exit_code_wins_over_live_process():
+    """PID переиспользуются: под тем же номером через сутки работает
+    что-то чужое. Код возврата честнее."""
+    out = run_outcome({"Alive": True, "Code": "0", "Tail": ""}, RUN)
+    assert out["state"] == "ok"
+
+
+def test_vanished_without_exit_code_is_lost():
+    out = run_outcome({"Alive": False, "Code": None, "Tail": ""}, RUN)
+    assert out["state"] == "lost"
+
+
+def test_old_run_without_marker_still_ends_by_pid():
+    """Рейсы, заведённые до появления файла-метки, знают только PID —
+    после обновления они не должны зависнуть навсегда."""
+    old_run = {"pid": 10848, "started": "2026-09-05 10:27:01"}
+    assert run_outcome({"Alive": False}, old_run)["state"] == "ok"
+    assert run_outcome({"Alive": True}, old_run)["state"] == "running"
 
 
 # ─── Ручной запуск из бота ───────────────────────────────────
@@ -299,3 +360,22 @@ def test_manual_start_keeps_last_finished(monkeypatch, tmp_path):
     backup_copy.start_copy_now("sql-region")
 
     assert backup_copy.load_state()["sql-region"]["last_finished"] == "2026-09-05 03:30:00"
+
+
+def test_reset_forgets_a_stuck_run(monkeypatch, tmp_path):
+    """Процесс убили руками — иначе сервер навсегда «копирует», и
+    следующая копия не поедет."""
+    _wire_state(monkeypatch, tmp_path,
+                {"sql-region": {"run": {"pid": 7, "started": "2026-09-05 10:27:01"}}})
+
+    backup_copy.clear_run("sql-region")
+
+    entry = backup_copy.load_state()["sql-region"]
+    assert entry["run"] is None
+    assert entry["last_run"]["state"] == "reset"
+
+
+def test_reset_refuses_when_nothing_runs(monkeypatch, tmp_path):
+    _wire_state(monkeypatch, tmp_path, {"sql-region": {}})
+    with pytest.raises(RuntimeError):
+        backup_copy.clear_run("sql-region")

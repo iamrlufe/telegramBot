@@ -29,7 +29,7 @@ import tempfile
 from datetime import datetime, timedelta
 
 from settings import SERVERS_FILE, ALMATY, int_env
-from winrm_client import run_ps, ps_json
+from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
 
 
 # Типы копий в msdb: D — полная, I — разностная, L — журнал транзакций.
@@ -261,34 +261,112 @@ def run_verdict(run: dict, settings: dict, now: datetime) -> str:
     return "running"
 
 
-def launch_script_ps(script: str) -> str:
+# Куда складывать журнал запуска и код возврата. Каталог общий и
+# предсказуемый: логи должны переживать перезапуск бота и открываться
+# на сервере руками, когда захочется посмотреть глазами.
+WORK_DIR_PS = "Join-Path $env:ProgramData 'AgroTNKbot\\copy'"
+
+# Сколько строк журнала показывать в алерте. Больше — простыня в
+# Telegram, меньше — не видно самой ошибки, она обычно в конце.
+LOG_TAIL_LINES = 15
+
+
+def run_id(now: datetime = None, btype: str = None) -> str:
+    """Имя пары файлов «журнал + код возврата» для одного рейса."""
+    now = now or datetime.now()
+    return f"{now.strftime('%Y%m%d-%H%M%S')}-{(btype or 'X').upper()[:1]}"
+
+
+def _invocation(script: str) -> str:
+    """Чем запускать: .ps1 — powershell, всё остальное — cmd напрямую."""
+    if script.lower().endswith(".ps1"):
+        return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{script}"'
+    return f'call "{script}"'
+
+
+def launch_script_ps(script: str, ident: str) -> str:
     """PowerShell, который запускает скрипт копирования и СРАЗУ отдаёт PID.
 
     Ждать окончания нельзя: сессия WinRM живёт минуты, а копирование
-    большой базы идёт часами. Поэтому процесс отвязывается, а следим за
-    ним по PID на следующих циклах.
+    большой базы идёт часами. Поэтому процесс отвязывается — но одного
+    PID мало: по нему видно только «что-то запущено». Скрипт, упавший на
+    первой же строке (нет прав, нет сессии WinSCP, не смонтирован диск),
+    для наблюдателя за PID выглядел бы точно так же, как идущая копия.
+
+    Поэтому запуск идёт через cmd с перенаправлением: весь вывод — в
+    журнал, код возврата — в файл-метку. Метка и есть ответ на вопрос
+    «сработало ли», а журнал — на вопрос «почему нет».
+
+    Win32_Process.Create вместо Start-Process намеренно: он принимает одну
+    строку командной строки целиком, и её не переписывает разбор массива
+    аргументов — с перенаправлениями и кавычками это единственный
+    предсказуемый способ.
     """
-    quoted = script.replace("'", "''")
+    if '"' in script:
+        raise ValueError("в пути к скрипту не должно быть кавычек")
+    invoke = _invocation(script).replace("'", "''")
     return f"""
-    $cmd = '{quoted}'
-    $ext = [System.IO.Path]::GetExtension(($cmd -split '"')[0].Trim()).ToLower()
-    if ($ext -eq '.ps1') {{
-        $p = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
-             -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$cmd
-    }} else {{
-        $p = Start-Process -FilePath 'cmd.exe' -PassThru -WindowStyle Hidden `
-             -ArgumentList '/c',$cmd
+    $dir = {WORK_DIR_PS}
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $log = Join-Path $dir '{ident}.log'
+    $done = Join-Path $dir '{ident}.done'
+    if (Test-Path -LiteralPath $done) {{ Remove-Item -LiteralPath $done -Force }}
+    $line = 'cmd.exe /c {invoke} >> "' + $log + '" 2>&1 & echo %ERRORLEVEL%> "' + $done + '"'
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $line }}
+    ConvertTo-Json @{{ Pid = $r.ProcessId; Ret = $r.ReturnValue; Log = $log; Done = $done }} -Compress
+    """
+
+
+def check_run_ps(run: dict) -> str:
+    """Что с рейсом: жив ли процесс, есть ли код возврата, что в журнале.
+
+    Код возврата важнее живого процесса: PID переиспользуются, и через
+    сутки под тем же номером работает что-то чужое. Появился файл-метка —
+    рейс закончился, и дальше вопрос только в том, чем именно.
+    """
+    pid = int(run.get("pid") or 0)
+    done = str(run.get("done") or "").replace("'", "''")
+    log = str(run.get("log") or "").replace("'", "''")
+    return PS_OUT_B64_HELPER + f"""
+    $alive = [bool](Get-Process -Id {pid} -ErrorAction SilentlyContinue)
+    $code = $null
+    $tail = ''
+    if ('{done}' -and (Test-Path -LiteralPath '{done}')) {{
+        $code = (Get-Content -LiteralPath '{done}' -Raw -ErrorAction SilentlyContinue).Trim()
     }}
-    ConvertTo-Json @{{ Pid = $p.Id; Started = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }} -Compress
+    if ('{log}' -and (Test-Path -LiteralPath '{log}')) {{
+        $tail = ((Get-Content -LiteralPath '{log}' -Tail {LOG_TAIL_LINES} -Encoding Oem -ErrorAction SilentlyContinue) -join "`n")
+    }}
+    Out-B64 @{{ Alive = $alive; Code = $code; Tail = $tail }}
     """
 
 
-def check_process_ps(pid: int) -> str:
-    """Жив ли запущенный процесс копирования."""
-    return f"""
-    $p = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue
-    ConvertTo-Json @{{ Alive = [bool]$p }} -Compress
+def run_outcome(data: dict, run: dict) -> dict:
+    """Вердикт по ответу сервера: {state, code, tail}.
+
+    state: 'running' — рейс идёт; 'ok' — закончился успешно; 'failed' —
+    закончился с ошибкой; 'lost' — процесса нет, а кода возврата не
+    появилось (скрипт убили или сервер перезагрузили).
     """
+    data = data or {}
+    tail = (data.get("Tail") or "").strip()
+    code = data.get("Code")
+    if code is not None and str(code).strip() != "":
+        try:
+            value = int(str(code).strip())
+        except ValueError:
+            value = None
+        return {"state": "ok" if value == 0 else "failed",
+                "code": value, "tail": tail}
+
+    if data.get("Alive"):
+        return {"state": "running", "code": None, "tail": tail}
+
+    # Старые рейсы (заведённые до появления файла-метки) знают только PID.
+    # Для них «процесса нет» — по-прежнему единственный признак конца.
+    if not run.get("done"):
+        return {"state": "ok", "code": None, "tail": tail}
+    return {"state": "lost", "code": None, "tail": tail}
 
 
 def type_label(btype: str) -> str:
@@ -380,10 +458,17 @@ def launch_copy(server: dict, settings: dict, ready: dict = None,
     script = script_for(settings, (ready or {}).get("type")) or _only_script(settings)
     if not script:
         raise RuntimeError("не задан скрипт копирования для этого типа копии")
-    raw = run_ps(server["host"], launch_script_ps(script),
+    ident = run_id(now_local(), (ready or {}).get("type"))
+    raw = run_ps(server["host"], launch_script_ps(script, ident),
                  server.get("username"), server.get("password"))
     data = ps_json(raw) or {}
     pid = data.get("Pid")
+    # ReturnValue Win32_Process.Create: 0 — процесс создан, всё прочее —
+    # отказ (2 нет прав, 8 неизвестная ошибка, 9 путь не найден, 21 неверный
+    # параметр). Без этой проверки отказ выглядел бы как удачный запуск.
+    if data.get("Ret") not in (0, None):
+        raise RuntimeError(f"сервер отказался запускать скрипт "
+                           f"(Win32_Process.Create вернул {data['Ret']})")
     if not pid:
         raise RuntimeError("сервер не вернул PID запущенного скрипта")
     return {
@@ -395,6 +480,9 @@ def launch_copy(server: dict, settings: dict, ready: dict = None,
         "type": (ready or {}).get("type"),
         "size_gb": (ready or {}).get("size_gb"),
         "script": script,
+        "log": data.get("Log"),
+        "done": data.get("Done"),
+        "ident": ident,
         "by": by,
     }
 
@@ -405,6 +493,26 @@ def _only_script(settings: dict) -> str:
     имел в виду, нельзя."""
     scripts = list(dict.fromkeys((settings.get("scripts") or {}).values()))
     return scripts[0] if len(scripts) == 1 else ""
+
+
+def clear_run(server_name: str) -> dict:
+    """Забыть идущий рейс. Процесс на сервере при этом НЕ убивается —
+    бот его не рождал управляемым и убивать чужую работу не должен.
+
+    Нужна, когда состояние разошлось с действительностью: процесс убили
+    руками, сервер перезагрузили, PID переиспользован. Без сброса сервер
+    остался бы «вечно копирующим», и следующая копия не поехала бы.
+    """
+    state = load_state()
+    entry = state.get(server_name) or {}
+    run = entry.get("run")
+    if not run:
+        raise RuntimeError("для этого сервера копирование не числится идущим")
+    entry["last_run"] = dict(run, ended=marker(now_local()), state="reset")
+    entry["run"] = None
+    state[server_name] = entry
+    save_state(state)
+    return run
 
 
 def start_copy_now(server_name: str, by: str = "бот", btype: str = None) -> dict:

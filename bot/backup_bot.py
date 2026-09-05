@@ -33,6 +33,7 @@ from backup_bot_db import (
 from charts import build_growth_chart, build_backup_freshness_chart, build_backup_volume_chart
 from backup_files import delete_backup_files, deletable_backup_targets, NO_DELETE_TYPES
 from backup_copy import (
+    clear_run,
     copy_servers,
     copy_settings,
     find_server,
@@ -524,11 +525,19 @@ def _copy_server_lines(server: dict, entry: dict) -> list:
         minutes = last.get("minutes")
         by = last.get("by") or "монитор"
         what = f" [{type_label(last['type'])}]" if last.get("type") else ""
+        icon, verdict = {
+            "failed": ("❌", f", код возврата {last.get('code')}"),
+            "lost": ("❌", ", процесс исчез"),
+            "reset": ("⏹", ", сброшен вручную"),
+        }.get(last.get("state"), ("✅", ""))
         lines.append(
-            f"   ✅ последний рейс{what}: {last.get('ended')}"
+            f"   {icon} последний рейс{what}: {last.get('ended')}"
             + (f", ехал {minutes} мин" if minutes is not None else "")
+            + verdict
             + f" (запустил {by})"
         )
+        if last.get("log"):
+            lines.append(f"   📄 журнал: {last['log']}")
     else:
         lines.append("   ⏸ рейсов ещё не было")
     return lines
@@ -607,7 +616,59 @@ async def show_copy_status(query, context, page: int = 0):
     # По кнопке в ряд, если типов больше двух: подписи длинные
     rows[-1:-1] = ([run_row] if len(run_row) <= 2
                    else [[button] for button in run_row])
+
+    # Рейс, который числится идущим: если он завис или его убили руками,
+    # без сброса следующая копия не поедет — бот считает сервер занятым.
+    for name in names:
+        if not (state.get(name) or {}).get("run"):
+            continue
+        data = f"backup_copy_reset:{name}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            continue
+        rows.insert(-1, [InlineKeyboardButton(
+            f"⏹ Сбросить рейс{'' if len(names) == 1 else ' · ' + name}",
+            callback_data=data)])
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def ask_copy_reset(query, context, server_name: str):
+    state = await asyncio.to_thread(load_copy_state)
+    run = (state.get(server_name) or {}).get("run") or {}
+    await safe_edit_message(
+        query,
+        f"⏹ Сбросить рейс на {server_name}?\n\n"
+        f"▶️ Числится идущим с {run.get('started')} (PID {run.get('pid')})\n"
+        f"📜 {run.get('script') or '?'}\n\n"
+        f"Бот перестанет считать сервер занятым и сможет запускать "
+        f"копирование снова.\n"
+        f"⚠️ Процесс на сервере при этом НЕ убивается: если он всё-таки "
+        f"работает, получится два копирования разом. Убедитесь, что в "
+        f"диспетчере задач его нет.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, сбросить",
+                                 callback_data=f"backup_copy_resetgo:{server_name}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="backup_copy"),
+        ]])
+    )
+
+
+async def do_copy_reset(query, context, server_name: str):
+    if not can_delete_backups(query):
+        await safe_edit_message(
+            query,
+            "⛔ Нет прав на сброс рейса.\n\nОбратитесь к администратору.",
+            reply_markup=back_kb()
+        )
+        return
+    try:
+        run = await asyncio.to_thread(clear_run, server_name)
+    except Exception as e:
+        await safe_edit_message(query, f"❌ {str(e)[:300]}", reply_markup=back_kb())
+        return
+
+    audit.log_config_change(query.from_user, "copy_reset", server_name,
+                            f"pid={run.get('pid')}")
+    await show_copy_status(query, context)
 
 
 async def show_copy_run_servers(query, context, page: int = 0):
@@ -1354,6 +1415,12 @@ async def backup_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("backup_copy_run:"):
         server_name = data.split(":", 1)[1]
         await do_copy_run(query, context, server_name)
+
+    elif data.startswith("backup_copy_reset:"):
+        await ask_copy_reset(query, context, data.split(":", 1)[1])
+
+    elif data.startswith("backup_copy_resetgo:"):
+        await do_copy_reset(query, context, data.split(":", 1)[1])
 
     elif data.startswith("backup_copy_go:"):
         server_name, btype = data[len("backup_copy_go:"):].rsplit(":", 1)
