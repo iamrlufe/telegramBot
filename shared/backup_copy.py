@@ -624,6 +624,53 @@ def _only_script(settings: dict) -> str:
     return scripts[0] if len(scripts) == 1 else ""
 
 
+# ─── Сколько уже доехало ─────────────────────────────────────
+
+def target_settings(server: dict) -> dict:
+    """Куда этот источник возит копии: сервер-приёмник и корень на нём.
+
+    Нужно ровно для одного — показать процент. У SFTP нет обратной связи
+    о ходе передачи: сколько доехало, знает только приёмник, и спросить
+    его можно, лишь зная, где там лежит файл.
+    """
+    name = str(server.get("copy_target") or "").strip()
+    root = str(server.get("copy_target_root") or "").strip()
+    if not name or not root:
+        return None
+    return {"server": name, "root": root.rstrip("\\")}
+
+
+def target_path(root: str, remote: str) -> str:
+    """`/new_pro_akt/FULL/файл.bak` + корень → путь на приёмнике."""
+    tail = str(remote or "").replace("/", "\\").lstrip("\\")
+    return f"{root}\\{tail}" if tail else ""
+
+
+def file_size_ps(path: str) -> str:
+    """Размер файла на приёмнике. Заодно смотрим `.filepart`: WinSCP
+    пишет туда, пока файл не доехал, и переименовывает в конце."""
+    quoted = str(path).replace("'", "''")
+    return PS_OUT_B64_HELPER + f"""
+    $size = $null
+    foreach ($p in @('{quoted}', '{quoted}.filepart')) {{
+        if (Test-Path -LiteralPath $p) {{
+            $size = (Get-Item -LiteralPath $p -Force).Length
+            break
+        }}
+    }}
+    Out-B64 @{{ Size = $size }}
+    """
+
+
+def remote_file_size(server: dict, path: str):
+    """Сколько байт уже лежит на приёмнике. None — файла ещё нет."""
+    raw = run_ps(server["host"], file_size_ps(path),
+                 server.get("username"), server.get("password"))
+    data = ps_json(raw) or {}
+    size = data.get("Size")
+    return int(size) if size is not None else None
+
+
 # ─── Чтение журналов скрипта с сервера ───────────────────────
 
 def read_tail_ps(path: str, tail_bytes: int = None) -> str:

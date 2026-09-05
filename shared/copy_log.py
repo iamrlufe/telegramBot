@@ -40,6 +40,7 @@ LINE_RE = re.compile(
 # не учитываются, а посмотреть журнал целиком можно кнопкой.
 MARKERS = {
     "found": "Найден файл",
+    "remote": "Remote:",
     "size": "Локальный размер",
     "skip": "SKIP",
     "upload": "Режим: UPLOAD",
@@ -145,7 +146,8 @@ def parse_common_log(text: str) -> dict:
         if current is None:
             current = {"name": database, "status": "unknown", "file": None,
                        "size_gb": None, "attempts": 0, "errors": [],
-                       "uploading": False, "started_at": None,
+                       "uploading": False, "remote": None, "bytes": None,
+                       "started_at": None,
                        "ended_at": None, "done_at": None, "exit_code": None}
             by_name[database] = current
             summary["databases"].append(current)
@@ -177,10 +179,15 @@ def _apply_message(entry: dict, message: str, when=None):
         if code and code != "0":
             entry["status"] = "failed"
             entry["uploading"] = False
+    elif message.startswith(MARKERS["remote"]):
+        # Путь на приёмнике, как его видит SFTP: /база/тип/файл.bak.
+        # По нему считается процент — размер растущего файла там.
+        entry["remote"] = message.split(":", 1)[-1].strip()
     elif message.startswith(MARKERS["found"]):
         entry["file"] = message.split(":", 1)[-1].strip()
     elif message.startswith(MARKERS["size"]):
         entry["size_gb"] = _size_gb(message)
+        entry["bytes"] = _size_bytes(message)
     elif message.startswith(MARKERS["skip"]):
         entry["status"] = "skip"
         entry["uploading"] = False
@@ -195,11 +202,40 @@ def _apply_message(entry: dict, message: str, when=None):
         entry["attempts"] += 1
 
 
+def _size_bytes(message: str):
+    digits = re.search(r"(\d+)", message)
+    return int(digits.group(1)) if digits else None
+
+
 def _size_gb(message: str):
     digits = re.search(r"(\d+)", message)
     if not digits:
         return None
     return round(int(digits.group(1)) / 1024 ** 3, 2)
+
+
+def _progress(entry: dict) -> str:
+    """Сколько уже доехало. Заполняется снаружи (progress_percent):
+    сам журнал процента не знает, его знает только приёмник."""
+    percent = entry.get("percent")
+    if percent is None:
+        return ""
+    done_gb = entry.get("remote_gb")
+    where = f", {done_gb} ГБ" if done_gb is not None else ""
+    return f" — {percent}%{where}"
+
+
+def progress_percent(local_bytes, remote_bytes):
+    """Процент готовности: сколько байт уже лежит на приёмнике.
+
+    Единственный честный источник — сам приёмник: у SFTP нет обратной
+    связи о ходе передачи, и на стороне отправителя процента взять
+    неоткуда. Больше 100% не показываем: файл на приёмнике может быть
+    чуть длиннее из-за докачки.
+    """
+    if not local_bytes or remote_bytes is None:
+        return None
+    return min(100, round(remote_bytes / local_bytes * 100))
 
 
 def _took(entry: dict) -> str:
@@ -250,7 +286,8 @@ def summary_lines(summary: dict) -> list:
         size = f", {entry['size_gb']} ГБ" if entry.get("size_gb") else ""
         attempts = (f", попыток {entry['attempts']}"
                     if entry.get("attempts", 0) > 1 else "")
-        lines.append(f"{icon} {entry['name']}{size}{attempts}{_took(entry)}")
+        lines.append(f"{icon} {entry['name']}{size}{attempts}"
+                     f"{_took(entry)}{_progress(entry)}")
         if entry.get("file"):
             lines.append(f"    {entry['file']}")
         for error in entry["errors"][:2]:

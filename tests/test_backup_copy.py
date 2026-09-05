@@ -509,3 +509,25 @@ def test_reset_refuses_when_nothing_runs(monkeypatch, tmp_path):
     _wire_state(monkeypatch, tmp_path, {"sql-region": {}})
     with pytest.raises(RuntimeError):
         backup_copy.clear_run("sql-region")
+
+
+# ─── Путь на приёмнике ───────────────────────────────────────
+
+def test_target_settings_need_both_fields():
+    """По одному полю процент не посчитать: нужен и сервер, и корень."""
+    assert backup_copy.target_settings({"copy_target": "sftp-01"}) is None
+    assert backup_copy.target_settings({"copy_target_root": "E:\\B"}) is None
+
+
+def test_target_path_glues_sftp_path_to_the_root():
+    settings = backup_copy.target_settings(
+        {"copy_target": "sftp-01", "copy_target_root": "E:\\Backups\\AKT1C8\\"})
+    path = backup_copy.target_path(settings["root"],
+                                   "/new_pro_akt/FULL/file.bak")
+    assert path == "E:\\Backups\\AKT1C8\\new_pro_akt\\FULL\\file.bak"
+
+
+def test_size_check_looks_at_filepart_too():
+    """WinSCP пишет в .filepart и переименовывает в конце — пока файл
+    едет, под конечным именем его нет вовсе."""
+    assert ".filepart" in backup_copy.file_size_ps("E:\\B\\file.bak")

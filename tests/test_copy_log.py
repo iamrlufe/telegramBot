@@ -8,6 +8,7 @@ from datetime import datetime
 
 from copy_log import (
     common_log,
+    progress_percent,
     winscp_highlights,
     winscp_is_transferring,
     winscp_last_time,
@@ -27,6 +28,7 @@ SAMPLE = """[05.09.2026 11:17:42,07] ===========================================
 [05.09.2026 11:17:42,10] [new_pro_akt] [FULL] Найден файл: AKT1C8_new_pro_akt_FULL_20260905_094515.bak
 [05.09.2026 11:17:42,10] [new_pro_akt] [FULL] Локальный размер: 47713517568 bytes
 [05.09.2026 11:17:47,15] [new_pro_akt] [FULL] Размер стабилен: 47713517568 bytes
+[05.09.2026 11:17:47,15] [new_pro_akt] [FULL] Remote: /new_pro_akt/FULL/AKT1C8_new_pro_akt_FULL_20260905_094515.bak
 [05.09.2026 11:17:47,15] [new_pro_akt] [FULL] Проверка remote-файла...
 batch           abort
 Searching for host...
@@ -145,6 +147,15 @@ def test_start_and_end_times():
     assert summary["ended"].minute == 20
 
 
+def test_similar_lines_do_not_pass_for_the_remote_path():
+    """Рядом в журнале есть «Remote dir:» и «Remote размер:» — они не
+    должны подменять путь, по которому считается процент."""
+    text = ("[05.09.2026 11:17:47,15] [db] [FULL] Remote: /db/FULL/f.bak\n"
+            "[05.09.2026 11:17:47,93] [db] [FULL] Remote dir: /db/FULL\n"
+            "[05.09.2026 11:17:50,98] [db] [FULL] Remote размер: 100 bytes")
+    assert parse_common_log(text)["databases"][0]["remote"] == "/db/FULL/f.bak"
+
+
 def test_unknown_lines_do_not_break_anything():
     assert parse_common_log("мусор\n\nещё мусор")["databases"] == []
     assert parse_common_log("")["databases"] == []
@@ -195,3 +206,39 @@ def test_last_time_and_transfer_state():
     assert winscp_last_time(WINSCP_TAIL) == "2026-09-05 11:40:21"
     assert winscp_is_transferring(WINSCP_TAIL) is True
     assert winscp_is_transferring(WINSCP_END) is False
+
+
+# ─── Процент готовности ──────────────────────────────────────
+
+def test_remote_path_is_taken_from_the_log():
+    """Путь на приёмнике скрипт пишет сам: по нему и считается процент."""
+    entry = parse_common_log(SAMPLE)["databases"][0]
+    assert entry["remote"] == "/new_pro_akt/FULL/AKT1C8_new_pro_akt_FULL_20260905_094515.bak"
+    assert entry["bytes"] == 47713517568
+
+
+def test_percent_from_sizes():
+    assert progress_percent(100, 25) == 25
+    assert progress_percent(47713517568, 23856758784) == 50
+
+
+def test_percent_is_capped():
+    """Докачка может сделать файл чуть длиннее — 103% выглядели бы
+    ошибкой."""
+    assert progress_percent(100, 103) == 100
+
+
+def test_percent_needs_both_sizes():
+    assert progress_percent(None, 10) is None
+    assert progress_percent(100, None) is None
+    assert progress_percent(0, 10) is None
+
+
+def test_percent_shows_up_in_the_summary():
+    summary = parse_common_log(SAMPLE.split("[05.09.2026 11:52:03,10]")[0])
+    entry = summary["databases"][0]
+    entry["percent"], entry["remote_gb"] = 28, 12.4
+
+    text = "\n".join(summary_lines(summary))
+
+    assert "28%" in text and "12.4 ГБ" in text

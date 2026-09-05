@@ -39,7 +39,10 @@ from backup_copy import (
     find_server,
     load_state as load_copy_state,
     read_remote_log_info,
+    remote_file_size,
     start_copy_now,
+    target_path,
+    target_settings,
     type_label,
 )
 from copy_log import (
@@ -47,6 +50,7 @@ from copy_log import (
     database_log,
     log_dir,
     parse_common_log,
+    progress_percent,
     summary_lines,
     winscp_highlights,
     winscp_is_transferring,
@@ -737,7 +741,12 @@ async def show_copy_log(query, context, server_name: str, btype: str):
         return
 
     summary = parse_common_log(text)
+    await _fill_progress(server, summary)
     lines = [f"🖥 {server_name}"] + summary_lines(summary)
+
+    if summary.get("target_error"):
+        lines.append("")
+        lines.append(f"⚠️ Процент не посчитан: {summary['target_error']}")
 
     rows = []
     for entry in summary.get("databases") or []:
@@ -790,6 +799,40 @@ def _winscp_body(path: str, info: dict) -> str:
         lines.append("📄 В хвосте только протокольный обмен — значимых "
                      "строк нет. Это нормально для идущей передачи.")
     return "\n".join(lines)
+
+
+async def _fill_progress(server: dict, summary: dict):
+    """Дописывает процент к базам, которые ещё в пути.
+
+    Спрашиваем приёмник: у SFTP нет обратной связи о ходе передачи, и на
+    стороне отправителя процента взять неоткуда. Ходим только за теми,
+    кто реально едет, — обычно это одна база.
+    """
+    target = target_settings(server)
+    if not target:
+        return
+    running = [e for e in summary.get("databases") or []
+               if e["status"] == "upload" and e.get("remote") and e.get("bytes")]
+    if not running:
+        return
+
+    receiver = await asyncio.to_thread(find_server, target["server"])
+    if not receiver:
+        summary["target_error"] = (f"сервера-приёмника {target['server']} "
+                                   f"нет в конфиге")
+        return
+
+    for entry in running:
+        path = target_path(target["root"], entry["remote"])
+        try:
+            size = await asyncio.to_thread(remote_file_size, receiver, path)
+        except Exception as e:
+            summary["target_error"] = str(e)[:120]
+            return
+        if size is None:
+            continue
+        entry["percent"] = progress_percent(entry["bytes"], size)
+        entry["remote_gb"] = round(size / 1024 ** 3, 2)
 
 
 async def show_copy_log_db(query, context, server_name: str, btype: str,
