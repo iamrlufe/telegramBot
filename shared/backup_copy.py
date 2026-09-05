@@ -55,6 +55,36 @@ COPY_TIMEOUT_MINUTES = int_env("BACKUP_COPY_TIMEOUT_MINUTES", 360)
 COPY_FRESH_MINUTES = int_env("BACKUP_COPY_FRESH_MINUTES", 180)
 
 
+def copy_scripts(server: dict) -> dict:
+    """Скрипты копирования: {тип копии: путь}.
+
+    Полную и разностную копии обычно возят РАЗНЫМИ скриптами: у них разные
+    каталоги на приёмнике и разное расписание. Поэтому copy_script — либо
+    один путь на все типы, либо карта вида {"D": full.cmd, "I": diff.cmd}.
+    """
+    value = server.get("copy_script")
+    if isinstance(value, dict):
+        out = {}
+        for btype, script in value.items():
+            btype = str(btype).strip().upper()[:1]
+            script = str(script or "").strip()
+            if btype and script:
+                out[btype] = script
+        return out
+
+    script = str(value or "").strip()
+    if not script:
+        return {}
+    types = _types_field(server.get("copy_types")) or DEFAULT_COPY_TYPES
+    return {btype: script for btype in types}
+
+
+def _types_field(types) -> tuple:
+    if isinstance(types, str):
+        types = [t.strip() for t in types.replace(";", ",").split(",")]
+    return tuple(str(t).strip().upper()[:1] for t in (types or []) if str(t).strip())
+
+
 def copy_settings(server: dict) -> dict:
     """Настройки копирования сервера-источника или None, если не заданы.
 
@@ -62,23 +92,26 @@ def copy_settings(server: dict) -> dict:
     чтобы их можно было править из бота: мастер ⚙️ Настройка спрашивает
     именно плоские поля.
     """
-    script = (server.get("copy_script") or "").strip()
-    if not script:
+    scripts = copy_scripts(server)
+    if not scripts:
         return None
 
-    types = server.get("copy_types")
-    if isinstance(types, str):
-        types = [t.strip() for t in types.replace(";", ",").split(",")]
-    types = [str(t).strip().upper()[:1] for t in (types or []) if str(t).strip()]
-
     return {
-        "script": script,
-        "types": tuple(types) if types else DEFAULT_COPY_TYPES,
+        "scripts": scripts,
+        # Типы берутся из самих скриптов: заданный скрипт и есть согласие
+        # возить копии этого типа, а второго списка, который разъедется
+        # с первым, лучше не заводить.
+        "types": tuple(scripts.keys()),
         "auto": server.get("copy_after_backup", True) is not False,
         "delay_minutes": _minutes(server.get("copy_delay_minutes"), COPY_DELAY_MINUTES),
         "timeout_minutes": _minutes(server.get("copy_timeout_minutes"),
                                     COPY_TIMEOUT_MINUTES),
     }
+
+
+def script_for(settings: dict, btype: str) -> str:
+    """Каким скриптом везти копию этого типа."""
+    return (settings.get("scripts") or {}).get(str(btype or "").upper()[:1], "")
 
 
 def _minutes(value, default: int) -> int:
@@ -103,9 +136,15 @@ def parse_finished(text):
         return None
 
 
-def pick_ready_backup(rows: list, settings: dict) -> dict:
-    """Самая свежая законченная копия нужного типа из выдачи msdb."""
-    best = None
+def pick_ready_backups(rows: list, settings: dict) -> list:
+    """Самые свежие законченные копии — по одной на каждый тип, который
+    возим. Полная и разностная считаются отдельно: у них свои скрипты и
+    своя очередь, и свежая разностная не отменяет неотправленную полную.
+
+    Порядок — от самой свежей к старой: если ждут обе, первой поедет та,
+    что закончилась позже.
+    """
+    best = {}
     for row in rows or []:
         btype = str(row.get("btype") or "").strip().upper()[:1]
         if btype not in settings["types"]:
@@ -113,15 +152,45 @@ def pick_ready_backup(rows: list, settings: dict) -> dict:
         finished = parse_finished(row.get("finished"))
         if not finished:
             continue
-        if best is None or finished > best["finished"]:
-            best = {
+        if btype not in best or finished > best[btype]["finished"]:
+            best[btype] = {
                 "db": row.get("db"),
                 "type": btype,
                 "finished": finished,
                 "size_gb": row.get("size_gb"),
                 "device": row.get("device"),
             }
-    return best
+    return sorted(best.values(), key=lambda i: i["finished"], reverse=True)
+
+
+def pick_ready_backup(rows: list, settings: dict) -> dict:
+    """Самая свежая законченная копия любого из возимых типов."""
+    ready = pick_ready_backups(rows, settings)
+    return ready[0] if ready else None
+
+
+def sent_marker(state: dict, btype: str) -> str:
+    """Отметка «эту копию уже отправили» — своя на каждый тип.
+
+    Старый формат (одна строка на сервер) читается как отметка для всех
+    типов сразу: иначе после обновления бот повёз бы заново то, что уже
+    уехало.
+    """
+    last = (state or {}).get("last_finished")
+    if isinstance(last, dict):
+        return last.get(str(btype or "").upper()[:1])
+    return last
+
+
+def mark_sent(state: dict, btype: str, marker_text: str) -> dict:
+    last = state.get("last_finished")
+    if not isinstance(last, dict):
+        # Переезд со старого формата: прежняя строка была отметкой для
+        # всех типов, ею и остаётся, пока каждый тип не отметится своей.
+        last = {t: last for t in ("D", "I", "L") if last}
+    last[str(btype or "").upper()[:1]] = marker_text
+    state["last_finished"] = last
+    return state
 
 
 def should_start(ready: dict, state: dict, settings: dict, now: datetime):
@@ -135,11 +204,15 @@ def should_start(ready: dict, state: dict, settings: dict, now: datetime):
         return False, "автозапуск выключен"
     if not ready:
         return False, "в msdb нет законченных копий нужного типа"
+    if not script_for(settings, ready["type"]):
+        return False, f"для копий типа {ready['type']} скрипт не задан"
 
-    marker = ready["finished"].strftime("%Y-%m-%d %H:%M:%S")
-    if state.get("last_finished") == marker:
+    marker_text = ready["finished"].strftime("%Y-%m-%d %H:%M:%S")
+    if sent_marker(state, ready["type"]) == marker_text:
         return False, "эта копия уже отправлена"
     if state.get("run"):
+        # Копирование грузит и сеть, и диск: два рейса разом идут вдвое
+        # дольше каждый. Второй тип поедет следующим циклом.
         return False, "предыдущее копирование ещё идёт"
 
     waited = (now - ready["finished"]).total_seconds() / 60
@@ -151,6 +224,29 @@ def should_start(ready: dict, state: dict, settings: dict, now: datetime):
         return False, "копия слишком старая, копирование не нужно"
 
     return True, None
+
+
+def next_to_send(rows: list, state: dict, settings: dict, now: datetime):
+    """Что везти сейчас: (копия, причина отказа по самой свежей).
+
+    Перебираются все ждущие типы, а не только самый свежий: пока едет
+    разностная, полная не должна выпасть из очереди.
+    """
+    candidates = pick_ready_backups(rows, settings)
+    if not candidates:
+        return None, "в msdb нет законченных копий нужного типа"
+
+    first_reason = None
+    for ready in candidates:
+        ok, reason = should_start(ready, state, settings, now)
+        if ok:
+            return ready, None
+        if first_reason is None:
+            first_reason = reason
+        if reason == "предыдущее копирование ещё идёт":
+            # Остальные типы всё равно подождут этого же рейса
+            break
+    return None, first_reason
 
 
 def run_verdict(run: dict, settings: dict, now: datetime) -> str:
@@ -281,7 +377,10 @@ def launch_copy(server: dict, settings: dict, ready: dict = None,
     Ждать окончания нельзя: сессия WinRM живёт минуты, а копия едет часами,
     поэтому процесс отвязывается и дальше опознаётся по PID.
     """
-    raw = run_ps(server["host"], launch_script_ps(settings["script"]),
+    script = script_for(settings, (ready or {}).get("type")) or _only_script(settings)
+    if not script:
+        raise RuntimeError("не задан скрипт копирования для этого типа копии")
+    raw = run_ps(server["host"], launch_script_ps(script),
                  server.get("username"), server.get("password"))
     data = ps_json(raw) or {}
     pid = data.get("Pid")
@@ -290,16 +389,29 @@ def launch_copy(server: dict, settings: dict, ready: dict = None,
     return {
         "pid": int(pid),
         "started": marker(now_local()),
-        "source_finished": marker(ready["finished"]) if ready else None,
+        "source_finished": (marker(ready["finished"])
+                            if (ready or {}).get("finished") else None),
         "db": (ready or {}).get("db"),
         "type": (ready or {}).get("type"),
         "size_gb": (ready or {}).get("size_gb"),
+        "script": script,
         "by": by,
     }
 
 
-def start_copy_now(server_name: str, by: str = "бот") -> dict:
+def _only_script(settings: dict) -> str:
+    """Единственный скрипт сервера — для ручного запуска, когда тип не
+    назван. Если скриптов несколько, тип обязателен: гадать, что человек
+    имел в виду, нельзя."""
+    scripts = list(dict.fromkeys((settings.get("scripts") or {}).values()))
+    return scripts[0] if len(scripts) == 1 else ""
+
+
+def start_copy_now(server_name: str, by: str = "бот", btype: str = None) -> dict:
     """Ручной запуск копирования кнопкой в боте.
+
+    btype нужен, когда у сервера скрипты разные для полной и разностной
+    копии: гадать, что человек имел в виду, нельзя.
 
     Отметку `last_finished` НЕ трогаем: ручной запуск не отменяет обычного
     хода дел — если следом SQL закончит новую копию, её всё равно повезут.
@@ -310,6 +422,8 @@ def start_copy_now(server_name: str, by: str = "бот") -> dict:
     settings = copy_settings(server)
     if not settings:
         raise RuntimeError("у сервера не задан скрипт копирования (copy_script)")
+    if btype and not script_for(settings, btype):
+        raise RuntimeError(f"для копий типа {btype} скрипт не задан")
 
     state = load_state()
     entry = state.get(server_name) or {}
@@ -319,7 +433,8 @@ def start_copy_now(server_name: str, by: str = "бот") -> dict:
             f"(PID {entry['run'].get('pid')})"
         )
 
-    entry["run"] = launch_copy(server, settings, by=by)
+    ready = {"type": str(btype).upper()[:1]} if btype else None
+    entry["run"] = launch_copy(server, settings, ready, by=by)
     state[server_name] = entry
     save_state(state)
     return entry["run"]

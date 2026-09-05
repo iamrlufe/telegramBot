@@ -229,7 +229,20 @@ def validate_config(servers) -> None:
         # таймаутами — типичная опечатка: настройки есть, копированием
         # никто не управляет, и об этом никто не узнает.
         script = server.get("copy_script")
-        if script is not None and not str(script).strip():
+        if isinstance(script, dict):
+            if not script:
+                raise ValueError(f"Сервер «{name}»: copy_script не может быть пустым")
+            for btype, path in script.items():
+                if str(btype).strip().upper()[:1] not in ("D", "I", "L"):
+                    raise ValueError(
+                        f"Сервер «{name}»: copy_script — тип копии только "
+                        f"D, I или L (получено «{btype}»)"
+                    )
+                if not str(path or "").strip():
+                    raise ValueError(
+                        f"Сервер «{name}»: copy_script[{btype}] — пустой путь"
+                    )
+        elif script is not None and not str(script).strip():
             raise ValueError(f"Сервер «{name}»: copy_script не может быть пустым")
         copy_extra = ("copy_types", "copy_delay_minutes",
                       "copy_timeout_minutes", "copy_after_backup")
@@ -561,6 +574,11 @@ FIELD_DEFS = {
         "prompt": "Полный путь к скрипту копирования НА САМОМ СЕРВЕРЕ.\n"
                   "Например: C:\\Scripts\\copy_to_sftp.ps1 (годятся .ps1, "
                   ".bat, .cmd, .exe)\n\n"
+                  "Скриптов может быть НЕСКОЛЬКО — свой на каждый тип копии:\n"
+                  "D=C:\\roman\\upload_full.cmd, I=C:\\roman\\upload_diff.cmd\n"
+                  "(можно словами: полная=…, разностная=…, журнал=…)\n"
+                  "Тогда каждую копию повезёт свой скрипт, а «Какие копии "
+                  "возить» задавать уже не нужно — типы берутся отсюда.\n\n"
                   "Бот запустит его САМ, как только SQL закончит копию — "
                   "по записи в msdb, а не по часам. Планировщик Windows "
                   "для этого больше не нужен: он стартует в назначенное "
@@ -581,6 +599,8 @@ FIELD_DEFS = {
         "prompt": "Типы копий, за которыми следить: D — полная, "
                   "I — разностная, L — журнал.\n"
                   "Например: D,I\n"
+                  "Нужно, только если скрипт ОДИН на все типы: когда скрипты "
+                  "разные (D=…, I=…), типы берутся из них.\n"
                   "Пропусти — полные и разностные (журналы делают каждые "
                   "15–60 минут, возить их скриптом бессмысленно).",
         "kind": "backup_types",
@@ -808,10 +828,7 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
         return True, text, None
 
     if kind == "script":
-        low = text.lower()
-        if not low.endswith((".ps1", ".bat", ".cmd", ".exe")):
-            return False, None, "Путь должен указывать на .ps1, .bat, .cmd или .exe"
-        return True, text, None
+        return _parse_script_field(text)
 
     if kind == "backup_types":
         letters = []
@@ -994,6 +1011,52 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
         return True, value, None
 
     return False, None, "Неизвестное поле"
+
+
+SCRIPT_EXTENSIONS = (".ps1", ".bat", ".cmd", ".exe")
+
+# Тип копии словами: «D=…» помнят не все, «полная=…» понятно сразу.
+BACKUP_TYPE_ALIASES = {
+    "d": "D", "full": "D", "полная": "D", "полный": "D", "фулл": "D",
+    "i": "I", "diff": "I", "differential": "I", "разностная": "I",
+    "разностный": "I", "дифф": "I", "диф": "I",
+    "l": "L", "log": "L", "журнал": "L", "лог": "L",
+}
+
+
+def _parse_script_field(text: str):
+    """Скрипт копирования: один путь или карта «тип=путь».
+
+    Полную и разностную копии обычно возят разными скриптами, поэтому
+    принимается и `D=C:\\up_full.cmd, I=C:\\up_diff.cmd`. Слова вместо
+    букв тоже: `полная=…, разностная=…`.
+    """
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    # У одного пути запятых не бывает, а «=» бывает разве что в имени
+    # каталога — карту опознаём по «=» в первой же части.
+    if len(parts) == 1 and "=" not in parts[0]:
+        path = parts[0]
+        if not path.lower().endswith(SCRIPT_EXTENSIONS):
+            return False, None, ("Путь должен указывать на .ps1, .bat, .cmd "
+                                 "или .exe")
+        return True, path, None
+
+    scripts = {}
+    for part in parts:
+        if "=" not in part:
+            return False, None, ("Когда скриптов несколько, у каждого нужен "
+                                 "тип: D=путь, I=путь (полная=…, разностная=…)")
+        raw_type, path = part.split("=", 1)
+        btype = BACKUP_TYPE_ALIASES.get(raw_type.strip().lower())
+        if not btype:
+            return False, None, (f"Не понимаю тип копии «{raw_type.strip()}». "
+                                 f"Бывают: D полная, I разностная, L журнал")
+        path = path.strip()
+        if not path.lower().endswith(SCRIPT_EXTENSIONS):
+            return False, None, (f"{btype}: путь должен указывать на .ps1, "
+                                 f".bat, .cmd или .exe")
+        scripts[btype] = path
+    return (True, scripts, None) if scripts else (True, None, None)
 
 
 _SCHEDULE_RE = re.compile(r"^([a-zа-я]+)[\s:\-.]*(\d{1,2})$")
@@ -1462,6 +1525,10 @@ def display_value(server: dict, key: str) -> str:
                     text += " [журналы .trn не учитываются]"
                 parts.append(text)
         return ", ".join(parts)
+    if key == "copy_script" and isinstance(value, dict):
+        # Карта «тип → скрипт»: без расшифровки в сводке был бы сырой dict
+        labels = {"D": "полная", "I": "разностная", "L": "журнал"}
+        return ", ".join(f"{labels.get(t, t)}: {p}" for t, p in value.items())
     if isinstance(value, bool):
         return "✅" if value else "—"
     if isinstance(value, list):
@@ -2683,10 +2750,15 @@ SQL закончил копию. Планировщик Windows для этог�
 
 📜 Скрипт копирования — полный путь НА САМОМ СЕРВЕРЕ
    (.ps1, .bat, .cmd, .exe). Задал — управление включилось.
+   Скриптов может быть НЕСКОЛЬКО, свой на каждый тип копии:
+   D=C:\\roman\\upload_full.cmd, I=C:\\roman\\upload_diff.cmd
+   (или словами: полная=…, разностная=…). Тогда типы берутся
+   из самих скриптов, а кнопка «Скопировать сейчас» спросит,
+   что везти.
 🔁 Копировать автоматически — можно временно выключить, не стирая путь.
 💾 Какие копии возить — D полная, I разностная, L журнал.
    По умолчанию D,I: журналы делают каждые 15–60 минут, скрипт работал
-   бы непрерывно.
+   бы непрерывно. Нужно, только если скрипт один на все типы.
 ⏸ Пауза перед копированием — сколько ждать после отметки «закончена»
    (SQL закрывает файл раньше, чем система дописывает его на диск).
 ⏰ Копирование зависло — порог, после которого зовём на помощь.
@@ -2712,6 +2784,8 @@ SQL закончил копию. Планировщик Windows для этог�
 
 Пока идёт один рейс, второй на том же сервере не запустится: две копии
 одного файла в одну папку — самый быстрый способ получить огрызок.
+Полная и разностная стоят в очереди каждая своя: увезли разностную —
+полная поедет следующим циклом, она не потеряется.
 Ручной запуск не сбивает обычный ход: следующую копию, которую закончит
 SQL, всё равно повезут.
 

@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи. copy_script: бот сам запускает копирование, как только SQL закончил копию (по msdb), — планировщик Windows для этого не нужен.",
+    "_comment": "Windows + MSSQL: минимальный набор полей. Обязательны только name и host. dbsize=true означает «здесь есть MSSQL»: собираются размеры баз и в карточке появляется кнопка SQL-логи. copy_script: бот сам запускает копирование, как только SQL закончил копию (по msdb), — планировщик Windows для этого не нужен. Скрипт свой на каждый тип копии: полную и разностную обычно возят разными.",
     "name": "sql-01.example.local",
     "host": "192.0.2.10",
     "services": [
@@ -14,8 +14,10 @@
       ]
     },
     "verify_backup": true,
-    "copy_script": "C:\\Scripts\\copy_to_sftp.ps1",
-    "copy_types": "D,I",
+    "copy_script": {
+      "D": "C:\\Scripts\\upload_full.cmd",
+      "I": "C:\\Scripts\\upload_diff.cmd"
+    },
     "copy_timeout_minutes": 360
   },
   {

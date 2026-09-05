@@ -171,6 +171,42 @@ def test_parse_script_requires_known_extension():
     assert not ok and err
 
 
+def test_parse_script_map_for_full_and_diff():
+    """Полную и разностную возят разными скриптами — карта «тип=путь»."""
+    ok, value, _ = parse_field_value(
+        "copy_script",
+        "D=C:\\roman\\upload_full.cmd, I=C:\\roman\\upload_diff.cmd")
+    assert ok and value == {"D": "C:\\roman\\upload_full.cmd",
+                            "I": "C:\\roman\\upload_diff.cmd"}
+
+
+def test_parse_script_map_accepts_words():
+    ok, value, _ = parse_field_value(
+        "copy_script", "полная=C:\\a.cmd, разностная=C:\\b.cmd")
+    assert ok and set(value) == {"D", "I"}
+
+
+def test_parse_script_map_rejects_unknown_type():
+    ok, _, err = parse_field_value("copy_script", "X=C:\\a.cmd")
+    assert not ok and err
+
+
+def test_parse_script_map_requires_type_for_each():
+    ok, _, err = parse_field_value("copy_script", "C:\\a.cmd, C:\\b.cmd")
+    assert not ok and "тип" in err
+
+
+def test_validate_accepts_script_map():
+    validate_config([{"name": "a", "host": "h",
+                      "copy_script": {"D": "C:\\a.cmd", "I": "C:\\b.cmd"}}])
+
+
+def test_validate_rejects_unknown_type_in_map():
+    with pytest.raises(ValueError):
+        validate_config([{"name": "a", "host": "h",
+                          "copy_script": {"X": "C:\\a.cmd"}}])
+
+
 def test_parse_copy_types():
     ok, value, _ = parse_field_value("copy_types", "d, i")
     assert ok and value == "D,I"

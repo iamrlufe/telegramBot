@@ -505,21 +505,27 @@ async def _run_verify_background(context, chat_id: int, server_name: str, user):
 def _copy_server_lines(server: dict, entry: dict) -> list:
     """Что показать про один сервер-источник: настройка и последний рейс."""
     settings = copy_settings(server)
-    lines = [f"🖥 {server['name']}", f"   📜 {settings['script']}"]
+    lines = [f"🖥 {server['name']}"]
+    # Скриптов может быть несколько — свой на полную и на разностную.
+    # Показываем каждый: иначе непонятно, что именно запустит кнопка.
+    for btype, script in settings["scripts"].items():
+        lines.append(f"   📜 {type_label(btype)}: {script}")
 
     auto = "включён" if settings["auto"] else "ВЫКЛЮЧЕН"
-    types = ", ".join(type_label(t) for t in settings["types"])
-    lines.append(f"   🔁 автозапуск: {auto} ({types})")
+    lines.append(f"   🔁 автозапуск: {auto}")
 
     run = (entry or {}).get("run")
     last = (entry or {}).get("last_run")
     if run:
-        lines.append(f"   ⏳ идёт с {run.get('started')} (PID {run.get('pid')})")
+        what = f" [{type_label(run['type'])}]" if run.get("type") else ""
+        lines.append(f"   ⏳ идёт{what} с {run.get('started')} "
+                     f"(PID {run.get('pid')})")
     elif last:
         minutes = last.get("minutes")
         by = last.get("by") or "монитор"
+        what = f" [{type_label(last['type'])}]" if last.get("type") else ""
         lines.append(
-            f"   ✅ последний рейс: {last.get('ended')}"
+            f"   ✅ последний рейс{what}: {last.get('ended')}"
             + (f", ехал {minutes} мин" if minutes is not None else "")
             + f" (запустил {by})"
         )
@@ -583,7 +589,24 @@ async def show_copy_run_servers(query, context, page: int = 0):
     )
 
 
-async def do_copy_run(query, context, server_name: str):
+async def show_copy_types(query, context, server_name: str, scripts: dict):
+    """Какую копию везти, когда скриптов несколько. Гадать нельзя: полная
+    и разностная едут разными скриптами в разные каталоги."""
+    rows = [[InlineKeyboardButton(
+        f"📤 {type_label(btype).capitalize()}",
+        callback_data=f"backup_copy_go:{server_name}:{btype}"
+    )] for btype in scripts]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_copy")])
+
+    await safe_edit_message(
+        query,
+        f"📤 {server_name}\n\nКакую копию везти?\n\n"
+        + "\n".join(f"{type_label(t)}: {p}" for t, p in scripts.items()),
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def do_copy_run(query, context, server_name: str, btype: str = None):
     if not can_delete_backups(query):
         await safe_edit_message(
             query,
@@ -592,9 +615,25 @@ async def do_copy_run(query, context, server_name: str):
         )
         return
 
+    if btype is None:
+        server = await asyncio.to_thread(find_server, server_name)
+        settings = copy_settings(server) if server else None
+        if not settings:
+            await safe_edit_message(
+                query,
+                f"⚠️ У {server_name} не задан скрипт копирования.",
+                reply_markup=back_kb()
+            )
+            return
+        scripts = settings["scripts"]
+        # Один и тот же скрипт на несколько типов — выбирать нечего
+        if len(set(scripts.values())) > 1:
+            await show_copy_types(query, context, server_name, scripts)
+            return
+
     await safe_edit_message(query, f"⏳ Запускаю копирование на {server_name}...")
     try:
-        run = await asyncio.to_thread(start_copy_now, server_name)
+        run = await asyncio.to_thread(start_copy_now, server_name, "бот", btype)
     except Exception as e:
         await safe_edit_message(
             query,
@@ -604,10 +643,11 @@ async def do_copy_run(query, context, server_name: str):
         return
 
     audit.log_config_change(query.from_user, "copy_run", server_name,
-                            f"pid={run.get('pid')}")
+                            f"pid={run.get('pid')} {run.get('script') or ''}".strip())
     await safe_edit_message(
         query,
         f"📤 Копирование запущено: {server_name}\n\n"
+        f"📜 {run.get('script') or 'скрипт сервера'}\n"
         f"▶️ Старт: {run.get('started')} (PID {run.get('pid')})\n\n"
         f"Скрипт работает на самом сервере — ботом можно пользоваться "
         f"дальше. Если копирование затянется дольше порога, придёт алерт "
@@ -1275,6 +1315,10 @@ async def backup_callback(query, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("backup_copy_run:"):
         server_name = data.split(":", 1)[1]
         await do_copy_run(query, context, server_name)
+
+    elif data.startswith("backup_copy_go:"):
+        server_name, btype = data[len("backup_copy_go:"):].rsplit(":", 1)
+        await do_copy_run(query, context, server_name, btype)
 
     elif data == "backup_report_servers":
         await show_report_servers(query, context)

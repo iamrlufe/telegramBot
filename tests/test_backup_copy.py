@@ -11,8 +11,13 @@ import pytest
 from backup_copy import (
     copy_settings,
     launch_script_ps,
+    mark_sent,
+    next_to_send,
     pick_ready_backup,
+    pick_ready_backups,
     run_verdict,
+    script_for,
+    sent_marker,
     should_start,
     type_label,
 )
@@ -74,6 +79,88 @@ def test_journal_taken_when_asked():
 def test_no_matching_backup():
     rows = [{"db": "b", "btype": "L", "finished": "2026-09-05 03:50:00"}]
     assert pick_ready_backup(rows, copy_settings(_server())) is None
+
+
+# ─── Свой скрипт на каждый тип копии ─────────────────────────
+
+FULL_DIFF = {"D": "C:\\roman\\upload_full.cmd",
+             "I": "C:\\roman\\upload_diff.cmd"}
+
+
+def test_script_map_sets_types_by_itself():
+    """Заданный скрипт и есть согласие возить копии этого типа — второй
+    список (copy_types) с ним только разъехался бы."""
+    s = copy_settings(_server(copy_script=dict(FULL_DIFF)))
+    assert set(s["types"]) == {"D", "I"}
+    assert script_for(s, "D").endswith("upload_full.cmd")
+    assert script_for(s, "I").endswith("upload_diff.cmd")
+
+
+def test_single_script_still_covers_default_types():
+    s = copy_settings(_server())
+    assert script_for(s, "D") == script_for(s, "I") == "C:\\Scripts\\copy.ps1"
+
+
+def test_type_without_script_is_not_shipped():
+    """Скрипт только для полной — разностную везти нечем, и молчать об
+    этом нельзя: причина уходит в лог."""
+    s = copy_settings(_server(copy_script={"D": "C:\\full.cmd"}))
+    ready = {"db": "base", "type": "I", "finished": NOW - timedelta(minutes=30)}
+    ok, reason = should_start(ready, {}, s, NOW)
+    assert not ok and "скрипт не задан" in reason
+
+
+def test_each_type_is_tracked_separately():
+    """Свежая разностная не отменяет неотправленную полную."""
+    s = copy_settings(_server(copy_script=dict(FULL_DIFF)))
+    rows = [
+        {"db": "base", "btype": "I", "finished": "2026-09-05 03:30:00"},
+        {"db": "base", "btype": "D", "finished": "2026-09-05 03:00:00"},
+    ]
+    state = {}
+
+    first, _ = next_to_send(rows, state, s, NOW)
+    assert first["type"] == "I"          # самая свежая едет первой
+
+    mark_sent(state, "I", "2026-09-05 03:30:00")
+    second, _ = next_to_send(rows, state, s, NOW)
+    assert second["type"] == "D"         # полная осталась в очереди
+
+    mark_sent(state, "D", "2026-09-05 03:00:00")
+    assert next_to_send(rows, state, s, NOW)[0] is None
+
+
+def test_one_trip_at_a_time():
+    """Копирование грузит сеть и диск: два рейса разом идут вдвое дольше
+    каждый. Второй тип поедет следующим циклом."""
+    s = copy_settings(_server(copy_script=dict(FULL_DIFF)))
+    rows = [{"db": "base", "btype": "I", "finished": "2026-09-05 03:30:00"},
+            {"db": "base", "btype": "D", "finished": "2026-09-05 03:00:00"}]
+    state = {"run": {"pid": 1, "started": "2026-09-05 03:35:00"}}
+
+    ready, reason = next_to_send(rows, state, s, NOW)
+    assert ready is None and "идёт" in reason
+
+
+def test_old_state_format_is_understood():
+    """До разделения по типам отметка была одной строкой на сервер. После
+    обновления она обязана значить «уже отправлено», иначе бот повёз бы
+    заново то, что уже уехало."""
+    assert sent_marker({"last_finished": "2026-09-05 03:30:00"}, "I") == \
+        "2026-09-05 03:30:00"
+
+    state = {"last_finished": "2026-09-05 03:30:00"}
+    mark_sent(state, "D", "2026-09-05 04:00:00")
+    assert state["last_finished"]["D"] == "2026-09-05 04:00:00"
+    assert state["last_finished"]["I"] == "2026-09-05 03:30:00"
+
+
+def test_newest_of_each_type_wins():
+    rows = [{"db": "base", "btype": "I", "finished": "2026-09-05 03:30:00"},
+            {"db": "base", "btype": "I", "finished": "2026-09-05 01:30:00"},
+            {"db": "base", "btype": "D", "finished": "2026-09-04 03:00:00"}]
+    picked = pick_ready_backups(rows, copy_settings(_server(copy_script=dict(FULL_DIFF))))
+    assert [(p["type"], p["finished"].hour) for p in picked] == [("I", 3), ("D", 3)]
 
 
 # ─── Пора ли запускать ───────────────────────────────────────

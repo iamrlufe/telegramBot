@@ -27,12 +27,14 @@ from backup_copy import (
     launch_copy,
     load_servers,
     load_state,
+    mark_sent,
     marker as _marker,
+    pick_ready_backups,
+    next_to_send,
     now_local as _now,
-    pick_ready_backup,
     run_verdict,
     save_state,
-    should_start,
+    script_for,
     type_label,
 )
 from alerts import (
@@ -99,7 +101,10 @@ def _watch_run(server: dict, settings: dict, entry: dict, state_key: str,
     started = datetime.strptime(run["started"], "%Y-%m-%d %H:%M:%S")
     minutes = round((now - started).total_seconds() / 60)
     entry["last_run"] = dict(run, ended=_marker(now), minutes=minutes)
-    entry["last_finished"] = run["source_finished"]
+    # Отметка своя на каждый тип: увезли разностную — полная остаётся
+    # в очереди и поедет следующим циклом.
+    if run.get("source_finished"):
+        mark_sent(entry, run.get("type"), run["source_finished"])
     entry["run"] = None
     state[state_key] = entry
     print(f"[copy] {name}: копирование закончилось за {minutes} мин", flush=True)
@@ -126,21 +131,22 @@ def process_server_copy(server: dict, state: dict) -> bool:
         print(f"[copy] {name}: не прочитать msdb: {e}", flush=True)
         return False
 
-    ready = pick_ready_backup(rows, settings)
-    ok, reason = should_start(ready, entry, settings, _now())
-    if not ok:
-        # Первый раз видим эту копию, но везти её незачем (старая или
-        # автозапуск выключен) — запоминаем, чтобы не думать о ней снова.
-        if ready and not entry.get("last_finished"):
-            entry["last_finished"] = _marker(ready["finished"])
-            state[name] = entry
-            changed = True
+    ready, reason = next_to_send(rows, entry, settings, _now())
+    if not ready:
+        # Первый раз видим эти копии, но везти их незачем (старые или
+        # автозапуск выключен) — запоминаем, чтобы не думать о них снова.
+        if not entry.get("last_finished"):
+            for item in pick_ready_backups(rows, settings):
+                mark_sent(entry, item["type"], _marker(item["finished"]))
+                changed = True
+            if changed:
+                state[name] = entry
         print(f"[copy] {name}: не запускаю — {reason}", flush=True)
         return changed
 
     print(f"[copy] {name}: копия {ready['db']} "
           f"({type_label(ready['type'])}) готова {_marker(ready['finished'])} "
-          f"— запускаю {settings['script']}", flush=True)
+          f"— запускаю {script_for(settings, ready['type'])}", flush=True)
     try:
         entry["run"] = launch_copy(server, settings, ready)
     except Exception as e:
