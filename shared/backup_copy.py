@@ -382,14 +382,53 @@ def check_run_ps(run: dict) -> str:
     """
 
 
+# Однобайтовые кодировки, в которых может оказаться строка от cmd:
+# CP866 — кодировка консоли по умолчанию, CP1251 — если в скрипте
+# стоит `chcp 1251` и сам .cmd сохранён в ней же. Обе «валидны» для
+# любых байтов, поэтому выбирать приходится по виду результата.
+FALLBACK_ENCODINGS = ("cp866", "cp1251")
+
+# Кириллица и обычная пунктуация — признак того, что кодировку угадали.
+# Промах даёт псевдографику (═ ╣ ▒) или мусор вроде «ЁЎ»: их здесь нет.
+_CYRILLIC = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
+
+
+def _score(text: str) -> int:
+    """Насколько текст похож на осмысленный русский. Считаем буквы:
+    у промаха их почти нет — вместо них рамки и значки."""
+    return sum(1 for char in text if char in _CYRILLIC)
+
+
+def _decode_line(chunk: bytes) -> str:
+    """Одна строка журнала → текст.
+
+    Порядок такой: UTF-8 строгим разбором (в него мусор не пролезает,
+    и если строка в нём читается — она в нём и записана), иначе выбор
+    между CP866 и CP1251 по числу русских букв. Байты у них пересекаются
+    полностью, отличить можно только по виду результата: CP1251-строка,
+    прочитанная как CP866, превращается в псевдографику.
+    """
+    try:
+        return chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    best, best_score = None, -1
+    for encoding in FALLBACK_ENCODINGS:
+        text = chunk.decode(encoding, errors="replace")
+        score = _score(text)
+        if score > best_score:
+            best, best_score = text, score
+    return best
+
+
 def decode_log_tail(b64: str, lines: int = None) -> str:
     """Хвост журнала из base64 → текст.
 
-    Строки декодируются ПООТДЕЛЬНОСТИ: cmd пишет в кодировке консоли
-    (CP866), WinSCP при перенаправлении — в UTF-8, и в одном файле они
-    соседствуют. Пробуем UTF-8, а на строке, которая в него не
-    укладывается, откатываемся на CP866 — так читаемыми остаются обе
-    половины, а не одна.
+    Строки декодируются ПООТДЕЛЬНОСТИ: WinSCP при перенаправлении вывода
+    пишет в UTF-8, а cmd — в кодировке консоли, и в одном файле они
+    соседствуют. Единая кодировка при чтении превращает половину журнала
+    в «РС‰Сѓ СЃРµСЂРІРµСЂ» — какую именно половину, зависит от того,
+    какую кодировку выбрать.
     """
     lines = lines or LOG_TAIL_LINES
     try:
@@ -407,11 +446,7 @@ def decode_log_tail(b64: str, lines: int = None) -> str:
 
     out = []
     for chunk in chunks:
-        try:
-            text = chunk.decode("utf-8")
-        except UnicodeDecodeError:
-            text = chunk.decode("cp866", errors="replace")
-        text = text.rstrip("\r")
+        text = _decode_line(chunk).rstrip("\r")
         if text.strip():
             out.append(text)
     return "\n".join(out[-lines:])

@@ -309,6 +309,33 @@ def test_log_with_two_encodings_stays_readable():
     assert "SKIP: файл уже загружен" in text
 
 
+def test_windows_1251_lines_are_read_too():
+    """`chcp 1251` в скрипте — обычное дело: тогда cmd пишет не в CP866.
+    Байты у этих кодировок пересекаются полностью, отличить можно только
+    по виду результата — промах даёт псевдографику вместо букв."""
+    raw = "[10:42] Поиск каталогов DIFF в D:\\backup".encode("cp1251")
+    assert "Поиск каталогов DIFF" in decode_log_tail(_b64(raw))
+
+
+def test_cp866_lines_are_read_too():
+    raw = "[10:42] Найден файл".encode("cp866")
+    assert "Найден файл" in decode_log_tail(_b64(raw))
+
+
+def test_three_encodings_in_one_log():
+    """Худший случай, он же настоящий: ASCII от cmd, UTF-8 от WinSCP
+    и русские строки самого скрипта в кодировке консоли."""
+    raw = (b"[10:42] START upload_common.cmd\n"
+           + "Ищу сервер…".encode("utf-8") + b"\n"
+           + "[10:42] Файл уже полностью загружен".encode("cp1251"))
+
+    text = decode_log_tail(_b64(raw))
+
+    assert "START upload_common.cmd" in text
+    assert "Ищу сервер" in text
+    assert "Файл уже полностью загружен" in text
+
+
 def test_truncated_first_line_is_dropped():
     """Хвост читается с конца по байтам: первая строка обрезана
     посередине — и посередине символа тоже, поэтому её не показываем."""
