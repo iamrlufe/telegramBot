@@ -171,6 +171,68 @@ def test_parse_script_requires_known_extension():
     assert not ok and err
 
 
+def _run_copy_steps(monkeypatch, answers):
+    """Прогоняет опрос «скрипт для полной / разностной / журнала».
+
+    answers — что отвечает человек на каждом шаге, None значит «пропустить».
+    Возвращает то, что ушло в конфиг.
+    """
+    import asyncio
+
+    saved = {}
+
+    def _update(server_name, field, value):
+        saved["field"] = field
+        saved["value"] = value
+        return True, server_name
+
+    monkeypatch.setattr(ce, "update_server_field", _update)
+    monkeypatch.setattr(ce, "load_config", lambda: [{"name": "sql-01", "host": "h"}])
+
+    state = {"mode": "copy_scripts", "server": "sql-01", "step": 0, "scripts": {}}
+    context = type("Ctx", (), {"user_data": {ce.STATE_KEY: state}})()
+
+    async def send(text, kb):
+        pass
+
+    async def go():
+        for answer in answers:
+            await ce.copy_scripts_advance(context, send, state, answer)
+
+    asyncio.run(go())
+    return saved
+
+
+def test_copy_steps_ask_each_type(monkeypatch):
+    saved = _run_copy_steps(monkeypatch, [
+        "C:\\roman\\upload_full.cmd",
+        "C:\\roman\\upload_diff.cmd",
+        None,                                  # журнал пропущен
+    ])
+    assert saved["field"] == "copy_script"
+    assert saved["value"] == {"D": "C:\\roman\\upload_full.cmd",
+                              "I": "C:\\roman\\upload_diff.cmd"}
+
+
+def test_copy_steps_full_only(monkeypatch):
+    saved = _run_copy_steps(monkeypatch, ["C:\\roman\\upload_full.cmd", None, None])
+    assert saved["value"] == {"D": "C:\\roman\\upload_full.cmd"}
+
+
+def test_copy_steps_full_is_required():
+    """Разностная без своей полной на приёмнике ничего не восстановит —
+    поэтому шаг с полной пропустить нельзя."""
+    assert ce.COPY_SCRIPT_STEPS[0][0] == "D"
+    assert ce.COPY_SCRIPT_STEPS[0][2] is True
+    assert all(step[2] is False for step in ce.COPY_SCRIPT_STEPS[1:])
+
+
+def test_copy_steps_dash_on_full_turns_management_off(monkeypatch):
+    """«-» на первом шаге — возврат к планировщику, а не пустая настройка."""
+    saved = _run_copy_steps(monkeypatch, [None])
+    assert saved["value"] is None
+
+
 def test_parse_script_map_for_full_and_diff():
     """Полную и разностную возят разными скриптами — карта «тип=путь»."""
     ok, value, _ = parse_field_value(

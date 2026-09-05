@@ -1016,6 +1016,8 @@ def parse_field_value(key: str, text: str, existing_names: set[str] = None):
 SCRIPT_EXTENSIONS = (".ps1", ".bat", ".cmd", ".exe")
 
 # Тип копии словами: «D=…» помнят не все, «полная=…» понятно сразу.
+TYPE_LABELS_RU = {"D": "полная", "I": "разностная", "L": "журнал"}
+
 BACKUP_TYPE_ALIASES = {
     "d": "D", "full": "D", "полная": "D", "полный": "D", "фулл": "D",
     "i": "I", "diff": "I", "differential": "I", "разностная": "I",
@@ -1527,8 +1529,8 @@ def display_value(server: dict, key: str) -> str:
         return ", ".join(parts)
     if key == "copy_script" and isinstance(value, dict):
         # Карта «тип → скрипт»: без расшифровки в сводке был бы сырой dict
-        labels = {"D": "полная", "I": "разностная", "L": "журнал"}
-        return ", ".join(f"{labels.get(t, t)}: {p}" for t, p in value.items())
+        return ", ".join(f"{TYPE_LABELS_RU.get(t, t)}: {p}"
+                         for t, p in value.items())
     if isinstance(value, bool):
         return "✅" if value else "—"
     if isinstance(value, list):
@@ -1877,6 +1879,112 @@ async def show_server_editor(query, context, server_name: str):
     )
 
 
+# Скрипты копирования спрашиваются по одному, а не строкой «D=…, I=…»:
+# так не нужно помнить формат и видно, какой скрипт за что отвечает.
+# Полная обязательна: если полную не возить, автоматика бессмысленна —
+# разностная без своей полной на приёмнике ничего не восстановит.
+COPY_SCRIPT_STEPS = [
+    ("D", "ПОЛНОЙ копии", True),
+    ("I", "РАЗНОСТНОЙ копии", False),
+    ("L", "ЖУРНАЛА транзакций", False),
+]
+
+
+def copy_step_text(server_name: str, step: int, scripts: dict) -> str:
+    btype, what, required = COPY_SCRIPT_STEPS[step]
+    lines = [f"✏️ {server_name} · Скрипт копирования",
+             f"Шаг {step + 1} из {len(COPY_SCRIPT_STEPS)}", "",
+             f"Путь к скрипту для {what} — на самом сервере."]
+    if btype == "D":
+        lines.append("Например: C:\\roman\\2026\\upload_full.cmd")
+        lines.append("Годятся .ps1, .bat, .cmd, .exe")
+    elif btype == "I":
+        lines.append("Например: C:\\roman\\2026\\upload_diff.cmd")
+    else:
+        lines.append("Журналы делают каждые 15–60 минут: скрипт будет "
+                     "работать почти непрерывно. Обычно этот шаг пропускают.")
+    lines.append("")
+    if required:
+        lines.append("⚠️ Полная копия обязательна. «-» — убрать управление "
+                     "копированием совсем (вернуться к планировщику).")
+    else:
+        lines.append("Пропусти («-» или кнопка) — копии этого типа бот "
+                     "возить не будет.")
+    if scripts:
+        lines.append("")
+        lines.append("Уже задано: " + ", ".join(
+            f"{TYPE_LABELS_RU.get(t, t)} → {path}" for t, path in scripts.items()))
+    return "\n".join(lines)
+
+
+def copy_step_kb(server_name: str, step: int):
+    rows = []
+    if not COPY_SCRIPT_STEPS[step][2]:
+        rows.append([InlineKeyboardButton("⏭ Пропустить",
+                                          callback_data="cfg_copyskip")])
+    rows.append([InlineKeyboardButton(
+        "❌ Отмена", callback_data=f"cfg_editsrv:{server_name}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ask_copy_scripts(query, context, server_name: str):
+    """Начинает опрос по скриптам копирования с первого шага."""
+    context.user_data[STATE_KEY] = {
+        "mode": "copy_scripts", "server": server_name, "step": 0, "scripts": {},
+    }
+    await safe_edit_message(
+        query,
+        copy_step_text(server_name, 0, {})
+        + f"\n\nСейчас: {display_value_for(server_name, 'copy_script')}",
+        reply_markup=copy_step_kb(server_name, 0)
+    )
+
+
+async def copy_scripts_advance(context, send, state: dict, value):
+    """Шаг вперёд по опросу. value=None — пропуск. По последнему шагу
+    сохраняет всё разом: полписьма в конфиге никому не нужны."""
+    btype = COPY_SCRIPT_STEPS[state["step"]][0]
+    if value:
+        state["scripts"][btype] = value
+    elif btype == "D" and state["step"] == 0 and value is None:
+        # «-» на полной = убрать управление копированием целиком
+        state["clear"] = True
+
+    if state.get("clear") or state["step"] + 1 >= len(COPY_SCRIPT_STEPS):
+        return await copy_scripts_save(context, send, state)
+
+    state["step"] += 1
+    await send(copy_step_text(state["server"], state["step"], state["scripts"]),
+               copy_step_kb(state["server"], state["step"]))
+
+
+async def copy_scripts_save(context, send, state: dict):
+    server_name = state["server"]
+    scripts = None if state.get("clear") else (state.get("scripts") or None)
+    context.user_data.pop(STATE_KEY, None)
+    try:
+        saved, result = update_server_field(server_name, "copy_script", scripts)
+    except Exception as e:
+        saved, result = False, f"ошибка записи: {str(e)[:120]}"
+    if not saved:
+        await send(f"❌ {result}", menu_kb())
+        return
+
+    servers = load_config()
+    server = next((s for s in servers if s.get("name") == server_name), None)
+    if server is None:
+        await send("✅ Сохранено, но сервер уже не найден в конфиге. "
+                   "Открой ⚙️ Настройка заново.", menu_kb())
+        return
+
+    head = ("✅ Управление копированием выключено — копии снова возит "
+            "планировщик.\n\n" if scripts is None else
+            "✅ Сохранено. Мониторинг подхватит изменения в течение 5 минут.\n\n")
+    await send(head + build_summary(server)
+               + "\n\nНажми на поле чтобы изменить:",
+               edit_fields_kb(server))
+
+
 async def ask_edit_field(query, context, field: str):
     server_name = context.user_data.get(EDIT_SERVER_KEY)
     if not server_name:
@@ -1908,6 +2016,10 @@ async def ask_edit_field(query, context, field: str):
 
     if field in PATH_FIELDS:
         await show_paths_menu(query, context, field)
+        return
+
+    if field == "copy_script":
+        await ask_copy_scripts(query, context, server_name)
         return
 
     context.user_data[STATE_KEY] = {"mode": "edit_field", "server": server_name, "field": field}
@@ -2748,13 +2860,14 @@ SQL закончил копию. Планировщик Windows для этог�
 
 ⚙️ Настройка → сервер-ИСТОЧНИК (регион), поля:
 
-📜 Скрипт копирования — полный путь НА САМОМ СЕРВЕРЕ
-   (.ps1, .bat, .cmd, .exe). Задал — управление включилось.
-   Скриптов может быть НЕСКОЛЬКО, свой на каждый тип копии:
-   D=C:\\roman\\upload_full.cmd, I=C:\\roman\\upload_diff.cmd
-   (или словами: полная=…, разностная=…). Тогда типы берутся
-   из самих скриптов, а кнопка «Скопировать сейчас» спросит,
-   что везти.
+📜 Скрипт копирования — бот спросит путь по шагам: сперва для
+   ПОЛНОЙ копии (обязательно), потом для РАЗНОСТНОЙ и для
+   ЖУРНАЛА — эти два можно пропустить кнопкой «⏭ Пропустить».
+   Пути — на самом сервере (.ps1, .bat, .cmd, .exe), например
+   C:\\roman\\2026\\upload_full.cmd.
+   Типы берутся из самих скриптов, задавать их отдельно не надо,
+   а кнопка «Скопировать сейчас» спросит, что везти.
+   «-» на первом шаге убирает управление копированием совсем.
 🔁 Копировать автоматически — можно временно выключить, не стирая путь.
 💾 Какие копии возить — D полная, I разностная, L журнал.
    По умолчанию D,I: журналы делают каждые 15–60 минут, скрипт работал
@@ -4047,6 +4160,18 @@ async def config_callback(query, context: ContextTypes.DEFAULT_TYPE):
             )
             await show_server_editor(query, context, server_name)
 
+    elif data == "cfg_copyskip":
+        state = context.user_data.get(STATE_KEY)
+        if not state or state.get("mode") != "copy_scripts":
+            await safe_edit_message(query, "❌ Шаг устарел. Открой поле заново.",
+                                    reply_markup=menu_kb())
+            return
+
+        async def send(text, kb):
+            await safe_edit_message(query, text, reply_markup=kb)
+
+        await copy_scripts_advance(context, send, state, None)
+
     elif data.startswith("cfg_f:"):
         await ask_edit_field(query, context, data.split(":", 1)[1])
 
@@ -4466,6 +4591,23 @@ async def handle_config_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return True
 
         await wizard_advance(context, send, value)
+        return True
+
+    if state["mode"] == "copy_scripts":
+        stripped = (text or "").strip()
+        if stripped in SKIP_INPUTS or not stripped:
+            await copy_scripts_advance(context, send, state, None)
+            return True
+        ok, value, error = _parse_script_field(stripped)
+        if not ok or isinstance(value, dict):
+            message = error or ("Здесь нужен ОДИН путь: тип копии бот "
+                                "спрашивает по шагам")
+            await send(f"⚠️ {message}\n\n"
+                       + copy_step_text(state["server"], state["step"],
+                                        state["scripts"]),
+                       copy_step_kb(state["server"], state["step"]))
+            return True
+        await copy_scripts_advance(context, send, state, value)
         return True
 
     if state["mode"] in ("path_add", "path_hours", "path_limits"):
