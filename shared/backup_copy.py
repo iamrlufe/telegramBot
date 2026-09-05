@@ -23,6 +23,8 @@ shared/backup_copy.py
 из msdb, решение «пора» и «слишком долго», текст запускающего скрипта.
 Сеть и состояние — в monitor/backup_transfer.py.
 """
+import base64
+import binascii
 import json
 import os
 import tempfile
@@ -270,6 +272,13 @@ WORK_DIR_PS = "Join-Path $env:ProgramData 'bot\\copy'"
 # Telegram, меньше — не видно самой ошибки, она обычно в конце.
 LOG_TAIL_LINES = 15
 
+# Сколько байт хвоста журнала забирать с сервера. Читаем байтами, а не
+# строками, ровно по одной причине: в одном файле лежат ДВЕ кодировки.
+# Сам cmd пишет свои строки в кодировке консоли (обычно CP866), а WinSCP
+# при перенаправлении вывода — в UTF-8. Любая единая кодировка при чтении
+# превращает половину журнала в «РС‰Сѓ СЃРµСЂРІРµСЂ». Разбираем построчно.
+LOG_TAIL_BYTES = 4096
+
 # Сколько дней держать журналы рейсов на сервере. Файлы крошечные, но
 # рейсов несколько в сутки, и без уборки каталог растёт вечно — а следом
 # за ним и время листинга. Чистится при запуске очередного рейса: своего
@@ -359,10 +368,53 @@ def check_run_ps(run: dict) -> str:
         $code = (Get-Content -LiteralPath '{done}' -Raw -ErrorAction SilentlyContinue).Trim()
     }}
     if ('{log}' -and (Test-Path -LiteralPath '{log}')) {{
-        $tail = ((Get-Content -LiteralPath '{log}' -Tail {LOG_TAIL_LINES} -Encoding Oem -ErrorAction SilentlyContinue) -join "`n")
+        try {{
+            $fs = [IO.File]::Open('{log}', 'Open', 'Read', 'ReadWrite')
+            $len = [Math]::Min($fs.Length, {LOG_TAIL_BYTES})
+            $null = $fs.Seek(-$len, 'End')
+            $buf = New-Object byte[] $len
+            $null = $fs.Read($buf, 0, $len)
+            $fs.Close()
+            $tail = [Convert]::ToBase64String($buf)
+        }} catch {{ $tail = '' }}
     }}
-    Out-B64 @{{ Alive = $alive; Code = $code; Tail = $tail }}
+    Out-B64 @{{ Alive = $alive; Code = $code; TailB64 = $tail }}
     """
+
+
+def decode_log_tail(b64: str, lines: int = None) -> str:
+    """Хвост журнала из base64 → текст.
+
+    Строки декодируются ПООТДЕЛЬНОСТИ: cmd пишет в кодировке консоли
+    (CP866), WinSCP при перенаправлении — в UTF-8, и в одном файле они
+    соседствуют. Пробуем UTF-8, а на строке, которая в него не
+    укладывается, откатываемся на CP866 — так читаемыми остаются обе
+    половины, а не одна.
+    """
+    lines = lines or LOG_TAIL_LINES
+    try:
+        raw = base64.b64decode(b64 or "", validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    if not raw:
+        return ""
+
+    chunks = raw.split(b"\n")
+    # Читали с конца файла по байтам: первая строка почти наверняка
+    # обрезана посередине — и посередине символа тоже.
+    if len(raw) >= LOG_TAIL_BYTES and len(chunks) > 1:
+        chunks = chunks[1:]
+
+    out = []
+    for chunk in chunks:
+        try:
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            text = chunk.decode("cp866", errors="replace")
+        text = text.rstrip("\r")
+        if text.strip():
+            out.append(text)
+    return "\n".join(out[-lines:])
 
 
 def run_outcome(data: dict, run: dict) -> dict:
@@ -373,7 +425,9 @@ def run_outcome(data: dict, run: dict) -> dict:
     появилось (скрипт убили или сервер перезагрузили).
     """
     data = data or {}
-    tail = (data.get("Tail") or "").strip()
+    # Tail — старый формат (текст как есть), TailB64 — новый (байты).
+    tail = (decode_log_tail(data.get("TailB64"))
+            or (data.get("Tail") or "")).strip()
     code = data.get("Code")
     if code is not None and str(code).strip() != "":
         try:

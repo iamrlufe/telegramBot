@@ -10,6 +10,7 @@ import pytest
 
 from backup_copy import (
     copy_settings,
+    decode_log_tail,
     run_outcome,
     launch_script_ps,
     mark_sent,
@@ -286,6 +287,59 @@ def test_type_label_is_readable():
     assert type_label("I") == "разностная"
 
 
+# ─── Журнал в двух кодировках ────────────────────────────────
+
+def _b64(data: bytes) -> str:
+    import base64
+    return base64.b64encode(data).decode()
+
+
+def test_log_with_two_encodings_stays_readable():
+    """В одном файле cmd пишет в CP866, а WinSCP при перенаправлении —
+    в UTF-8. Единая кодировка превращала половину журнала в «РС‰Сѓ
+    СЃРµСЂРІРµСЂ»."""
+    raw = ("[10:42:38] Проверка remote-файла...".encode("cp866") + b"\n"
+           + "Ищу сервер…".encode("utf-8") + b"\n"
+           + "[10:42:38] SKIP: файл уже загружен".encode("cp866"))
+
+    text = decode_log_tail(_b64(raw))
+
+    assert "Проверка remote-файла" in text
+    assert "Ищу сервер" in text
+    assert "SKIP: файл уже загружен" in text
+
+
+def test_truncated_first_line_is_dropped():
+    """Хвост читается с конца по байтам: первая строка обрезана
+    посередине — и посередине символа тоже, поэтому её не показываем."""
+    raw = b"x" * 4096 + b"\n" + "хвост".encode("utf-8")
+    assert decode_log_tail(_b64(raw)).strip() == "хвост"
+
+
+def test_short_log_keeps_its_first_line():
+    """Если файл целиком влез, обрезанной строки нет — терять её нельзя."""
+    raw = "первая строка\nвторая".encode("utf-8")
+    assert decode_log_tail(_b64(raw)).startswith("первая строка")
+
+
+def test_empty_log_is_not_an_error():
+    assert decode_log_tail("") == ""
+    assert decode_log_tail(None) == ""
+
+
+def test_broken_base64_is_not_an_error():
+    """Ответ сервера мог прийти обрезанным — это не повод ронять разбор
+    рейса: код возврата важнее журнала."""
+    assert decode_log_tail("не base64 вовсе") == ""
+
+
+def test_tail_is_limited():
+    raw = "\n".join(f"строка {n}" for n in range(50)).encode("utf-8")
+    text = decode_log_tail(_b64(raw), lines=5)
+    assert text.count("\n") == 4
+    assert "строка 49" in text
+
+
 # ─── Чем закончился рейс ─────────────────────────────────────
 
 RUN = {"pid": 10848, "started": "2026-09-05 10:27:01",
@@ -305,7 +359,8 @@ def test_exit_code_zero_is_success():
 def test_nonzero_exit_code_is_failure():
     """Главная поломка, ради которой это писалось: скрипт падал на первой
     строке, а бот показывал «идёт копирование»."""
-    out = run_outcome({"Alive": False, "Code": "1", "Tail": "Access denied"},
+    out = run_outcome({"Alive": False, "Code": "1",
+                       "TailB64": _b64("Access denied".encode("cp866"))},
                       RUN)
     assert out["state"] == "failed" and out["code"] == 1
     assert "Access denied" in out["tail"]
