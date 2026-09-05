@@ -5,7 +5,6 @@
 страна значит «GeoIP промолчал», а не «чужой», и такой адрес обязан
 остаться человеку.
 """
-import pytest
 
 import autoban
 from autoban import (

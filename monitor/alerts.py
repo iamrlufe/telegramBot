@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 from alerts_ack import (
-    ACK_HOURS, is_acked, with_ack_button, purge_acks_for_server,
+    is_acked, with_ack_button, purge_acks_for_server,
 )
 from winrm_errors import error_to_status
 from autoban import report_lines, run_autoban
@@ -583,7 +583,7 @@ def check_snapshot_alerts(server_name: str, snapshots: list,
         save_json(SNAPSHOT_STATE_FILE, state)
 
     lines = [
-        f"📸 СТАРЫЕ СНАПШОТЫ",
+        "📸 СТАРЫЕ СНАПШОТЫ",
         f"🖥 Сервер: {server_name}",
         f"Найдено: {len(flagged)}",
         "",

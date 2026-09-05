@@ -80,13 +80,3 @@ def get_conn():
     finally:
         pool.putconn(conn, close=broken or conn.closed)
 
-
-def close_pool():
-    """Закрывает все соединения. Нужен только при остановке процесса."""
-    global _pool
-    with _pool_lock:
-        if _pool is not None:
-            try:
-                _pool.closeall()
-            finally:
-                _pool = None

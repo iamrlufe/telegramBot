@@ -8,7 +8,6 @@ bot/audit.py
 Раньше эти события уходили только в stdout контейнера; теперь остаётся
 постоянный след, доступный из бота (📜 Аудит).
 """
-from datetime import timezone
 
 from pgconn import get_conn
 from settings import ALMATY

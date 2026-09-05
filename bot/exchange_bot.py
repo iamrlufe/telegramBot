@@ -17,8 +17,12 @@ from collections import OrderedDict
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
+# has_exchange здесь не вызывается: bot.py берёт её ИМЕННО отсюда
+# (`from exchange_bot import has_exchange`), а не из exchange_log. Убрать как
+# «неиспользуемый импорт» — уронить бота на старте, поэтому noqa.
 from exchange_log import (
-    has_exchange, read_owa_logins, read_owa_failures, read_activesync,
+    has_exchange,  # noqa: F401  — реэкспорт для bot.py
+    read_owa_logins, read_owa_failures, read_activesync,
     read_top_sources,
 )
 from winlog import friendly_winlog_error

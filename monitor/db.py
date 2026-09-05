@@ -106,23 +106,6 @@ def save_process_metrics(server_name: str, metric_type: str, processes: list):
         )
 
 
-def get_latest_server_status(server_name: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT status
-            FROM server_status
-            WHERE server_name = %s
-            ORDER BY checked_at DESC
-            LIMIT 1
-            """,
-            (server_name,)
-        )
-        row = cur.fetchone()
-    return row[0] if row else None
-
-
 def cleanup_removed_servers(current_names: list) -> list:
     """
     Удаляет из БД серверы которых нет в servers.json.

@@ -144,9 +144,6 @@ def retention_for_server(server: dict) -> dict | None:
         )
         return None
 
-    host = server["host"]
-    username = server.get("username")
-    password = server.get("password")
     backups = server.get("backups", {})
     cutoff = _utcnow_naive() - timedelta(days=days)
 

@@ -6,12 +6,8 @@
 либо перечитывания 20 ГБ истории.
 """
 import importlib.util
-import sys
-import types
 from pathlib import Path
-from unittest.mock import MagicMock
 
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 

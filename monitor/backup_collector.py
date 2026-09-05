@@ -14,11 +14,10 @@ from settings import SERVERS_FILE, int_env, float_env
 from server_check import server_type
 from alerts import (
     alert_due,
-    alert_level,
     mark_alert_sent,
     send_or_defer, load_json, save_json, is_muted, check_backup_failure_alerts,
 )
-from onec_logs import ONEC_LOG_CRIT_GB, ONEC_LOG_WARN_GB, onec_targets
+from onec_logs import onec_targets
 from backup_schedule import (
     ALMATY,
     most_recent_weekly_deadline,

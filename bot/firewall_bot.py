@@ -27,8 +27,13 @@ from geoip import resolve as geo_resolve
 from iis_log import detect_brute_force, parse_hit
 from iis_store import read_events
 from config_editor import can_configure
+# has_firewall здесь не вызывается: её реэкспортируют bot.py и iis_bot.py
+# (`from firewall_bot import ...`). Убрать как «неиспользуемый импорт» —
+# уронить бота на старте, поэтому noqa.
 from firewall import (
-    MAX_ADDRESSES, apply_blocks, has_firewall, is_inside, normalize_target,
+    MAX_ADDRESSES, apply_blocks,
+    has_firewall,  # noqa: F401  — реэкспорт для bot.py и iis_bot.py
+    is_inside, normalize_target,
     read_blocks, refuse_reason, warn_reason,
 )
 from refresh import load_server

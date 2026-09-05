@@ -22,7 +22,7 @@ TransportRoles\\Logs\\MessageTracking. На боевом сервере это 1
 подделанный свой адрес в конверте туда не пролезет.
 """
 from winrm_client import (
-    PS_OUT_B64_HELPER, compact_ps, ps_encoded_length, ps_fits, ps_json,
+    PS_OUT_B64_HELPER, compact_ps, ps_json,
     run_ps,
 )
 

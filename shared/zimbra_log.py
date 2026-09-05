@@ -112,25 +112,6 @@ SENDER_REJECT_MARK = os.getenv(
     "ZIMBRA_SENDER_REJECT_MARK", "sender address rejected").strip().lower()
 
 
-def _reader(path: str) -> str:
-    """Читалка файла с повышением прав, только если оно нужно.
-
-    mail.log принадлежит syslog:adm, audit.log — zimbra:zimbra, и учётка
-    мониторинга обычно не в этих группах. `sudo -n` не спрашивает пароль:
-    если правила нет, команда честно падает, и текст ошибки скажет, чего
-    не хватает, вместо пустого отчёта.
-    """
-    return (f'if [ -r "{path}" ]; then cat "{path}"; '
-            f'else sudo -n cat "{path}"; fi')
-
-
-def _pick_script(paths) -> str:
-    """Первый существующий непустой файл из списка."""
-    items = " ".join(f'"{p}"' for p in paths)
-    return (f'for f in {items}; do '
-            f'if [ -s "$f" ]; then echo "$f"; break; fi; done')
-
-
 # ─── Разбор mail.log ─────────────────────────────────────────
 
 # Awk без mktime и systime: на Ubuntu по умолчанию стоит mawk, а этих

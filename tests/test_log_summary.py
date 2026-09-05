@@ -5,7 +5,6 @@
 и то, что недоступный раздел журнала не уносит с собой остальные.
 """
 import importlib.util
-import sys
 from pathlib import Path
 
 import pytest

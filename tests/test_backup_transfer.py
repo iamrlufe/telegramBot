@@ -4,7 +4,7 @@
 в msdb запись о копии появляется, как только закончилась ПЕРВАЯ база,
 а следом сервер может писать вторую и третью.
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import backup_transfer as bt
 

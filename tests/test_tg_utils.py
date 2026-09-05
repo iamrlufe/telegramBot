@@ -8,7 +8,6 @@ import asyncio
 
 from telegram.error import BadRequest
 
-import tg_utils
 from tg_utils import TELEGRAM_TEXT_LIMIT, safe_edit_message, split_message
 
 

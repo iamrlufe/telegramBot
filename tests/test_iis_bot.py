@@ -4,10 +4,8 @@
 строк. Данные берутся готовыми из базы, их дочитывает монитор по смещению.
 """
 import importlib.util
-import sys
 from pathlib import Path
 
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 

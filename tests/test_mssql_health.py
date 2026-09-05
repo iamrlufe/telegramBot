@@ -5,10 +5,8 @@
 отличие «не проверялась ни разу» от «проверялась давно», и то, что файл с
 выключенным автоприростом встаёт независимо от места на диске.
 """
-import base64
 import json
 
-import pytest
 
 import mssql_health
 import sqllog_bot

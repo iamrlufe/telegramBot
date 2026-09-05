@@ -749,38 +749,6 @@ def read_remote_log_info(server: dict, path: str, tail_bytes: int = None,
             "size": size}
 
 
-def read_remote_log(server: dict, path: str, tail_bytes: int = None,
-                    lines: int = 400) -> str:
-    """Хвост файла на сервере как текст. Пустая строка — файла нет."""
-    return read_remote_log_info(server, path, tail_bytes, lines)["text"]
-
-
-def list_dir_ps(path: str) -> str:
-    """PowerShell: что лежит в каталоге журналов за дату."""
-    quoted = str(path).replace("'", "''")
-    return PS_OUT_B64_HELPER + f"""
-    $items = @()
-    if (Test-Path -LiteralPath '{quoted}') {{
-        $items = @(Get-ChildItem -LiteralPath '{quoted}' -ErrorAction SilentlyContinue |
-            ForEach-Object {{ @{{ Name = $_.Name; Dir = $_.PSIsContainer;
-                                 Size = $(if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}) }} }})
-    }}
-    Out-B64 @{{ Items = $items }}
-    """
-
-
-def list_remote_dir(server: dict, path: str) -> list:
-    """[{name, dir, size}] — содержимое каталога на сервере."""
-    raw = run_ps(server["host"], list_dir_ps(path),
-                 server.get("username"), server.get("password"))
-    data = ps_json(raw) or {}
-    items = data.get("Items") or []
-    if isinstance(items, dict):
-        items = [items]
-    return [{"name": i.get("Name"), "dir": bool(i.get("Dir")),
-             "size": int(i.get("Size") or 0)} for i in items]
-
-
 def clear_run(server_name: str) -> dict:
     """Забыть идущий рейс. Процесс на сервере при этом НЕ убивается —
     бот его не рождал управляемым и убивать чужую работу не должен.

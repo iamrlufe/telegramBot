@@ -14,7 +14,6 @@ sudo-запись без пароля, например в /etc/sudoers.d/monito
 Чтобы get_top_dirs видел весь диск, а не только читаемое пользователем:
     monitoring ALL=(root) NOPASSWD: /usr/bin/du
 """
-import json
 import shlex
 
 from server_check import server_type

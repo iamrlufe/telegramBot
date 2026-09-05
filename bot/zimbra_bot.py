@@ -22,7 +22,7 @@ from refresh import load_server
 from tg_utils import safe_edit_message, paginate, nav_row
 from zimbra_log import (
     HOME_COUNTRY, QUEUE_ALERT, _origin_rows, brute_force, foreign_logins,
-    has_zimbra, heavy_senders, letters, origin_kind, outside_senders,
+    heavy_senders, letters, origin_kind, outside_senders,
     read_audit,
     read_mail,
 )

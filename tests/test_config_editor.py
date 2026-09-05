@@ -557,8 +557,8 @@ def test_config_written_with_owner_only_mode(tmp_path, monkeypatch):
 def test_backup_copy_is_not_world_readable(tmp_path, monkeypatch):
     """Регрессия: .bak писался обычным open() и получал 0644 —
     полная копия конфига с паролями была читаема любому на хосте."""
-    path = _use_tmp_config(tmp_path, monkeypatch,
-                           [{"name": "a", "host": "h", "password": "s3cret-pw"}])
+    _use_tmp_config(tmp_path, monkeypatch,
+                    [{"name": "a", "host": "h", "password": "s3cret-pw"}])
 
     _cfg.save_config([{"name": "a", "host": "h2"}])
 
@@ -571,7 +571,7 @@ def test_backup_copy_is_not_world_readable(tmp_path, monkeypatch):
 
 def test_existing_loose_backup_is_tightened(tmp_path, monkeypatch):
     """Файл, оставшийся с прежних версий в 0644, надо ужать при перезаписи."""
-    path = _use_tmp_config(tmp_path, monkeypatch, [{"name": "a", "host": "h"}])
+    _use_tmp_config(tmp_path, monkeypatch, [{"name": "a", "host": "h"}])
     backup = tmp_path / "servers.json.bak"
     backup.write_text("старое", encoding="utf-8")
     _os.chmod(backup, 0o644)

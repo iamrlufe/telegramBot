@@ -36,7 +36,6 @@ from mssql_log import (
     read_login_errors, read_backup_errors, read_engine_errors,
     read_agent_jobs, read_job_schedules, friendly_sql_error,
     explain_engine_error, explain_backup_error, summarize_job_message,
-    decode_agent_duration,
 )
 
 

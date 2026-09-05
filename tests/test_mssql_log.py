@@ -8,7 +8,6 @@
 import base64
 import json
 
-import pytest
 
 import mssql_log
 import sqllog_bot
@@ -458,7 +457,7 @@ def test_state_from_russian_error_line():
 
 
 def test_russian_error_line_included_in_query():
-    q = mssql_log._errorlog_query(24, "1=1", 40)
+    mssql_log._errorlog_query(24, "1=1", 40)
     # сам фильтр строится в read_login_errors — проверяем его отдельно
     import inspect
     src = inspect.getsource(mssql_log.read_login_errors)

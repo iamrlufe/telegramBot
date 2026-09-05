@@ -82,7 +82,7 @@ def test_compact_report_one_line_per_server():
     assert "🟠 file-01 · CPU 15.0% · RAM 55.6% · E 18.9% (из 2)" in msg
     assert "🔴 offline-01 (timeout)" in msg
     # строка на сервер: заголовок, подпись и пустые строки сверх этого
-    assert len([l for l in msg.splitlines() if l.startswith(("🟢", "🟠", "🔴"))]) == 5
+    assert len([line for line in msg.splitlines() if line.startswith(("🟢", "🟠", "🔴"))]) == 5
 
 
 def test_compact_report_orders_problems_first():

@@ -11,7 +11,6 @@ shared/winlog.py
 стороне провайдера журнала, поэтому запрос не тащит весь журнал в память.
 Устаревший Get-EventLog так не умеет и на боевом сервере читает минутами.
 """
-import re
 
 from winrm_client import run_ps, ps_json, PS_OUT_B64_HELPER
 

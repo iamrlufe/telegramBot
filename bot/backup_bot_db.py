@@ -592,10 +592,6 @@ def get_files_for_cleanup(server_name: str, age_days: int,
     if not server:
         return []
 
-    host = server["host"]
-    username = server.get("username")
-    password = server.get("password")
-
     targets = deletable_backup_targets(server)
     if only_path:
         targets = [t for t in targets if t["path"] == only_path]

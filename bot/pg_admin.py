@@ -12,7 +12,6 @@ import os
 import asyncio
 
 import psycopg2
-from psycopg2 import errors
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 

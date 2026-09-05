@@ -28,7 +28,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 import audit
 from config_editor import can_configure
-from fail2ban import ban, has_fail2ban, read_state, unban
+from fail2ban import ban, read_state, unban
 from geoip import resolve as geo_resolve
 from mail_store import read_snapshots
 from refresh import load_server

@@ -1,7 +1,7 @@
 import os
 import tempfile
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import matplotlib
 matplotlib.use("Agg")

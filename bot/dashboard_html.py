@@ -21,7 +21,7 @@ import html
 import os
 import tempfile
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from pgconn import get_conn
 from db import (
@@ -34,7 +34,7 @@ from mail_store import read_snapshots as read_mail_snapshots, KIND_LABELS
 from iis_store import read_events as read_iis_events, read_facts as read_iis_facts
 from geoip import resolve as geo_resolve
 from iis_log import parse_hit, detect_brute_force, is_cloudflare, LOGIN_BRUTE_PER_HOUR
-from log_summary import WIN_CATEGORIES, SQL_CATEGORIES, count_by_category
+from log_summary import count_by_category
 from backup_bot_db import (
     get_latest_backup_metrics, classify_backup_row, load_schedule_map,
     BACKUP_STATUS_MISSING,
@@ -1185,7 +1185,6 @@ def _iis_server(server: dict) -> str:
         total = sum(r["count"] for r in server["errors"])
         inner = sum(r["count"] for r in server["errors"] if _is_local(r["parts"][1]))
         bases = {r["parts"][0].split("/")[1] for r in server["errors"] if "/" in r["parts"][0]}
-        services = sum(r["count"] for r in server["errors"] if "/hs/" in r["parts"][0])
         body = "".join(
             _lrow(STATUS_WARN if _is_local(r["parts"][1]) else STATUS_CRIT,
                   _num(r["count"]), html.escape(r["parts"][0]),
