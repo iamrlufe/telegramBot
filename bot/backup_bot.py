@@ -534,6 +534,33 @@ def _copy_server_lines(server: dict, entry: dict) -> list:
     return lines
 
 
+# Telegram режет callback_data длиннее 64 байт, и кнопка молча перестаёт
+# работать. Длинное имя сервера плюс тип в лимит могут не влезть — тогда
+# показываем общий выбор, а тип спрашиваем следующим экраном.
+COPY_CALLBACK_LIMIT = 64
+
+
+def copy_type_buttons(server_name: str, settings: dict) -> list:
+    """Кнопка на каждый тип копии: «Полная», «Разностная», «Журнал».
+
+    Один сервер — самый частый случай, и лишний экран выбора сервера, а
+    потом ещё один выбора типа, тут только мешает: кнопки видно сразу.
+    """
+    scripts = settings.get("scripts") or {}
+    if len(set(scripts.values())) < 2:
+        # Скрипт один на все типы — выбирать нечего, тип ничего не меняет
+        return []
+
+    buttons = []
+    for btype in scripts:
+        data = f"backup_copy_go:{server_name}:{btype}"
+        if len(data.encode()) > COPY_CALLBACK_LIMIT:
+            return []
+        buttons.append(InlineKeyboardButton(
+            f"📤 {type_label(btype).capitalize()}", callback_data=data))
+    return buttons
+
+
 async def show_copy_status(query, context, page: int = 0):
     names = await asyncio.to_thread(copy_servers)
     if not names:
@@ -564,8 +591,22 @@ async def show_copy_status(query, context, page: int = 0):
         callback_prefix="backup_copy_page"
     )
     rows = list(keyboard.inline_keyboard)
-    rows.insert(-1, [InlineKeyboardButton("📤 Скопировать сейчас",
-                                          callback_data="backup_copy_run_servers")])
+    run_row = []
+    if len(names) == 1:
+        server = await asyncio.to_thread(find_server, names[0])
+        settings = copy_settings(server) if server else None
+        if settings:
+            run_row = copy_type_buttons(names[0], settings)
+    if not run_row:
+        # Сервер один и скрипт у него один — незачем спрашивать, какой
+        # именно сервер: кнопка запускает сразу.
+        data = (f"backup_copy_run:{names[0]}" if len(names) == 1
+                and len(f"backup_copy_run:{names[0]}".encode()) <= COPY_CALLBACK_LIMIT
+                else "backup_copy_run_servers")
+        run_row = [InlineKeyboardButton("📤 Скопировать сейчас", callback_data=data)]
+    # По кнопке в ряд, если типов больше двух: подписи длинные
+    rows[-1:-1] = ([run_row] if len(run_row) <= 2
+                   else [[button] for button in run_row])
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -592,10 +633,8 @@ async def show_copy_run_servers(query, context, page: int = 0):
 async def show_copy_types(query, context, server_name: str, scripts: dict):
     """Какую копию везти, когда скриптов несколько. Гадать нельзя: полная
     и разностная едут разными скриптами в разные каталоги."""
-    rows = [[InlineKeyboardButton(
-        f"📤 {type_label(btype).capitalize()}",
-        callback_data=f"backup_copy_go:{server_name}:{btype}"
-    )] for btype in scripts]
+    rows = [[button] for button in
+            copy_type_buttons(server_name, {"scripts": scripts})]
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="backup_copy")])
 
     await safe_edit_message(
