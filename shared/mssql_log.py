@@ -585,6 +585,27 @@ def read_agent_jobs(server: dict, hours: int = 24, limit: int = 30) -> dict:
     return {"rows": rows, "jobs_total": total}
 
 
+def read_running_backups(server: dict) -> list:
+    """Копии, которые прямо сейчас делаются: база, процент, сколько идёт.
+
+    Нужно тому, кто запускает копирование файлов по факту готовности:
+    в msdb запись появляется, как только закончилась ПЕРВАЯ база, а
+    следом за ней сервер может писать вторую и третью. Утащить каталог
+    в этот момент — значит увезти файл, который ещё дописывается.
+
+    sys.dm_exec_requests видит и копии, запущенные не из джоб: руками из
+    студии, сторонним софтом, планировщиком. Джобы для этого смотреть
+    бесполезно — по имени задания не понять, что оно делает.
+    """
+    tsql = """SET NOCOUNT ON;
+SELECT DB_NAME(r.database_id) AS db,
+       CAST(r.percent_complete AS DECIMAL(5,1)) AS pct,
+       r.total_elapsed_time / 1000 AS seconds
+FROM sys.dm_exec_requests r
+WHERE r.command LIKE 'BACKUP%';"""
+    return _run_sql(server, tsql, "db,pct,seconds")
+
+
 def read_backup_history(server: dict, days: int = 7, limit: int = 30) -> list:
     """Что сам SQL считает сделанным: база, тип копии, время, размер, путь.
 

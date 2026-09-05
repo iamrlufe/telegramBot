@@ -19,7 +19,7 @@ from datetime import datetime
 from settings import SERVERS_FILE
 from server_check import server_type
 from winrm_client import run_ps, ps_json
-from mssql_log import read_backup_history
+from mssql_log import read_backup_history, read_running_backups
 from backup_copy import (
     TRANSFER_STATE_FILE,
     check_run_ps,
@@ -166,6 +166,22 @@ def process_server_copy(server: dict, state: dict) -> bool:
 
     if entry.get("run"):
         return _watch_run(server, settings, entry, name, state)
+
+    # На сервере прямо сейчас делается копия? В msdb запись появляется,
+    # как только закончилась ПЕРВАЯ база, а следом сервер может писать
+    # вторую и третью. Утащить каталог в этот момент — значит увезти
+    # файл, который ещё дописывается.
+    try:
+        running = read_running_backups(server)
+    except Exception as e:
+        # Не смогли спросить — не повод стоять: копию всё равно везти
+        # надо, а от полуготового файла защищает пауза перед запуском.
+        print(f"[copy] {name}: не проверить идущие копии: {e}", flush=True)
+        running = []
+    if running:
+        where = ", ".join(f"{r.get('db')} {r.get('pct')}%" for r in running[:3])
+        print(f"[copy] {name}: жду окончания копий ({where})", flush=True)
+        return False
 
     try:
         rows = read_backup_history(server, days=HISTORY_DAYS, limit=HISTORY_LIMIT)
