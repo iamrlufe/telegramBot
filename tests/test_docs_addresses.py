@@ -14,7 +14,9 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DOCS = ["readme.md", "config/example.servers.json", ".env.example"]
+DOCS = ["readme.md", "config/example.servers.json", ".env.example",
+        "scripts/readme.md", "scripts/example.upload_common.cmd",
+        "scripts/example.upload_full.cmd", "scripts/example.upload_diff.cmd"]
 
 DOC_NETWORKS = [ipaddress.ip_network(net) for net in (
     "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",   # RFC 5737 — примеры

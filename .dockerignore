@@ -16,6 +16,8 @@ venv/
 
 # В образ не нужны
 tests/
+# scripts/ — образцы того, что выполняется на самих серверах, а не код бота
+scripts/
 graphify-out/
 .claude/
 .git/
