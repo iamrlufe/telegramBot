@@ -151,6 +151,43 @@ def test_validate_rejects_bad_schedule_values():
 
 # ─── Управление копированием ─────────────────────────────────
 
+def _run_target_steps(monkeypatch, answers):
+    """Прогоняет опрос «приёмник копий → каталог на нём»."""
+    import asyncio
+
+    saved = {}
+    monkeypatch.setattr(ce, "update_server_fields",
+                        lambda name, values: (saved.update(values), (True, name))[1])
+    monkeypatch.setattr(ce, "load_config", lambda: [{"name": "sql-01", "host": "h"}])
+
+    state = {"mode": "copy_target", "server": "sql-01", "step": 0, "values": {}}
+    context = type("Ctx", (), {"user_data": {ce.STATE_KEY: state}})()
+
+    async def send(text, kb):
+        pass
+
+    async def go():
+        for answer in answers:
+            await ce.copy_target_advance(context, send, state, answer)
+
+    asyncio.run(go())
+    return saved
+
+
+def test_target_pair_is_saved_together(monkeypatch):
+    """Регрессия: поля проверяются парой, а мастер сохранял по одному —
+    первое же поле не сохранялось, валидация не пускала."""
+    saved = _run_target_steps(monkeypatch, ["is-cc.example.local",
+                                            "E:\\Backups\\AKT1C8"])
+    assert saved == {"copy_target": "is-cc.example.local",
+                     "copy_target_root": "E:\\Backups\\AKT1C8"}
+
+
+def test_target_dash_clears_both(monkeypatch):
+    saved = _run_target_steps(monkeypatch, [None])
+    assert saved == {"copy_target": None, "copy_target_root": None}
+
+
 def test_copy_autostart_is_on_until_turned_off():
     """Флаг «по умолчанию включено»: выключение обязано писать явный false,
     иначе ответ «нет» бесследно исчезнет при чтении конфига."""

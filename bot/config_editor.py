@@ -2021,6 +2021,98 @@ async def copy_scripts_save(context, send, state: dict):
                edit_fields_kb(server))
 
 
+# Приёмник копий и каталог на нём проверяются парой: одно без второго
+# ничего не показывает. Поэтому спрашиваются подряд и сохраняются разом —
+# иначе первое же поле не сохранить, валидация не пустит.
+COPY_TARGET_STEPS = [
+    ("copy_target", "Имя сервера-ПРИЁМНИКА, как оно записано в конфиге бота "
+                    "(тот, куда скрипт заливает копии по SFTP)."),
+    ("copy_target_root", "Каталог на приёмнике, соответствующий корню SFTP.\n"
+                         "Например: E:\\Backups\\AKT1C8\n"
+                         "Путь из журнала (/база/FULL/файл.bak) бот приклеит "
+                         "к нему и посмотрит размер растущего файла."),
+]
+
+
+def copy_target_text(server_name: str, step: int, values: dict) -> str:
+    field, prompt = COPY_TARGET_STEPS[step]
+    lines = [f"✏️ {server_name} · {FIELD_DEFS[field]['label']}",
+             f"Шаг {step + 1} из {len(COPY_TARGET_STEPS)}", "", prompt, ""]
+    if step == 0:
+        lines.append("Нужно ровно для одного — показывать процент "
+                     "готовности: у SFTP нет обратной связи о ходе "
+                     "передачи, сколько доехало, знает только приёмник.")
+        lines.append("«-» — убрать показ процента совсем.")
+    if values:
+        lines.append("")
+        lines.append("Уже задано: " + ", ".join(f"{k} = {v}"
+                                                for k, v in values.items()))
+    return "\n".join(lines)
+
+
+def copy_target_kb(server_name: str):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data=f"cfg_editsrv:{server_name}")
+    ]])
+
+
+async def ask_copy_target(query, context, server_name: str):
+    context.user_data[STATE_KEY] = {
+        "mode": "copy_target", "server": server_name, "step": 0, "values": {},
+    }
+    current = ", ".join(
+        f"{FIELD_DEFS[f]['label']}: {display_value_for(server_name, f)}"
+        for f, _ in COPY_TARGET_STEPS)
+    await safe_edit_message(
+        query,
+        copy_target_text(server_name, 0, {}) + f"\n\nСейчас — {current}",
+        reply_markup=copy_target_kb(server_name)
+    )
+
+
+async def copy_target_advance(context, send, state: dict, value):
+    field = COPY_TARGET_STEPS[state["step"]][0]
+    if value is None and state["step"] == 0:
+        # «-» на первом шаге — убрать обе настройки разом
+        state["clear"] = True
+    elif value is not None:
+        state["values"][field] = value
+
+    if state.get("clear") or state["step"] + 1 >= len(COPY_TARGET_STEPS):
+        return await copy_target_save(context, send, state)
+
+    state["step"] += 1
+    await send(copy_target_text(state["server"], state["step"], state["values"]),
+               copy_target_kb(state["server"]))
+
+
+async def copy_target_save(context, send, state: dict):
+    server_name = state["server"]
+    values = {field: None for field, _ in COPY_TARGET_STEPS}
+    if not state.get("clear"):
+        values.update(state.get("values") or {})
+    context.user_data.pop(STATE_KEY, None)
+
+    try:
+        saved, result = update_server_fields(server_name, values)
+    except Exception as e:
+        saved, result = False, f"ошибка записи: {str(e)[:150]}"
+    if not saved:
+        await send(f"❌ {result}", menu_kb())
+        return
+
+    servers = load_config()
+    server = next((s for s in servers if s.get("name") == server_name), None)
+    if server is None:
+        await send("✅ Сохранено, но сервер уже не найден в конфиге.", menu_kb())
+        return
+    head = ("✅ Показ процента выключен.\n\n" if state.get("clear")
+            else "✅ Сохранено. Процент появится в 📄 Журнале у базы, "
+                 "которая едет.\n\n")
+    await send(head + build_summary(server)
+               + "\n\nНажми на поле чтобы изменить:", edit_fields_kb(server))
+
+
 async def ask_edit_field(query, context, field: str):
     server_name = context.user_data.get(EDIT_SERVER_KEY)
     if not server_name:
@@ -2056,6 +2148,10 @@ async def ask_edit_field(query, context, field: str):
 
     if field == "copy_script":
         await ask_copy_scripts(query, context, server_name)
+        return
+
+    if field in ("copy_target", "copy_target_root"):
+        await ask_copy_target(query, context, server_name)
         return
 
     context.user_data[STATE_KEY] = {"mode": "edit_field", "server": server_name, "field": field}
@@ -2094,6 +2190,23 @@ def display_value_for(server_name: str, field: str) -> str:
         return display_value(server, field) if server else "—"
     except Exception:
         return "—"
+
+
+def update_server_fields(server_name: str, values: dict) -> tuple[bool, str]:
+    """Несколько полей одной записью.
+
+    Нужно для настроек, которые проверяются парой: приёмник копий и
+    каталог на нём. По одному их не сохранить — валидация справедливо
+    ругается, что одно без другого ничего не делает.
+    """
+    servers = load_config()
+    server = next((s for s in servers if s.get("name") == server_name), None)
+    if not server:
+        return False, f"Сервер {server_name} не найден в конфиге"
+    for field, value in values.items():
+        apply_field(server, field, value)
+    save_config(servers)
+    return True, server.get("name")
 
 
 def update_server_field(server_name: str, field: str, value) -> tuple[bool, str]:
@@ -2912,7 +3025,8 @@ SQL закончил копию. Планировщик Windows для этог�
    работал бы непрерывно. Нужно, только если скрипт один на все типы.
 ⏸ Пауза перед копированием — сколько ждать после отметки «закончена»
    (SQL закрывает файл раньше, чем система дописывает его на диск).
-📥 Приёмник копий + 📁 Каталог на приёмнике — только ради процента
+📥 Приёмник копий — бот спросит две вещи подряд: имя приёмника
+   и каталог на нём, и сохранит разом. Только ради процента
    готовности. У SFTP нет обратной связи о ходе передачи: сколько
    доехало, знает лишь приёмник. Задал оба — в журнале появится
    «— 28%, 12.4 ГБ» у базы, которая едет. Не задал — всё остальное
@@ -4672,6 +4786,12 @@ async def handle_config_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return True
 
         await wizard_advance(context, send, value)
+        return True
+
+    if state["mode"] == "copy_target":
+        stripped = (text or "").strip()
+        value = None if (not stripped or stripped in SKIP_INPUTS) else stripped
+        await copy_target_advance(context, send, state, value)
         return True
 
     if state["mode"] == "copy_scripts":
